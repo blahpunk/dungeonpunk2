@@ -32,6 +32,7 @@ const MAX_SERVER_SAVES = 5;
 const SAVE_NAME_MAX_LEN = 48;
 const SAVE_PAYLOAD_MAX_LEN = 2000000;
 const SPRITE_UPLOAD_MAX_BYTES = 100000000;
+const MONSTER_EDITOR_PAYLOAD_MAX_BYTES = 1200000;
 const LOCAL_AUTH_COOKIE = 'bp_auth_user';
 const LOCAL_AUTH_SIG_COOKIE = 'bp_auth_sig';
 
@@ -755,6 +756,309 @@ function sprite_resolve_custom_file_path(string $category, string $fileName): ?s
   return null;
 }
 
+function monster_editor_file_path(): string
+{
+  return app_storage_path('monster_editor/config.json');
+}
+
+function ensure_monster_editor_storage_root(): bool
+{
+  $dir = dirname(monster_editor_file_path());
+  return is_dir($dir) || @mkdir($dir, 0700, true) || is_dir($dir);
+}
+
+function monster_editor_normalize_id(string $value): ?string
+{
+  $id = strtolower(trim($value));
+  if ($id === '' || !preg_match('/^[a-z0-9_]{1,80}$/', $id)) {
+    return null;
+  }
+  return $id;
+}
+
+function monster_editor_title_from_id(string $id): string
+{
+  $parts = preg_split('/_+/', trim($id)) ?: [];
+  $parts = array_filter($parts, static fn (string $part): bool => $part !== '');
+  if (!$parts) {
+    return 'Monster';
+  }
+  $named = array_map(static fn (string $part): string => ucfirst($part), $parts);
+  return implode(' ', $named);
+}
+
+function monster_editor_clamp_int(mixed $value, int $min, int $max, int $fallback): int
+{
+  if (!is_numeric($value)) {
+    return $fallback;
+  }
+  $n = (int) floor((float) $value);
+  if ($n < $min) {
+    return $min;
+  }
+  if ($n > $max) {
+    return $max;
+  }
+  return $n;
+}
+
+function monster_editor_clamp_float(mixed $value, float $min, float $max, float $fallback, int $precision = 4): float
+{
+  if (!is_numeric($value)) {
+    return $fallback;
+  }
+  $n = (float) $value;
+  if ($n < $min) {
+    $n = $min;
+  } elseif ($n > $max) {
+    $n = $max;
+  }
+  return (float) round($n, $precision);
+}
+
+/**
+ * @param array<string, mixed> $raw
+ * @return array{monsters: array<string, array<string, mixed>>, spawn_rules: array<int, array<string, mixed>>, updated_at: string}
+ */
+function monster_editor_normalize_payload(array $raw): array
+{
+  $monstersRaw = $raw['monsters'] ?? [];
+  $spawnRulesRaw = $raw['spawn_rules'] ?? [];
+
+  $monsters = [];
+  if (is_array($monstersRaw)) {
+    foreach ($monstersRaw as $idRaw => $specRaw) {
+      $id = monster_editor_normalize_id((string) $idRaw);
+      if ($id === null || !is_array($specRaw)) {
+        continue;
+      }
+
+      $name = trim((string) ($specRaw['name'] ?? ''));
+      if ($name === '') {
+        $name = monster_editor_title_from_id($id);
+      }
+      if (function_exists('mb_substr')) {
+        $name = mb_substr($name, 0, 80);
+      } else {
+        $name = substr($name, 0, 80);
+      }
+
+      $glyphRaw = trim((string) ($specRaw['glyph'] ?? ''));
+      $glyph = $glyphRaw !== '' ? $glyphRaw : substr($id, 0, 1);
+      if (function_exists('mb_substr')) {
+        $glyph = mb_substr($glyph, 0, 2);
+      } else {
+        $glyph = substr($glyph, 0, 2);
+      }
+      if ($glyph === '') {
+        $glyph = 'm';
+      }
+
+      $aliasOf = monster_editor_normalize_id((string) ($specRaw['aliasOf'] ?? ''));
+      $ai = trim((string) ($specRaw['ai'] ?? ''));
+      if (function_exists('mb_substr')) {
+        $ai = mb_substr($ai, 0, 40);
+      } else {
+        $ai = substr($ai, 0, 40);
+      }
+
+      $spec = [
+        'id' => $id,
+        'name' => $name,
+        'glyph' => $glyph,
+        'sizeGrowth' => isset($specRaw['sizeGrowth']) ? (bool) $specRaw['sizeGrowth'] : true,
+        'baseHp' => monster_editor_clamp_int($specRaw['baseHp'] ?? null, 1, 250000, 18),
+        'baseAtk' => monster_editor_clamp_int($specRaw['baseAtk'] ?? null, 1, 250000, 6),
+        'baseDef' => monster_editor_clamp_int($specRaw['baseDef'] ?? null, 0, 250000, 1),
+        'baseAcc' => monster_editor_clamp_int($specRaw['baseAcc'] ?? null, 1, 98, 70),
+        'baseEva' => monster_editor_clamp_int($specRaw['baseEva'] ?? null, 0, 95, 8),
+        'spd' => monster_editor_clamp_float($specRaw['spd'] ?? null, 0.1, 8.0, 1.0, 3),
+        'xp' => monster_editor_clamp_int($specRaw['xp'] ?? null, 1, 250000, 3),
+      ];
+      if ($aliasOf !== null && $aliasOf !== $id) {
+        $spec['aliasOf'] = $aliasOf;
+      }
+      if ($ai !== '') {
+        $spec['ai'] = $ai;
+      }
+
+      $optionalInt = [
+        'range' => [0, 30],
+        'cdTurns' => [0, 12],
+        'preferredRange' => [0, 30],
+        'blinkRange' => [0, 12],
+        'poisonOnHitTurns' => [0, 20],
+        'poisonOnHitDmg' => [0, 250000],
+        'slowTurns' => [0, 20],
+        'summonCooldownTurns' => [0, 30],
+        'deathCloudTurns' => [0, 20],
+        'deathCloudRadius' => [0, 8],
+        'deathCloudDmg' => [0, 250000],
+      ];
+      foreach ($optionalInt as $key => [$min, $max]) {
+        if (!array_key_exists($key, $specRaw)) {
+          continue;
+        }
+        $value = monster_editor_clamp_int($specRaw[$key], $min, $max, $min);
+        if ($value > 0) {
+          $spec[$key] = $value;
+        }
+      }
+
+      $optionalFloat = [
+        'poisonOnHitChance' => [0.0, 1.0, 3],
+        'slowOnHitChance' => [0.0, 1.0, 3],
+        'stunOnHitChance' => [0.0, 1.0, 3],
+        'knockbackOnHitChance' => [0.0, 1.0, 3],
+        'backstabDamageMult' => [0.5, 5.0, 3],
+        'meleeReflectPct' => [0.0, 0.95, 3],
+      ];
+      foreach ($optionalFloat as $key => [$min, $max, $precision]) {
+        if (!array_key_exists($key, $specRaw)) {
+          continue;
+        }
+        $value = monster_editor_clamp_float($specRaw[$key], $min, $max, $min, $precision);
+        if ($value > $min) {
+          $spec[$key] = $value;
+        }
+      }
+
+      if (!empty($specRaw['immunePoison'])) {
+        $spec['immunePoison'] = true;
+      }
+
+      $knownKeys = array_fill_keys(array_keys($spec), true);
+      foreach ($specRaw as $rawKey => $rawValue) {
+        $key = trim((string) $rawKey);
+        if ($key === '' || isset($knownKeys[$key])) {
+          continue;
+        }
+        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]{0,40}$/', $key)) {
+          continue;
+        }
+        if (is_bool($rawValue)) {
+          $spec[$key] = $rawValue;
+          continue;
+        }
+        if (is_numeric($rawValue)) {
+          $spec[$key] = (float) round((float) $rawValue, 4);
+          continue;
+        }
+        if (is_string($rawValue)) {
+          $trimmed = trim($rawValue);
+          if ($trimmed === '') {
+            continue;
+          }
+          if (function_exists('mb_substr')) {
+            $trimmed = mb_substr($trimmed, 0, 80);
+          } else {
+            $trimmed = substr($trimmed, 0, 80);
+          }
+          $spec[$key] = $trimmed;
+        }
+      }
+
+      $monsters[$id] = $spec;
+    }
+  }
+  ksort($monsters);
+
+  $spawnRules = [];
+  if (is_array($spawnRulesRaw)) {
+    foreach ($spawnRulesRaw as $ruleRaw) {
+      if (!is_array($ruleRaw)) {
+        continue;
+      }
+      $id = monster_editor_normalize_id((string) ($ruleRaw['id'] ?? ''));
+      if ($id === null) {
+        continue;
+      }
+      $minDepth = monster_editor_clamp_int($ruleRaw['minDepth'] ?? null, 0, 5000, 0);
+      $maxDepthRaw = $ruleRaw['maxDepth'] ?? null;
+      $maxDepth = null;
+      if ($maxDepthRaw !== null && $maxDepthRaw !== '') {
+        $maxDepth = monster_editor_clamp_int($maxDepthRaw, $minDepth, 5000, $minDepth);
+      }
+      $spawnRules[] = [
+        'id' => $id,
+        'minDepth' => $minDepth,
+        'maxDepth' => $maxDepth,
+        'baseWeight' => monster_editor_clamp_float($ruleRaw['baseWeight'] ?? null, 0, 20, 1, 3),
+        'rampFactor' => monster_editor_clamp_float($ruleRaw['rampFactor'] ?? null, -5, 5, 0, 3),
+      ];
+    }
+  }
+  usort(
+    $spawnRules,
+    static function (array $a, array $b): int {
+      return ($a['minDepth'] <=> $b['minDepth']) ?: strcmp((string) $a['id'], (string) $b['id']);
+    }
+  );
+
+  $updatedAt = trim((string) ($raw['updated_at'] ?? ''));
+  if ($updatedAt === '') {
+    $updatedAt = date('c');
+  }
+
+  return [
+    'monsters' => $monsters,
+    'spawn_rules' => $spawnRules,
+    'updated_at' => $updatedAt,
+  ];
+}
+
+/**
+ * @return array{monsters: array<string, array<string, mixed>>, spawn_rules: array<int, array<string, mixed>>, updated_at: string}
+ */
+function load_monster_editor_config(): array
+{
+  $path = monster_editor_file_path();
+  if (!is_file($path) || !is_readable($path)) {
+    return ['monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
+  }
+  $raw = @file_get_contents($path);
+  if (!is_string($raw) || trim($raw) === '') {
+    return ['monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
+  }
+  $decoded = json_decode($raw, true);
+  if (!is_array($decoded)) {
+    return ['monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
+  }
+  return monster_editor_normalize_payload($decoded);
+}
+
+function persist_monster_editor_config(array $payload): bool
+{
+  if (!ensure_monster_editor_storage_root()) {
+    return false;
+  }
+  $normalized = monster_editor_normalize_payload($payload);
+  $normalized['updated_at'] = date('c');
+  $json = json_encode($normalized, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+  if (!is_string($json)) {
+    return false;
+  }
+  $path = monster_editor_file_path();
+  $fp = @fopen($path, 'c+');
+  if ($fp === false) {
+    return false;
+  }
+  $ok = false;
+  if (@flock($fp, LOCK_EX)) {
+    ftruncate($fp, 0);
+    rewind($fp);
+    $written = fwrite($fp, $json . "\n");
+    fflush($fp);
+    @flock($fp, LOCK_UN);
+    $ok = is_int($written) && $written > 0;
+  }
+  fclose($fp);
+  if ($ok) {
+    @chmod($path, 0640);
+  }
+  return $ok;
+}
+
 function save_storage_root(): string
 {
   $configured = trim((string) (getenv('DUNGEON25_SAVE_PATH') ?: getenv('DUNGEON2_SAVE_PATH')));
@@ -1364,6 +1668,66 @@ if ($apiMode === 'sprites') {
     'entries' => $payload['entries'],
   ]);
 }
+if ($apiMode === 'monsters') {
+  $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+  if ($method === 'GET' && !app_rate_limit('api_monsters_get', 240, 60)) {
+    json_response(['ok' => false, 'error' => 'Too many requests. Please retry shortly.'], 429);
+  }
+  if ($method === 'POST' && !app_rate_limit('api_monsters_post', 60, 60)) {
+    json_response(['ok' => false, 'error' => 'Too many write requests. Please retry shortly.'], 429);
+  }
+
+  if ($method === 'GET') {
+    $payload = load_monster_editor_config();
+    json_response([
+      'ok' => true,
+      'monsters' => (object) ($payload['monsters'] ?? []),
+      'spawn_rules' => $payload['spawn_rules'] ?? [],
+      'updated_at' => (string) ($payload['updated_at'] ?? ''),
+    ]);
+  }
+
+  if ($method !== 'POST') {
+    json_response(['ok' => false, 'error' => 'Method not allowed.'], 405);
+  }
+  if (!$isAdminUser) {
+    json_response(['ok' => false, 'error' => 'Admin access required.'], 403);
+  }
+  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+  if ($csrfHeader === '' || !hash_equals($saveGamesCsrf, $csrfHeader)) {
+    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
+  }
+  $contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+  if ($contentLength > 0 && $contentLength > MONSTER_EDITOR_PAYLOAD_MAX_BYTES) {
+    json_response(['ok' => false, 'error' => 'Monster payload is too large.'], 413);
+  }
+
+  $body = request_json_body();
+  if ($body === null) {
+    json_response(['ok' => false, 'error' => 'Invalid JSON body.'], 400);
+  }
+  $action = strtolower(trim((string) ($body['action'] ?? '')));
+  if ($action !== 'save') {
+    json_response(['ok' => false, 'error' => 'Unsupported action.'], 400);
+  }
+
+  $payload = [
+    'monsters' => is_array($body['monsters'] ?? null) ? $body['monsters'] : [],
+    'spawn_rules' => is_array($body['spawn_rules'] ?? null) ? $body['spawn_rules'] : [],
+    'updated_at' => date('c'),
+  ];
+  if (!persist_monster_editor_config($payload)) {
+    json_response(['ok' => false, 'error' => 'Could not persist monster editor data.'], 500);
+  }
+  $saved = load_monster_editor_config();
+  json_response([
+    'ok' => true,
+    'message' => 'Monster editor data saved.',
+    'monsters' => (object) ($saved['monsters'] ?? []),
+    'spawn_rules' => $saved['spawn_rules'] ?? [],
+    'updated_at' => (string) ($saved['updated_at'] ?? ''),
+  ]);
+}
 if ($apiMode === 'savegames') {
   $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
   if ($method === 'GET' && !app_rate_limit('api_savegames_get', 240, 60)) {
@@ -1573,6 +1937,18 @@ $spriteOverridesJson = json_encode(
 );
 if (!is_string($spriteOverridesJson)) {
   $spriteOverridesJson = '{"overrides":{},"scales":{},"entries":[]}';
+}
+$monsterEditorPayload = load_monster_editor_config();
+$monsterEditorJson = json_encode(
+  [
+    'monsters' => (object) ($monsterEditorPayload['monsters'] ?? []),
+    'spawn_rules' => $monsterEditorPayload['spawn_rules'] ?? [],
+    'updated_at' => (string) ($monsterEditorPayload['updated_at'] ?? ''),
+  ],
+  JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
+);
+if (!is_string($monsterEditorJson)) {
+  $monsterEditorJson = '{"monsters":{},"spawn_rules":[],"updated_at":""}';
 }
 ?>
 <!doctype html>
@@ -3176,6 +3552,195 @@ if (!is_string($spriteOverridesJson)) {
         opacity: 0.82;
         font-size: 13px;
       }
+      #monsterEditorOverlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1736;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.72);
+        padding: 12px;
+      }
+      #monsterEditorOverlay.show {
+        display: flex;
+      }
+      #monsterEditorCard {
+        width: min(1180px, 97vw);
+        height: min(830px, 95vh);
+        border: 1px solid var(--ui-border);
+        border-radius: 12px;
+        background: linear-gradient(180deg, rgba(14, 22, 34, 0.99) 0%, rgba(7, 11, 18, 0.99) 100%);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        display: grid;
+        grid-template-rows: auto auto auto 1fr;
+        overflow: hidden;
+      }
+      #monsterEditorHeader {
+        padding: 12px 14px 8px 14px;
+        border-bottom: 1px solid #27314a;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      #monsterEditorTitle {
+        margin: 0;
+        font-size: 19px;
+        font-weight: 800;
+      }
+      #monsterEditorToolbar {
+        padding: 8px 14px;
+        border-bottom: 1px solid #1f2a40;
+        display: grid;
+        grid-template-columns: minmax(170px, 1fr) 130px repeat(8, auto);
+        gap: 8px;
+        align-items: end;
+      }
+      .monsterToolbarField {
+        display: grid;
+        gap: 4px;
+      }
+      .monsterToolbarField label {
+        font-size: 11px;
+        letter-spacing: 0.02em;
+        color: #b8c6df;
+      }
+      .monsterToolbarField input {
+        width: 100%;
+        min-width: 0;
+        height: 34px;
+        border-radius: 8px;
+        border: 1px solid #32415f;
+        background: #0a1220;
+        color: #e6e6e6;
+        padding: 6px 8px;
+        font-size: 13px;
+      }
+      #monsterEditorImportInput {
+        display: none;
+      }
+      #monsterEditorStatus {
+        min-height: 1.2em;
+        padding: 8px 14px;
+        border-bottom: 1px solid #1f2a40;
+        font-size: 12px;
+        color: #b8c6df;
+      }
+      #monsterEditorBody {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+      }
+      #monsterEditorList {
+        min-height: 0;
+        overflow: auto;
+        border-right: 1px solid #223149;
+        padding: 10px;
+        display: grid;
+        gap: 6px;
+        align-content: start;
+      }
+      .monsterEditorListBtn {
+        width: 100%;
+        text-align: left;
+        border: 1px solid #2a3a58;
+        border-radius: 8px;
+        background: rgba(11, 18, 30, 0.88);
+        color: #e9f0ff;
+        padding: 8px 10px;
+      }
+      .monsterEditorListBtn.active {
+        border-color: #4a6998;
+        box-shadow: 0 0 0 1px rgba(74, 105, 152, 0.36);
+      }
+      .monsterEditorListName {
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+      }
+      .monsterEditorListSub {
+        margin-top: 3px;
+        font-size: 11px;
+        color: #b7c6de;
+        opacity: 0.95;
+        line-height: 1.25;
+      }
+      #monsterEditorDetail {
+        min-height: 0;
+        overflow: auto;
+        padding: 10px 12px;
+        display: grid;
+        gap: 10px;
+        align-content: start;
+      }
+      #monsterEditorPreview {
+        border: 1px solid #2b3956;
+        border-radius: 8px;
+        background: rgba(10, 16, 27, 0.9);
+        padding: 8px 10px;
+        white-space: pre-wrap;
+        font-size: 12px;
+        color: #c8d6ea;
+        line-height: 1.35;
+      }
+      #monsterEditorForm {
+        display: grid;
+        gap: 10px;
+      }
+      .monsterFormGrid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .monsterField {
+        display: grid;
+        gap: 4px;
+      }
+      .monsterFieldWide {
+        grid-column: span 2;
+      }
+      .monsterField label {
+        font-size: 11px;
+        color: #b8c6df;
+      }
+      .monsterField input,
+      .monsterField select {
+        width: 100%;
+        min-width: 0;
+        height: 34px;
+        border-radius: 8px;
+        border: 1px solid #32415f;
+        background: #0a1220;
+        color: #e6e6e6;
+        padding: 6px 8px;
+        font-size: 12px;
+      }
+      .monsterFieldToggle {
+        align-content: end;
+      }
+      .monsterFieldToggle label {
+        margin-bottom: 2px;
+      }
+      .monsterFieldToggle input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        margin: 0;
+      }
+      .monsterAdvancedHead {
+        display: flex;
+        justify-content: flex-start;
+      }
+      #monsterEditAdvancedToggle {
+        padding: 6px 10px;
+        border-radius: 8px;
+        font-size: 12px;
+      }
+      #monsterEditorAdvancedFields {
+        display: none;
+      }
+      #monsterEditorAdvancedFields.show {
+        display: grid;
+      }
       @media (max-width: 780px) {
         #shopBody {
           grid-template-columns: 1fr;
@@ -3201,6 +3766,23 @@ if (!is_string($spriteOverridesJson)) {
         .spriteRowActions {
           grid-column: 1 / -1;
           justify-content: flex-start;
+        }
+        #monsterEditorToolbar {
+          grid-template-columns: 1fr 1fr;
+        }
+        #monsterEditorBody {
+          grid-template-columns: 1fr;
+        }
+        #monsterEditorList {
+          border-right: none;
+          border-bottom: 1px solid #223149;
+          max-height: 34vh;
+        }
+        .monsterFormGrid {
+          grid-template-columns: 1fr 1fr;
+        }
+        .monsterFieldWide {
+          grid-column: span 2;
         }
       }
       #deathCard {
@@ -3427,7 +4009,15 @@ if (!is_string($spriteOverridesJson)) {
       }
       .panel h3 { margin: 0 0 8px 0; font-size: 14px; }
 
-      #invList { display: grid; gap: 0; }
+      #invList {
+        --inv-row-height: 28px;
+        display: grid;
+        gap: 0;
+        max-height: calc(var(--inv-row-height) * 5);
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding-right: 2px;
+      }
       #equipBadges {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -3568,6 +4158,7 @@ if (!is_string($spriteOverridesJson)) {
       #invList > .invLabelBtn {
         display: block;
         width: 100%;
+        min-height: var(--inv-row-height);
         text-align: left;
         padding: 0 4px;
         margin: 0;
@@ -3653,6 +4244,7 @@ if (!is_string($spriteOverridesJson)) {
         #characterOverlay,
         #infoOverlay,
         #spriteEditorOverlay,
+        #monsterEditorOverlay,
         #newDungeonConfirmOverlay,
         #levelUpOverlay {
           align-items: flex-start;
@@ -3665,6 +4257,7 @@ if (!is_string($spriteOverridesJson)) {
         #characterOverlayCard,
         #infoCard,
         #spriteEditorCard,
+        #monsterEditorCard,
         #levelUpCard {
           width: min(1120px, calc(100vw - 20px));
           max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
@@ -3680,6 +4273,7 @@ if (!is_string($spriteOverridesJson)) {
         #characterOverlayBody,
         #infoBody,
         #spriteEditorList,
+        #monsterEditorDetail,
         #levelUpStatsList {
           min-height: 0;
           overflow: auto;
@@ -3951,6 +4545,7 @@ if (!is_string($spriteOverridesJson)) {
           <button id="btnDebugMenu" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="debugMenu">Admin</button>
           <div id="debugMenu" aria-hidden="true">
             <button id="btnSpriteEditor" type="button" class="adminMenuAction">Sprite Editor</button>
+            <button id="btnMonsterEditor" type="button" class="adminMenuAction">Monster Editor</button>
             <div class="adminMenuDivider"></div>
             <label class="debugToggle" for="toggleGodmode">
               <span>Godmode</span>
@@ -4188,6 +4783,202 @@ if (!is_string($spriteOverridesJson)) {
         <div id="spriteEditorList"></div>
       </div>
     </div>
+    <div id="monsterEditorOverlay" aria-hidden="true">
+      <div id="monsterEditorCard" role="dialog" aria-modal="true" aria-labelledby="monsterEditorTitle">
+        <div id="monsterEditorHeader">
+          <h2 id="monsterEditorTitle">Monster Editor (Admin)</h2>
+          <button id="monsterEditorCloseBtn" type="button">Close</button>
+        </div>
+        <div id="monsterEditorToolbar">
+          <div class="monsterToolbarField">
+            <label for="monsterEditorSearchInput">Search</label>
+            <input id="monsterEditorSearchInput" type="text" placeholder="name or id" autocomplete="off" />
+          </div>
+          <div class="monsterToolbarField">
+            <label for="monsterEditorPreviewDepthInput">Preview depth</label>
+            <input id="monsterEditorPreviewDepthInput" type="number" min="0" step="1" value="1" />
+          </div>
+          <button id="monsterEditorNewBtn" type="button">New</button>
+          <button id="monsterEditorDuplicateBtn" type="button">Duplicate</button>
+          <button id="monsterEditorDeleteBtn" type="button">Delete</button>
+          <button id="monsterEditorExportBtn" type="button">Export</button>
+          <button id="monsterEditorImportBtn" type="button">Import</button>
+          <input id="monsterEditorImportInput" type="file" accept="application/json,.json" />
+          <button id="monsterEditorRefreshBtn" type="button">Refresh</button>
+          <button id="monsterEditorRevertBtn" type="button">Revert</button>
+          <button id="monsterEditorSaveBtn" type="button">Save</button>
+        </div>
+        <div id="monsterEditorStatus"></div>
+        <div id="monsterEditorBody">
+          <div id="monsterEditorList"></div>
+          <div id="monsterEditorDetail">
+            <div id="monsterEditorPreview"></div>
+            <form id="monsterEditorForm" autocomplete="off">
+              <div class="monsterFormGrid">
+                <div class="monsterField">
+                  <label for="monsterEditId">ID</label>
+                  <input id="monsterEditId" type="text" readonly />
+                </div>
+                <div class="monsterField monsterFieldWide">
+                  <label for="monsterEditName">Name</label>
+                  <input id="monsterEditName" type="text" maxlength="80" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditGlyph">Glyph</label>
+                  <input id="monsterEditGlyph" type="text" maxlength="2" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditAliasOf">Alias of</label>
+                  <input id="monsterEditAliasOf" type="text" placeholder="optional id" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditAi">AI</label>
+                  <select id="monsterEditAi">
+                    <option value="">(default melee chase)</option>
+                    <option value="melee_chase">melee_chase</option>
+                    <option value="tank">tank</option>
+                    <option value="blink_flanker">blink_flanker</option>
+                    <option value="support_undead">support_undead</option>
+                    <option value="ranged_hold">ranged_hold</option>
+                    <option value="ranged_kite">ranged_kite</option>
+                    <option value="ranged_artillery">ranged_artillery</option>
+                  </select>
+                </div>
+                <div class="monsterField monsterFieldToggle">
+                  <label for="monsterEditSizeGrowth">Size growth</label>
+                  <input id="monsterEditSizeGrowth" type="checkbox" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBaseHp">Base HP</label>
+                  <input id="monsterEditBaseHp" type="number" min="1" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBaseAtk">Base ATK</label>
+                  <input id="monsterEditBaseAtk" type="number" min="1" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBaseDef">Base DEF</label>
+                  <input id="monsterEditBaseDef" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBaseAcc">Base ACC</label>
+                  <input id="monsterEditBaseAcc" type="number" min="1" max="98" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBaseEva">Base EVA</label>
+                  <input id="monsterEditBaseEva" type="number" min="0" max="95" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSpd">Speed</label>
+                  <input id="monsterEditSpd" type="number" min="0.1" max="8" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditXp">Base XP</label>
+                  <input id="monsterEditXp" type="number" min="1" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditRange">Range</label>
+                  <input id="monsterEditRange" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditCdTurns">CD turns</label>
+                  <input id="monsterEditCdTurns" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditPreferredRange">Preferred range</label>
+                  <input id="monsterEditPreferredRange" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBlinkRange">Blink range</label>
+                  <input id="monsterEditBlinkRange" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSummonCooldownTurns">Summon CD</label>
+                  <input id="monsterEditSummonCooldownTurns" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField monsterFieldToggle">
+                  <label for="monsterEditSpawnEnabled">Spawn enabled</label>
+                  <input id="monsterEditSpawnEnabled" type="checkbox" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSpawnMinDepth">Spawn min depth</label>
+                  <input id="monsterEditSpawnMinDepth" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSpawnMaxDepth">Spawn max depth</label>
+                  <input id="monsterEditSpawnMaxDepth" type="number" min="0" step="1" placeholder="blank = no max" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSpawnBaseWeight">Spawn base weight</label>
+                  <input id="monsterEditSpawnBaseWeight" type="number" min="0" max="20" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSpawnRampFactor">Spawn ramp/depth</label>
+                  <input id="monsterEditSpawnRampFactor" type="number" min="-5" max="5" step="0.01" />
+                </div>
+              </div>
+              <div class="monsterAdvancedHead">
+                <button id="monsterEditAdvancedToggle" type="button">Advanced +</button>
+              </div>
+              <div id="monsterEditorAdvancedFields" class="monsterFormGrid">
+                <div class="monsterField">
+                  <label for="monsterEditPoisonOnHitChance">Poison chance</label>
+                  <input id="monsterEditPoisonOnHitChance" type="number" min="0" max="1" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditPoisonOnHitTurns">Poison turns</label>
+                  <input id="monsterEditPoisonOnHitTurns" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditPoisonOnHitDmg">Poison damage</label>
+                  <input id="monsterEditPoisonOnHitDmg" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSlowOnHitChance">Slow chance</label>
+                  <input id="monsterEditSlowOnHitChance" type="number" min="0" max="1" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditSlowTurns">Slow turns</label>
+                  <input id="monsterEditSlowTurns" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditStunOnHitChance">Stun chance</label>
+                  <input id="monsterEditStunOnHitChance" type="number" min="0" max="1" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditKnockbackOnHitChance">Knockback chance</label>
+                  <input id="monsterEditKnockbackOnHitChance" type="number" min="0" max="1" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditBackstabDamageMult">Backstab mult</label>
+                  <input id="monsterEditBackstabDamageMult" type="number" min="0.5" max="5" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditMeleeReflectPct">Melee reflect</label>
+                  <input id="monsterEditMeleeReflectPct" type="number" min="0" max="0.95" step="0.01" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditDeathCloudTurns">Death cloud turns</label>
+                  <input id="monsterEditDeathCloudTurns" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditDeathCloudRadius">Death cloud radius</label>
+                  <input id="monsterEditDeathCloudRadius" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField">
+                  <label for="monsterEditDeathCloudDmg">Death cloud damage</label>
+                  <input id="monsterEditDeathCloudDmg" type="number" min="0" step="1" />
+                </div>
+                <div class="monsterField monsterFieldToggle">
+                  <label for="monsterEditImmunePoison">Immune poison</label>
+                  <input id="monsterEditImmunePoison" type="checkbox" />
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
     <div id="newDungeonConfirmOverlay" aria-hidden="true">
       <div id="newDungeonConfirmCard" role="dialog" aria-modal="true" aria-labelledby="newDungeonConfirmTitle">
         <h2 id="newDungeonConfirmTitle">Start New Dungeon?</h2>
@@ -4242,6 +5033,7 @@ if (!is_string($spriteOverridesJson)) {
     </div>
 
     <script id="spriteOverridesData" type="application/json"><?php echo $spriteOverridesJson; ?></script>
+    <script id="monsterEditorData" type="application/json"><?php echo $monsterEditorJson; ?></script>
     <script type="module" src="<?php echo h($gameScriptUrl); ?>"></script>
     <!-- Mobile touch controls (table: left = 3x3 directional, right = context buttons) -->
     <div id="touchControls" aria-hidden="false">

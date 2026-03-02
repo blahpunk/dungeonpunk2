@@ -1302,6 +1302,7 @@ const btnLoadGameEl = document.getElementById("btnImport");
 const btnChooseCharacterEl = document.getElementById("btnChooseCharacter");
 const btnInfoEl = document.getElementById("btnInfo");
 const btnSpriteEditorEl = document.getElementById("btnSpriteEditor");
+const btnMonsterEditorEl = document.getElementById("btnMonsterEditor");
 const authBtnEl = document.getElementById("authBtn");
 const vitalsDisplayEl = document.getElementById("vitalsDisplay");
 const logPanelEl = document.getElementById("logPanel");
@@ -1377,6 +1378,61 @@ const spriteBulkSetSizeBtnEl = document.getElementById("spriteBulkSetSizeBtn");
 const spriteEditorRefreshBtnEl = document.getElementById("spriteEditorRefreshBtn");
 const spriteEditorStatusEl = document.getElementById("spriteEditorStatus");
 const spriteEditorListEl = document.getElementById("spriteEditorList");
+const monsterEditorOverlayEl = document.getElementById("monsterEditorOverlay");
+const monsterEditorCloseBtnEl = document.getElementById("monsterEditorCloseBtn");
+const monsterEditorSearchInputEl = document.getElementById("monsterEditorSearchInput");
+const monsterEditorPreviewDepthInputEl = document.getElementById("monsterEditorPreviewDepthInput");
+const monsterEditorNewBtnEl = document.getElementById("monsterEditorNewBtn");
+const monsterEditorDuplicateBtnEl = document.getElementById("monsterEditorDuplicateBtn");
+const monsterEditorDeleteBtnEl = document.getElementById("monsterEditorDeleteBtn");
+const monsterEditorExportBtnEl = document.getElementById("monsterEditorExportBtn");
+const monsterEditorImportBtnEl = document.getElementById("monsterEditorImportBtn");
+const monsterEditorImportInputEl = document.getElementById("monsterEditorImportInput");
+const monsterEditorRefreshBtnEl = document.getElementById("monsterEditorRefreshBtn");
+const monsterEditorRevertBtnEl = document.getElementById("monsterEditorRevertBtn");
+const monsterEditorSaveBtnEl = document.getElementById("monsterEditorSaveBtn");
+const monsterEditorStatusEl = document.getElementById("monsterEditorStatus");
+const monsterEditorListEl = document.getElementById("monsterEditorList");
+const monsterEditorPreviewEl = document.getElementById("monsterEditorPreview");
+const monsterEditorFormEl = document.getElementById("monsterEditorForm");
+const monsterEditAdvancedToggleEl = document.getElementById("monsterEditAdvancedToggle");
+const monsterEditorAdvancedFieldsEl = document.getElementById("monsterEditorAdvancedFields");
+const monsterEditIdEl = document.getElementById("monsterEditId");
+const monsterEditNameEl = document.getElementById("monsterEditName");
+const monsterEditGlyphEl = document.getElementById("monsterEditGlyph");
+const monsterEditAliasOfEl = document.getElementById("monsterEditAliasOf");
+const monsterEditAiEl = document.getElementById("monsterEditAi");
+const monsterEditSizeGrowthEl = document.getElementById("monsterEditSizeGrowth");
+const monsterEditBaseHpEl = document.getElementById("monsterEditBaseHp");
+const monsterEditBaseAtkEl = document.getElementById("monsterEditBaseAtk");
+const monsterEditBaseDefEl = document.getElementById("monsterEditBaseDef");
+const monsterEditBaseAccEl = document.getElementById("monsterEditBaseAcc");
+const monsterEditBaseEvaEl = document.getElementById("monsterEditBaseEva");
+const monsterEditSpdEl = document.getElementById("monsterEditSpd");
+const monsterEditXpEl = document.getElementById("monsterEditXp");
+const monsterEditRangeEl = document.getElementById("monsterEditRange");
+const monsterEditCdTurnsEl = document.getElementById("monsterEditCdTurns");
+const monsterEditPreferredRangeEl = document.getElementById("monsterEditPreferredRange");
+const monsterEditBlinkRangeEl = document.getElementById("monsterEditBlinkRange");
+const monsterEditSummonCooldownTurnsEl = document.getElementById("monsterEditSummonCooldownTurns");
+const monsterEditSpawnEnabledEl = document.getElementById("monsterEditSpawnEnabled");
+const monsterEditSpawnMinDepthEl = document.getElementById("monsterEditSpawnMinDepth");
+const monsterEditSpawnMaxDepthEl = document.getElementById("monsterEditSpawnMaxDepth");
+const monsterEditSpawnBaseWeightEl = document.getElementById("monsterEditSpawnBaseWeight");
+const monsterEditSpawnRampFactorEl = document.getElementById("monsterEditSpawnRampFactor");
+const monsterEditPoisonOnHitChanceEl = document.getElementById("monsterEditPoisonOnHitChance");
+const monsterEditPoisonOnHitTurnsEl = document.getElementById("monsterEditPoisonOnHitTurns");
+const monsterEditPoisonOnHitDmgEl = document.getElementById("monsterEditPoisonOnHitDmg");
+const monsterEditSlowOnHitChanceEl = document.getElementById("monsterEditSlowOnHitChance");
+const monsterEditSlowTurnsEl = document.getElementById("monsterEditSlowTurns");
+const monsterEditStunOnHitChanceEl = document.getElementById("monsterEditStunOnHitChance");
+const monsterEditKnockbackOnHitChanceEl = document.getElementById("monsterEditKnockbackOnHitChance");
+const monsterEditBackstabDamageMultEl = document.getElementById("monsterEditBackstabDamageMult");
+const monsterEditMeleeReflectPctEl = document.getElementById("monsterEditMeleeReflectPct");
+const monsterEditDeathCloudTurnsEl = document.getElementById("monsterEditDeathCloudTurns");
+const monsterEditDeathCloudRadiusEl = document.getElementById("monsterEditDeathCloudRadius");
+const monsterEditDeathCloudDmgEl = document.getElementById("monsterEditDeathCloudDmg");
+const monsterEditImmunePoisonEl = document.getElementById("monsterEditImmunePoison");
 const shopOverlayEl = document.getElementById("shopOverlay");
 const shopCloseBtnEl = document.getElementById("shopCloseBtn");
 const shopTabBuyEl = document.getElementById("shopTabBuy");
@@ -1422,6 +1478,7 @@ function syncBodyModalLock() {
     !!characterOverlayEl?.classList.contains("show") ||
     !!infoOverlayEl?.classList.contains("show") ||
     !!spriteEditorOverlayEl?.classList.contains("show") ||
+    !!monsterEditorOverlayEl?.classList.contains("show") ||
     !!newDungeonConfirmOverlayEl?.classList.contains("show") ||
     !!levelUpOverlayEl?.classList.contains("show");
   document.body?.classList.toggle("modal-open", hasModal);
@@ -1521,13 +1578,28 @@ const spriteEditorUi = {
   filterSource: "all",
   maxUploadBytes: 50_000_000,
 };
+const monsterEditorUi = {
+  open: false,
+  loading: false,
+  dirty: false,
+  selectedId: "",
+  previewDepth: 1,
+  showAdvanced: false,
+  suspendFormEvents: false,
+  baselineMonsters: {},
+  baselineSpawnRules: [],
+  workingMonsters: {},
+  workingSpawnRules: [],
+};
 const CLIENT_SPRITE_UPLOAD_SOFT_TARGET_BYTES = 450 * 1024;
 const CLIENT_SPRITE_UPLOAD_RETRY_TARGET_BYTES = 220 * 1024;
 let saveNameWasEdited = false;
 let lastAutoSaveName = "";
 const spriteOverrideState = { overrides: {}, scales: {}, entries: [] };
+const monsterEditorState = { monsters: {}, spawnRules: [], updatedAt: "" };
 let infoTierSignature = "";
 let spriteEditorSignature = "";
+let monsterEditorSignature = "";
 const MOBILE_VISIBILITY_BOOST =
   (typeof window !== "undefined" && window.matchMedia && window.matchMedia("(pointer: coarse)").matches) ||
   (typeof navigator !== "undefined" && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || ""));
@@ -1586,6 +1658,7 @@ function bootstrapSpriteOverrides() {
   }
 }
 bootstrapSpriteOverrides();
+const monsterEditorBootstrapPayload = readEmbeddedJson("monsterEditorData");
 
 function normalizeDebugFlags(flags) {
   return {
@@ -3140,6 +3213,108 @@ const MONSTER_TYPES = {
     name: "Rogue",
     baseHp: 30, baseAtk: 15, baseDef: 4, baseAcc: 77, baseEva: 18, spd: 1.15, xp: 11, glyph: "R", sizeGrowth: false,
   },
+  spore_crawler: {
+    id: "spore_crawler",
+    name: "Spore Crawler",
+    baseHp: 34, baseAtk: 14, baseDef: 5, baseAcc: 72, baseEva: 9, spd: 0.95, xp: 12, glyph: "f", sizeGrowth: true,
+    ai: "melee_chase",
+    poisonOnHitChance: 0.26,
+    poisonOnHitTurns: 3,
+    poisonOnHitDmg: 70,
+    deathCloudTurns: 3,
+    deathCloudRadius: 1,
+    deathCloudDmg: 55,
+  },
+  rift_hound: {
+    id: "rift_hound",
+    name: "Rift Hound",
+    baseHp: 48, baseAtk: 20, baseDef: 4, baseAcc: 82, baseEva: 20, spd: 1.32, xp: 18, glyph: "h", sizeGrowth: false,
+    ai: "blink_flanker",
+    blinkRange: 2,
+    backstabDamageMult: 1.2,
+  },
+  crocubot: {
+    id: "crocubot",
+    name: "Croc-u-bot",
+    baseHp: 90, baseAtk: 26, baseDef: 18, baseAcc: 74, baseEva: 6, spd: 0.82, xp: 28, glyph: "C", sizeGrowth: true,
+    ai: "tank",
+    immunePoison: true,
+    stunOnHitChance: 0.12,
+  },
+  bone_herald: {
+    id: "bone_herald",
+    name: "Bone Herald",
+    baseHp: 52, baseAtk: 18, baseDef: 6, baseAcc: 78, baseEva: 12, spd: 1.0, xp: 30, glyph: "N", sizeGrowth: false,
+    ai: "support_undead",
+    range: 5,
+    cdTurns: 2,
+    summonCooldownTurns: 6,
+  },
+  iron_warden: {
+    id: "iron_warden",
+    name: "Iron Warden",
+    baseHp: 118, baseAtk: 30, baseDef: 24, baseAcc: 70, baseEva: 6, spd: 0.78, xp: 38, glyph: "I", sizeGrowth: true,
+    ai: "tank",
+    meleeReflectPct: 0.2,
+  },
+  cave_skirmisher: {
+    id: "cave_skirmisher",
+    name: "Cave Skirmisher",
+    baseHp: 36, baseAtk: 16, baseDef: 3, baseAcc: 82, baseEva: 15, spd: 1.16, xp: 14, glyph: "k", sizeGrowth: false,
+    ai: "ranged_kite",
+    preferredRange: 4,
+    range: 5,
+    cdTurns: 1,
+  },
+  ruin_archer: {
+    id: "ruin_archer",
+    name: "Ruin Archer",
+    baseHp: 46, baseAtk: 21, baseDef: 6, baseAcc: 80, baseEva: 12, spd: 1.0, xp: 19, glyph: "u", sizeGrowth: false,
+    ai: "ranged_hold",
+    preferredRange: 5,
+    range: 6,
+    cdTurns: 2,
+  },
+  storm_sniper: {
+    id: "storm_sniper",
+    name: "Storm Sniper",
+    baseHp: 56, baseAtk: 28, baseDef: 8, baseAcc: 84, baseEva: 14, spd: 1.04, xp: 27, glyph: "t", sizeGrowth: false,
+    ai: "ranged_kite",
+    preferredRange: 6,
+    range: 6,
+    cdTurns: 2,
+    slowOnHitChance: 0.2,
+    slowTurns: 2,
+  },
+  nullmetal_assassin: {
+    id: "nullmetal_assassin",
+    name: "Nullmetal Assassin",
+    baseHp: 58, baseAtk: 30, baseDef: 7, baseAcc: 86, baseEva: 22, spd: 1.24, xp: 34, glyph: "n", sizeGrowth: false,
+    ai: "ranged_kite",
+    preferredRange: 4,
+    range: 5,
+    cdTurns: 2,
+    blinkRange: 2,
+  },
+  deepcore_ballista_sentinel: {
+    id: "deepcore_ballista_sentinel",
+    name: "Deepcore Ballista Sentinel",
+    baseHp: 84, baseAtk: 42, baseDef: 14, baseAcc: 78, baseEva: 4, spd: 0.72, xp: 44, glyph: "D", sizeGrowth: false,
+    ai: "ranged_artillery",
+    preferredRange: 5,
+    range: 5,
+    cdTurns: 3,
+  },
+  singularity_hunter: {
+    id: "singularity_hunter",
+    name: "Singularity Hunter",
+    baseHp: 96, baseAtk: 40, baseDef: 12, baseAcc: 84, baseEva: 20, spd: 1.06, xp: 52, glyph: "Q", sizeGrowth: false,
+    ai: "ranged_kite",
+    preferredRange: 6,
+    range: 6,
+    cdTurns: 2,
+    knockbackOnHitChance: 0.2,
+  },
   slime_green: {
     id: "slime_green",
     name: "Green Slime",
@@ -3179,6 +3354,9 @@ const MONSTER_TYPES = {
 };
 const VOID_ALIGNED_MONSTER_IDS = new Set([
   "wraith",
+  "rift_hound",
+  "nullmetal_assassin",
+  "singularity_hunter",
   "slime_violet",
   "slime_indigo",
   "jelly_red",
@@ -3280,6 +3458,26 @@ function monsterStatsForDepth(type, z) {
   };
 }
 
+function monsterSizeTierPrefix(sizeTier) {
+  if (sizeTier === "large") return "Large";
+  if (sizeTier === "giant") return "Giant";
+  if (sizeTier === "hulking") return "Hulking";
+  return "";
+}
+
+function monsterDisplayName(monsterOrType, depth = 0) {
+  const type = typeof monsterOrType === "string"
+    ? monsterOrType
+    : (monsterOrType?.type ?? "rat");
+  const z = typeof monsterOrType === "string"
+    ? depth
+    : (monsterOrType?.z ?? depth ?? 0);
+  const spec = monsterStatsForDepth(type, z);
+  const baseName = spec?.name ?? MONSTER_TYPES[type]?.name ?? type;
+  const prefix = monsterSizeTierPrefix(spec?.sizeTier);
+  return prefix ? `${prefix} ${baseName}` : baseName;
+}
+
 const METAL_TIERS = [
   { id: "wood", name: "Wood", color: "#8B5A2B", atkBonus: -30, defBonus: 0, unlockDepth: 0, rampDepth: 2, maxWeight: 42 },
   { id: "bronze", name: "Bronze", color: "#CD7F32", atkBonus: 0, defBonus: 40, unlockDepth: 0, rampDepth: 2, maxWeight: 38 },
@@ -3324,7 +3522,7 @@ const MATERIAL_DEPTH_WINDOWS = {
 const MATERIAL_BY_ID = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m]));
 const MATERIAL_COLOR_BY_ID = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.color]));
 const WEAPON_MATERIALS = METAL_TIERS.map((m) => m.id);
-const WEAPON_KINDS = ["dagger", "sword", "axe"];
+const WEAPON_KINDS = ["dagger", "sword", "axe", "shortbow", "longbow", "crossbow"];
 const ARMOR_MATERIALS = METAL_TIERS.map((m) => m.id);
 const ARMOR_SLOTS = ["head", "chest", "legs"];
 const SCRAPPER_LOW_TIER_MAX_INDEX = Math.max(0, METAL_TIERS.findIndex((tier) => tier.id === "steel"));
@@ -3333,11 +3531,189 @@ const WEAPON_KIND_LABEL = {
   dagger: "Dagger",
   sword: "Sword",
   axe: "Axe",
+  shortbow: "Shortbow",
+  longbow: "Longbow",
+  crossbow: "Crossbow",
+};
+const BOW_DISPLAY_NAME_BY_MATERIAL = {
+  wood: {
+    shortbow: "Oak Initiate Bow",
+    longbow: "Hardened Oak Longbow",
+    crossbow: "Crude Oak Crossbow",
+  },
+  bronze: {
+    shortbow: "Bronze-Banded Oak Bow",
+    longbow: "Copper-Limbed Longbow",
+    crossbow: "Bronze Crankbow",
+  },
+  iron: {
+    shortbow: "Iron-Riveted Oak Bow",
+    longbow: "Forged Iron Warbow",
+    crossbow: "Iron Bolt-Caster",
+  },
+  steel: {
+    shortbow: "Steel-Tipped Yew Bow",
+    longbow: "Tempered Yew Longbow",
+    crossbow: "Steel Recurve Crossbow",
+  },
+  silversteel: {
+    shortbow: "Silversteel Whisperbow",
+    longbow: "Frostbound Yew Longbow",
+    crossbow: "Silversteel Windlass",
+  },
+  storm_alloy: {
+    shortbow: "Stormbound Yew Bow",
+    longbow: "Thunderlimb Warbow",
+    crossbow: "Storm Alloy Arcbow",
+  },
+  sunforged_alloy: {
+    shortbow: "Sunforged Ash Bow",
+    longbow: "Radiant Warbow",
+    crossbow: "Solar Crankbow",
+  },
+  embersteel: {
+    shortbow: "Emberlash Bow",
+    longbow: "Magma-Core Warbow",
+    crossbow: "Embersteel Siegebow",
+  },
+  star_metal: {
+    shortbow: "Starforged Ash Bow",
+    longbow: "Meteor Arc Longbow",
+    crossbow: "Star Metal Ballista",
+  },
+  nightsteel: {
+    shortbow: "Nightsteel Shadowbow",
+    longbow: "Abyssal Ironwood Longbow",
+    crossbow: "Nightsteel Silent Repeater",
+  },
+  heartstone_alloy: {
+    shortbow: "Heartpulse Bow",
+    longbow: "Crimson Core Longbow",
+    crossbow: "Heartstone Windlass",
+  },
+  aether_alloy: {
+    shortbow: "Aetherweave Bow",
+    longbow: "Mistbound Ironwood Warbow",
+    crossbow: "Aetherlight Crossbow",
+  },
+  prime_metal: {
+    shortbow: "Primebound Dragonbow",
+    longbow: "Ivory Sovereign Longbow",
+    crossbow: "Prime Metal Arbalest",
+  },
+  nullmetal: {
+    shortbow: "Nullstring Dragonbow",
+    longbow: "Voidlined Warbow",
+    crossbow: "Nullmetal Suppressor",
+  },
+  dungeoncore_alloy: {
+    shortbow: "Corebound Bow",
+    longbow: "Dungeonheart Warbow",
+    crossbow: "Corelock Ballista",
+  },
+  azhurite_prime: {
+    shortbow: "Azhurite Recurve",
+    longbow: "Azurefract Longbow",
+    crossbow: "Azhurite Prismcaster",
+  },
+  deepcore_metal: {
+    shortbow: "Deepcore Warbow",
+    longbow: "Coreblood Siege Bow",
+    crossbow: "Deepcore Torsion Engine",
+  },
+  singularity_steel: {
+    shortbow: "Singularity Recurve",
+    longbow: "Gravity Arc Longbow",
+    crossbow: "Event Horizon Arbalest",
+  },
 };
 const WEAPON_KIND_ATK = {
   dagger: 90,
   sword: 150,
   axe: 210,
+  shortbow: 105,
+  longbow: 135,
+  crossbow: 165,
+};
+const WEAPON_ATTACK_PROFILES = {
+  dagger: {
+    kind: "melee",
+    range: 1,
+    minRange: 1,
+    requiresLOS: false,
+    cannotFireAdjacent: false,
+    damageMod: 1,
+    accuracyMod: 0,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    hands: 1,
+  },
+  sword: {
+    kind: "melee",
+    range: 1,
+    minRange: 1,
+    requiresLOS: false,
+    cannotFireAdjacent: false,
+    damageMod: 1,
+    accuracyMod: 0,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    hands: 1,
+  },
+  axe: {
+    kind: "melee",
+    range: 1,
+    minRange: 1,
+    requiresLOS: false,
+    cannotFireAdjacent: false,
+    damageMod: 1,
+    accuracyMod: -1,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    hands: 1,
+  },
+  shortbow: {
+    kind: "ranged",
+    range: 7,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.80,
+    accuracyMod: 2,
+    critChanceMod: 3,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.88,
+    maxRangeFalloffPct: 0.12,
+    hands: 2,
+  },
+  longbow: {
+    kind: "ranged",
+    range: 8,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.92,
+    accuracyMod: 0,
+    critChanceMod: 0,
+    defIgnorePct: 0.05,
+    closeRangeDamageMult: 0.75,
+    maxRangeFalloffPct: 0.10,
+    hands: 2,
+  },
+  crossbow: {
+    kind: "ranged",
+    range: 6,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 1.04,
+    accuracyMod: -3,
+    critChanceMod: -1,
+    defIgnorePct: 0.09,
+    closeRangeDamageMult: 0.62,
+    maxRangeFalloffPct: 0.14,
+    hands: 1,
+  },
 };
 const WEAPON_MATERIAL_ATK = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.atkBonus]));
 const ARMOR_MATERIAL_DEF = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.defBonus]));
@@ -3350,8 +3726,27 @@ const ARMOR_SLOT_DEF = {
 function capWord(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function titleFromId(s) { return String(s ?? "").split("_").map(capWord).join(" "); }
 function materialLabel(material) { return MATERIAL_BY_ID[material]?.name ?? titleFromId(material); }
+function weaponDisplayName(material, kind) {
+  const mappedBowName = BOW_DISPLAY_NAME_BY_MATERIAL[material]?.[kind];
+  if (mappedBowName) {
+    if (/bow/i.test(mappedBowName)) return mappedBowName;
+    return `${mappedBowName} (${WEAPON_KIND_LABEL[kind]})`;
+  }
+  return `${materialLabel(material)} ${WEAPON_KIND_LABEL[kind]}`;
+}
 function weaponType(material, kind) { return `weapon_${material}_${kind}`; }
 function armorType(material, slot) { return `armor_${material}_${slot}`; }
+function weaponKindFromItemType(type) {
+  if (!type || typeof type !== "string" || !type.startsWith("weapon_")) return null;
+  const parts = type.split("_");
+  if (parts.length < 3) return null;
+  return parts[parts.length - 1] ?? null;
+}
+function weaponAttackProfileForType(type) {
+  const kind = weaponKindFromItemType(type);
+  const profile = kind ? WEAPON_ATTACK_PROFILES[kind] : null;
+  return profile ?? WEAPON_ATTACK_PROFILES.sword;
+}
 
 const ITEM_TYPES = {
   potion: { name: "Potion" },
@@ -3376,8 +3771,12 @@ const WEAPONS = {};
 for (const material of WEAPON_MATERIALS) {
   for (const kind of WEAPON_KINDS) {
     const id = weaponType(material, kind);
-    ITEM_TYPES[id] = { name: `${materialLabel(material)} ${WEAPON_KIND_LABEL[kind]}` };
-    WEAPONS[id] = { atkBonus: WEAPON_KIND_ATK[kind] + WEAPON_MATERIAL_ATK[material] };
+    ITEM_TYPES[id] = { name: weaponDisplayName(material, kind) };
+    WEAPONS[id] = {
+      atkBonus: WEAPON_KIND_ATK[kind] + WEAPON_MATERIAL_ATK[material],
+      kind,
+      attackProfile: { ...(WEAPON_ATTACK_PROFILES[kind] ?? WEAPON_ATTACK_PROFILES.sword) },
+    };
   }
 }
 
@@ -3477,9 +3876,12 @@ function armorMaterialWeightsForDepth(z) {
 function weaponForDepth(z, rng = Math.random) {
   const material = weightedPick(rng, weaponMaterialWeightsForDepth(z));
   const kind = weightedPick(rng, [
-    { id: "dagger", w: 28 },
-    { id: "sword", w: 40 },
-    { id: "axe", w: 32 },
+    { id: "dagger", w: 20 },
+    { id: "sword", w: 28 },
+    { id: "axe", w: 22 },
+    { id: "shortbow", w: 14 },
+    { id: "longbow", w: 10 },
+    { id: "crossbow", w: 6 },
   ]);
   return weaponType(material, kind);
 }
@@ -3786,6 +4188,7 @@ function openShopOverlay(state, mode = "buy") {
   closeSaveGameOverlay();
   closeInfoOverlay();
   closeSpriteEditorOverlay();
+  closeMonsterEditorOverlay();
   if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   ensureShopState(state);
   refreshShopStock(state, false);
@@ -3888,9 +4291,23 @@ function renderShopOverlay(state) {
   renderShopItemPreview(selected.type);
   const atk = WEAPONS[selected.type]?.atkBonus ?? 0;
   const def = ARMOR_PIECES[selected.type]?.defBonus ?? 0;
+  const weaponProfile = selected.type?.startsWith("weapon_") ? weaponAttackProfileForType(selected.type) : null;
   const details = [];
   if (atk > 0) details.push(`ATK Bonus: +${atk}`);
   if (def > 0) details.push(`DEF Bonus: +${def}`);
+  if (weaponProfile) {
+    if ((weaponProfile.kind ?? "melee") === "ranged") {
+      details.push(`Range: ${Math.max(1, Math.floor(weaponProfile.minRange ?? 1))}-${Math.max(1, Math.floor(weaponProfile.range ?? 1))}`);
+      details.push(`Targeting: ${weaponProfile.requiresLOS ? "LoS required" : "No LoS requirement"}`);
+      if (weaponProfile.cannotFireAdjacent) details.push("Cannot fire while adjacent to enemies");
+      const closePenaltyPct = Math.round(clamp(1 - Number(weaponProfile.closeRangeDamageMult ?? 1), 0, 0.95) * 100);
+      if (closePenaltyPct > 0) details.push(`Adjacency damage penalty: -${closePenaltyPct}%`);
+      const maxFalloffPct = Math.round(clamp(Number(weaponProfile.maxRangeFalloffPct ?? 0), 0, 0.95) * 100);
+      if (maxFalloffPct > 0) details.push(`Max-range damage falloff: up to -${maxFalloffPct}%`);
+    } else {
+      details.push("Type: Melee");
+    }
+  }
   if (!atk && !def && selected.type === "potion") details.push("Consumable healing item.");
   if (!atk && !def && selected.type !== "potion") details.push("Utility item.");
   if (isBuyMode) details.push(`Stock: ${Math.max(1, selected.amount ?? 1)}`);
@@ -3961,83 +4378,237 @@ function weightedChoice(rng, entries) {
   }
   return entries[entries.length - 1].id;
 }
+const MONSTER_SPAWN_RULES = [
+  { id: "rat", minDepth: 0, maxDepth: 5, baseWeight: 7, rampFactor: -0.9 },
+  { id: "goblin", minDepth: 0, maxDepth: 10, baseWeight: 6, rampFactor: -0.25 },
+  { id: "skeleton", minDepth: 0, maxDepth: 14, baseWeight: 5, rampFactor: -0.1 },
+  { id: "slime_green", minDepth: 0, maxDepth: 6, baseWeight: 2, rampFactor: -0.18 },
+  { id: "slime_yellow", minDepth: 1, maxDepth: 10, baseWeight: 1.8, rampFactor: 0.07 },
+  { id: "archer", minDepth: 2, maxDepth: 15, baseWeight: 2, rampFactor: 0.08 },
+  { id: "dire_wolf", minDepth: 2, maxDepth: 20, baseWeight: 2, rampFactor: 0.09 },
+  { id: "giant_spider", minDepth: 3, maxDepth: 16, baseWeight: 2.4, rampFactor: 0.09 },
+  { id: "hobgoblin", minDepth: 4, maxDepth: 26, baseWeight: 2.8, rampFactor: 0.1 },
+  { id: "wraith", minDepth: 5, maxDepth: 36, baseWeight: 2.1, rampFactor: 0.1 },
+  { id: "cave_troll", minDepth: 5, maxDepth: 34, baseWeight: 2.1, rampFactor: 0.09 },
+  { id: "basilisk", minDepth: 7, maxDepth: 60, baseWeight: 1.8, rampFactor: 0.1 },
+  { id: "ancient_automaton", minDepth: 8, maxDepth: 70, baseWeight: 1.3, rampFactor: 0.1 },
+  { id: "slime_orange", minDepth: 3, maxDepth: 15, baseWeight: 2.2, rampFactor: 0.12 },
+  { id: "slime_red", minDepth: 5, maxDepth: 24, baseWeight: 2.4, rampFactor: 0.1 },
+  { id: "slime_violet", minDepth: 8, maxDepth: 36, baseWeight: 2.1, rampFactor: 0.1 },
+  { id: "slime_indigo", minDepth: 11, maxDepth: null, baseWeight: 1.7, rampFactor: 0.09 },
+  { id: "spore_crawler", minDepth: 4, maxDepth: 22, baseWeight: 1.1, rampFactor: 0.12 },
+  { id: "cave_skirmisher", minDepth: 3, maxDepth: 18, baseWeight: 1.1, rampFactor: 0.1 },
+  { id: "ruin_archer", minDepth: 6, maxDepth: 24, baseWeight: 0.95, rampFactor: 0.09 },
+  { id: "rift_hound", minDepth: 8, maxDepth: 30, baseWeight: 0.95, rampFactor: 0.1 },
+  { id: "storm_sniper", minDepth: 12, maxDepth: 38, baseWeight: 0.78, rampFactor: 0.1 },
+  { id: "crocubot", minDepth: 14, maxDepth: 50, baseWeight: 0.72, rampFactor: 0.09 },
+  { id: "nullmetal_assassin", minDepth: 15, maxDepth: 44, baseWeight: 0.68, rampFactor: 0.09 },
+  { id: "deepcore_ballista_sentinel", minDepth: 17, maxDepth: 46, baseWeight: 0.52, rampFactor: 0.08 },
+  { id: "singularity_hunter", minDepth: 18, maxDepth: null, baseWeight: 0.42, rampFactor: 0.07 },
+  { id: "bone_herald", minDepth: 20, maxDepth: 70, baseWeight: 0.62, rampFactor: 0.08 },
+  { id: "iron_warden", minDepth: 28, maxDepth: null, baseWeight: 0.52, rampFactor: 0.07 },
+];
+const BASE_MONSTER_TYPES = JSON.parse(JSON.stringify(MONSTER_TYPES));
+const BASE_MONSTER_SPAWN_RULES = MONSTER_SPAWN_RULES.map((rule) => ({ ...rule }));
+
+function monsterSpawnWeightForDepth(rule, depth) {
+  if (!rule || typeof rule !== "object") return 0;
+  const minDepth = Math.max(0, Math.floor(rule.minDepth ?? 0));
+  const maxDepth = Number.isFinite(rule.maxDepth) ? Math.floor(rule.maxDepth) : Number.POSITIVE_INFINITY;
+  if (depth < minDepth || depth > maxDepth) return 0;
+  const base = Number(rule.baseWeight ?? 0);
+  const ramp = Number(rule.rampFactor ?? 0);
+  const raw = base + (depth - minDepth) * ramp;
+  return clamp(raw, 0, 12);
+}
+
 function monsterTableForDepth(z) {
   const depth = Math.max(0, Math.floor(z ?? 0));
-  if (depth <= 1) {
-    return [
-      { id: "rat", w: 3 },
-      { id: "goblin", w: 7 },
-      { id: "skeleton", w: 5 },
-      { id: "slime_green", w: 2 },
-    ];
+  const weighted = [];
+  for (const rule of MONSTER_SPAWN_RULES) {
+    const w = monsterSpawnWeightForDepth(rule, depth);
+    if (w <= 0) continue;
+    weighted.push({ id: rule.id, w: Math.max(1, Math.round(w * 100) / 100) });
   }
-  if (depth <= 2) {
-    return [
-      { id: "rat", w: 2 },
-      { id: "goblin", w: 6 },
-      { id: "skeleton", w: 5 },
-      { id: "archer", w: 2 },
-      { id: "dire_wolf", w: 2 },
-      { id: "slime_green", w: 2 },
-      { id: "slime_yellow", w: 2 },
-    ];
-  }
-  if (depth <= 4) {
-    return [
-      { id: "goblin", w: 4 },
-      { id: "skeleton", w: 4 },
-      { id: "archer", w: 3 },
-      { id: "dire_wolf", w: 3 },
-      { id: "giant_spider", w: 3 },
-      { id: "hobgoblin", w: 3 },
-      { id: "slime_yellow", w: 1 },
-      { id: "slime_orange", w: 1 },
-    ];
-  }
-  if (depth <= 6) {
-    return [
-      { id: "archer", w: 3 },
-      { id: "dire_wolf", w: 3 },
-      { id: "giant_spider", w: 3 },
-      { id: "hobgoblin", w: 4 },
-      { id: "wraith", w: 2 },
-      { id: "cave_troll", w: depth >= 5 ? 2 : 0 },
-      { id: "slime_orange", w: 4 },
-      { id: "slime_red", w: 3 },
-    ].filter((entry) => entry.w > 0);
-  }
-  if (depth <= 9) {
-    return [
-      { id: "giant_spider", w: 3 },
-      { id: "hobgoblin", w: 4 },
-      { id: "wraith", w: 3 },
-      { id: "cave_troll", w: 3 },
-      { id: "basilisk", w: depth >= 6 ? 2 : 0 },
-      { id: "ancient_automaton", w: depth >= 7 ? 1 : 0 },
-      { id: "slime_red", w: 4 },
-      { id: "slime_violet", w: 3 },
-    ].filter((entry) => entry.w > 0);
-  }
-  if (depth <= 12) {
-    return [
-      { id: "wraith", w: 3 },
-      { id: "cave_troll", w: 3 },
-      { id: "basilisk", w: 4 },
-      { id: "ancient_automaton", w: 3 },
-      { id: "archer", w: 2 },
-      { id: "slime_violet", w: 4 },
-      { id: "slime_indigo", w: 3 },
-    ];
-  }
-  return [
-    { id: "basilisk", w: 4 },
-    { id: "ancient_automaton", w: 4 },
-    { id: "wraith", w: 3 },
-    { id: "cave_troll", w: 3 },
-    { id: "slime_indigo", w: 4 },
-    { id: "hobgoblin", w: 2 },
-    { id: "dire_wolf", w: 2 },
+  if (weighted.length > 0) return weighted;
+  return [{ id: "rat", w: 1 }];
+}
+
+function normalizeMonsterEditorId(raw) {
+  const id = String(raw ?? "").trim().toLowerCase();
+  if (!/^[a-z0-9_]{1,80}$/.test(id)) return null;
+  return id;
+}
+
+function normalizeMonsterEditorSpec(id, rawSpec = null) {
+  const src = (rawSpec && typeof rawSpec === "object") ? rawSpec : {};
+  const baseName = String(src.name ?? "").trim() || titleFromId(id);
+  const glyphRaw = String(src.glyph ?? "").trim();
+  const glyph = glyphRaw ? glyphRaw.slice(0, 2) : (id.slice(0, 1) || "m");
+  const aliasOf = normalizeMonsterEditorId(src.aliasOf ?? "");
+  const ai = String(src.ai ?? "").trim().slice(0, 40);
+  const spec = {
+    id,
+    name: baseName.slice(0, 80),
+    glyph: glyph || "m",
+    sizeGrowth: src.sizeGrowth !== false,
+    baseHp: clamp(Math.floor(Number(src.baseHp ?? 18) || 18), 1, 250000),
+    baseAtk: clamp(Math.floor(Number(src.baseAtk ?? 6) || 6), 1, 250000),
+    baseDef: clamp(Math.floor(Number(src.baseDef ?? 1) || 1), 0, 250000),
+    baseAcc: clamp(Math.floor(Number(src.baseAcc ?? 70) || 70), 1, 98),
+    baseEva: clamp(Math.floor(Number(src.baseEva ?? 8) || 8), 0, 95),
+    spd: clamp(Number(src.spd ?? 1) || 1, 0.1, 8),
+    xp: clamp(Math.floor(Number(src.xp ?? 3) || 3), 1, 250000),
+  };
+  if (aliasOf && aliasOf !== id) spec.aliasOf = aliasOf;
+  if (ai) spec.ai = ai;
+
+  const optionalInt = [
+    "range", "cdTurns", "preferredRange", "blinkRange",
+    "poisonOnHitTurns", "poisonOnHitDmg", "slowTurns",
+    "summonCooldownTurns", "deathCloudTurns", "deathCloudRadius", "deathCloudDmg",
   ];
+  for (const key of optionalInt) {
+    if (!Number.isFinite(Number(src[key]))) continue;
+    const value = Math.floor(Number(src[key]) || 0);
+    if (value > 0) spec[key] = value;
+  }
+
+  const optionalPct = [
+    "poisonOnHitChance", "slowOnHitChance", "stunOnHitChance",
+    "knockbackOnHitChance", "meleeReflectPct",
+  ];
+  for (const key of optionalPct) {
+    if (!Number.isFinite(Number(src[key]))) continue;
+    const value = clamp(Number(src[key]) || 0, 0, 0.95);
+    if (value > 0) spec[key] = Number(value.toFixed(3));
+  }
+  if (Number.isFinite(Number(src.backstabDamageMult))) {
+    const value = clamp(Number(src.backstabDamageMult) || 0, 0.5, 5);
+    if (value > 0) spec.backstabDamageMult = Number(value.toFixed(3));
+  }
+  if (src.immunePoison) spec.immunePoison = true;
+
+  return spec;
+}
+
+function normalizeMonsterSpawnRule(rawRule = null) {
+  const src = (rawRule && typeof rawRule === "object") ? rawRule : {};
+  const id = normalizeMonsterEditorId(src.id ?? "");
+  if (!id) return null;
+  const minDepth = clamp(Math.floor(Number(src.minDepth ?? 0) || 0), 0, 5000);
+  const maxRaw = src.maxDepth;
+  let maxDepth = null;
+  if (maxRaw !== null && maxRaw !== "" && Number.isFinite(Number(maxRaw))) {
+    maxDepth = clamp(Math.floor(Number(maxRaw) || 0), minDepth, 5000);
+  }
+  const baseWeight = Number(clamp(Number(src.baseWeight ?? 1) || 1, 0, 20).toFixed(3));
+  const rampFactor = Number(clamp(Number(src.rampFactor ?? 0) || 0, -5, 5).toFixed(3));
+  return { id, minDepth, maxDepth, baseWeight, rampFactor };
+}
+
+function cloneMonsterTypeMapForEditor(source = MONSTER_TYPES) {
+  const out = {};
+  for (const [idRaw, specRaw] of Object.entries(source ?? {})) {
+    const id = normalizeMonsterEditorId(idRaw);
+    if (!id) continue;
+    out[id] = normalizeMonsterEditorSpec(id, specRaw);
+  }
+  return out;
+}
+
+function cloneMonsterSpawnRulesForEditor(source = MONSTER_SPAWN_RULES) {
+  const out = [];
+  for (const ruleRaw of source ?? []) {
+    const rule = normalizeMonsterSpawnRule(ruleRaw);
+    if (!rule) continue;
+    out.push(rule);
+  }
+  out.sort((a, b) => (a.minDepth - b.minDepth) || a.id.localeCompare(b.id));
+  return out;
+}
+
+function normalizeMonsterEditorPayload(payload) {
+  const src = (payload && typeof payload === "object") ? payload : {};
+  const monstersOut = {};
+  const monstersRaw = src.monsters;
+  if (Array.isArray(monstersRaw)) {
+    for (const entry of monstersRaw) {
+      if (!entry || typeof entry !== "object") continue;
+      const id = normalizeMonsterEditorId(entry.id ?? "");
+      if (!id) continue;
+      monstersOut[id] = normalizeMonsterEditorSpec(id, entry);
+    }
+  } else if (monstersRaw && typeof monstersRaw === "object") {
+    for (const [idRaw, specRaw] of Object.entries(monstersRaw)) {
+      const id = normalizeMonsterEditorId(idRaw);
+      if (!id) continue;
+      monstersOut[id] = normalizeMonsterEditorSpec(id, specRaw);
+    }
+  }
+  const spawnRulesOut = [];
+  const spawnRulesRaw = Array.isArray(src.spawn_rules) ? src.spawn_rules : [];
+  for (const ruleRaw of spawnRulesRaw) {
+    const rule = normalizeMonsterSpawnRule(ruleRaw);
+    if (!rule) continue;
+    spawnRulesOut.push(rule);
+  }
+  spawnRulesOut.sort((a, b) => (a.minDepth - b.minDepth) || a.id.localeCompare(b.id));
+  return {
+    monsters: monstersOut,
+    spawnRules: spawnRulesOut,
+    updatedAt: String(src.updated_at ?? "").trim(),
+  };
+}
+
+function replaceMonsterRuntimeConfig(monsters = {}, spawnRules = []) {
+  const monsterMap = (monsters && Object.keys(monsters).length > 0)
+    ? monsters
+    : BASE_MONSTER_TYPES;
+  const rulesList = (Array.isArray(spawnRules) && spawnRules.length > 0)
+    ? spawnRules
+    : BASE_MONSTER_SPAWN_RULES;
+
+  for (const key of Object.keys(MONSTER_TYPES)) {
+    delete MONSTER_TYPES[key];
+  }
+  for (const [idRaw, rawSpec] of Object.entries(monsterMap)) {
+    const id = normalizeMonsterEditorId(idRaw);
+    if (!id) continue;
+    MONSTER_TYPES[id] = normalizeMonsterEditorSpec(id, rawSpec);
+  }
+  if (!MONSTER_TYPES.rat) {
+    MONSTER_TYPES.rat = normalizeMonsterEditorSpec("rat", BASE_MONSTER_TYPES.rat ?? { id: "rat", name: "Rat", glyph: "r", baseHp: 18, baseAtk: 6, baseDef: 1, baseAcc: 70, baseEva: 18, spd: 1.25, xp: 3, sizeGrowth: true });
+  }
+
+  MONSTER_SPAWN_RULES.length = 0;
+  for (const rawRule of rulesList) {
+    const rule = normalizeMonsterSpawnRule(rawRule);
+    if (!rule) continue;
+    MONSTER_SPAWN_RULES.push(rule);
+  }
+  if (!MONSTER_SPAWN_RULES.length) {
+    for (const fallbackRule of BASE_MONSTER_SPAWN_RULES) {
+      MONSTER_SPAWN_RULES.push({ ...fallbackRule });
+    }
+  }
+
+  spriteEditorUi.objects = buildSpriteObjectCatalog();
+  updateSpriteEditorFilterControls();
+  if (isSpriteEditorOverlayOpen()) renderSpriteEditorList();
+}
+
+function applyMonsterEditorPayload(payload, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const normalized = normalizeMonsterEditorPayload(payload);
+  monsterEditorState.monsters = normalized.monsters;
+  monsterEditorState.spawnRules = normalized.spawnRules;
+  monsterEditorState.updatedAt = normalized.updatedAt;
+  if (!opts.skipRuntimeApply) {
+    replaceMonsterRuntimeConfig(normalized.monsters, normalized.spawnRules);
+  }
+  monsterEditorSignature = "";
+  return normalized;
 }
 
 function keyWeightsForDepth(z) {
@@ -4419,6 +4990,7 @@ function setNewDungeonConfirmOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
   }
   newDungeonConfirmOverlayEl.classList.toggle("show", show);
   newDungeonConfirmOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
@@ -4490,6 +5062,7 @@ async function requestNewDungeonReset(state) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
     game = makeNewGame(randomSeedString(), { carryover });
     game.debug = priorDebug;
     enforceAdminControlPolicy(game);
@@ -4582,6 +5155,7 @@ function setSaveGameOverlayOpen(open) {
     closeShopOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
   }
   saveMenuUi.open = show;
   saveGameOverlayEl.classList.toggle("show", show);
@@ -4851,6 +5425,7 @@ function setCharacterOverlayOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   }
   characterUi.open = show;
@@ -5566,7 +6141,7 @@ function resolveContextAction(state, occupancy = null) {
 
   const attackTarget = getAdjacentMonsterTarget(state, occ);
   if (attackTarget) {
-    const nm = MONSTER_TYPES[attackTarget.type]?.name ?? attackTarget.type;
+    const nm = monsterDisplayName(attackTarget, state.player.z);
     return {
       type: "attack",
       targetMonsterId: attackTarget.id,
@@ -5628,8 +6203,58 @@ function monsterThreatScore(state, monster) {
   return level * 100000 + maxHp * 8 + atkHi * 6 + atkLo * 3;
 }
 
+function playerWeaponAttackProfile(state) {
+  const weaponTypeId = state?.player?.equip?.weapon ?? null;
+  return weaponAttackProfileForType(weaponTypeId);
+}
+
+function hasAdjacentMonster(state, occupancy = null) {
+  const p = state.player;
+  const occ = occupancy ?? buildOccupancy(state);
+  const dirs = [[0,-1],[1,0],[0,1],[-1,0]];
+  for (const [dx, dy] of dirs) {
+    if (occ.monsters.has(keyXYZ(p.x + dx, p.y + dy, p.z))) return true;
+  }
+  return false;
+}
+
+function playerCanAttackMonster(state, monster, profile = null, occupancy = null) {
+  if (!monster || monster.kind !== "monster") return false;
+  const p = state.player;
+  if (!p || p.dead) return false;
+  if (monster.z !== p.z) return false;
+  const atkProfile = profile ?? playerWeaponAttackProfile(state);
+  const dist = Math.abs((monster.x ?? 0) - p.x) + Math.abs((monster.y ?? 0) - p.y);
+  const minRange = Math.max(1, Math.floor(atkProfile?.minRange ?? 1));
+  const maxRange = Math.max(minRange, Math.floor(atkProfile?.range ?? 1));
+  if (dist < minRange || dist > maxRange) return false;
+  if (atkProfile?.kind === "melee") return dist === 1;
+  if (atkProfile?.cannotFireAdjacent && hasAdjacentMonster(state, occupancy)) return false;
+  if (atkProfile?.requiresLOS && !hasLineOfSight(state.world, p.z, p.x, p.y, monster.x, monster.y)) return false;
+  return true;
+}
+
+function getAttackableMonsters(state, occupancy = null, profile = null) {
+  const p = state.player;
+  const atkProfile = profile ?? playerWeaponAttackProfile(state);
+  const out = [];
+  for (const ent of state.entities.values()) {
+    if (!ent || ent.kind !== "monster") continue;
+    if (ent.z !== p.z) continue;
+    if (!playerCanAttackMonster(state, ent, atkProfile, occupancy)) continue;
+    const dist = Math.abs((ent.x ?? 0) - p.x) + Math.abs((ent.y ?? 0) - p.y);
+    out.push({ monster: ent, dist, score: monsterThreatScore(state, ent) });
+  }
+  out.sort((a, b) =>
+    (b.score - a.score) ||
+    (a.dist - b.dist) ||
+    ((a.monster?.id ?? "").localeCompare(b.monster?.id ?? ""))
+  );
+  return out;
+}
+
 function getAdjacentMonsterTarget(state, occupancy = null) {
-  const list = getAdjacentMonsters(state, occupancy);
+  const list = getAttackableMonsters(state, occupancy, playerWeaponAttackProfile(state));
   return list.length ? list[0].monster : null;
 }
 
@@ -5672,13 +6297,19 @@ function attackAdjacentMonster(state, occupancy = null) {
 
 function attackMonsterById(state, monsterId) {
   const m = state.entities.get(monsterId);
+  const profile = playerWeaponAttackProfile(state);
   if (!m || m.kind !== "monster" || m.z !== state.player.z) {
     pushLog(state, "That enemy is no longer in range.");
     return false;
   }
-  const dist = Math.abs(m.x - state.player.x) + Math.abs(m.y - state.player.y);
-  if (dist !== 1) {
-    pushLog(state, "That enemy is no longer adjacent.");
+  if (!playerCanAttackMonster(state, m, profile)) {
+    if (profile?.kind === "ranged" && profile?.cannotFireAdjacent && hasAdjacentMonster(state)) {
+      pushLog(state, "An adjacent enemy prevents you from firing.");
+    } else if (profile?.kind === "ranged") {
+      pushLog(state, "Target is out of range or line of sight.");
+    } else {
+      pushLog(state, "That enemy is no longer adjacent.");
+    }
     return false;
   }
   playerAttack(state, m);
@@ -5903,17 +6534,18 @@ function buildAuxContextActions(state, occupancy = null, primaryAction = null) {
     });
   }
 
-  const adjacent = getAdjacentMonsters(state, occ);
-  for (const entry of adjacent) {
+  const attackables = getAttackableMonsters(state, occ, playerWeaponAttackProfile(state));
+  for (const entry of attackables) {
     const id = entry.monster.id;
     if (primaryAction?.type === "attack" && primaryAction?.targetMonsterId === id) continue;
-    const nm = MONSTER_TYPES[entry.monster.type]?.name ?? entry.monster.type;
+    const nm = monsterDisplayName(entry.monster, state.player.z);
+    const distLabel = entry.dist > 1 ? ` (${entry.dist} tiles)` : "";
     actions.push({
       id: `aux|attack|${id}`,
       type: "attack",
       targetMonsterId: id,
       monsterType: entry.monster.type,
-      label: `Attack ${nm} (${entry.dir})`,
+      label: `Attack ${nm}${distLabel}`,
       run: () => attackMonsterById(state, id),
     });
   }
@@ -6258,6 +6890,15 @@ function recalcDerivedStats(state) {
   const effAtk = state.player.effects
     .filter(e => e.type === "bless" || e.type === "curse")
     .reduce((s, e) => s + e.atkDelta, 0);
+  const effAcc = state.player.effects
+    .filter((e) => Number.isFinite(e?.accDelta))
+    .reduce((s, e) => s + Number(e.accDelta), 0);
+  const effEva = state.player.effects
+    .filter((e) => Number.isFinite(e?.evaDelta))
+    .reduce((s, e) => s + Number(e.evaDelta), 0);
+  const effSpeedMult = state.player.effects
+    .filter((e) => Number.isFinite(e?.speedMult))
+    .reduce((m, e) => m * Math.max(0.2, Number(e.speedMult ?? 1)), 1);
   const weaponAtk = weapon?.atkBonus ?? 0;
   const armorRaw = (headArmor?.defBonus ?? 0) + (chestArmor?.defBonus ?? 0) + (legsArmor?.defBonus ?? 0);
   const level = Math.max(1, Math.floor(p.level ?? 1));
@@ -6281,6 +6922,11 @@ function recalcDerivedStats(state) {
 
   p.baseAtk = baseAtk;
   p.baseDef = baseDef;
+  p.weaponKind = weapon?.kind ?? "sword";
+  p.weaponAttackProfile = weapon?.attackProfile ? { ...weapon.attackProfile } : { ...WEAPON_ATTACK_PROFILES.sword };
+  p.weaponRange = Math.max(1, Math.floor(p.weaponAttackProfile?.range ?? 1));
+  p.weaponMinRange = Math.max(1, Math.floor(p.weaponAttackProfile?.minRange ?? 1));
+  p.weaponIsRanged = (p.weaponAttackProfile?.kind ?? "melee") === "ranged";
   p.weaponAtkBonus = weaponAtk;
   p.weaponAtkScale = weaponAtkScale;
   p.effectAtkBonus = effAtk;
@@ -6288,9 +6934,9 @@ function recalcDerivedStats(state) {
   p.atkLo = Math.max(1, Math.round(baseAtk * 0.86));
   p.atkHi = Math.max(p.atkLo, Math.round(baseAtk * 1.16));
   p.defBonus = Math.max(0, Math.round((baseDef + armorRaw) * armorEffect));
-  p.acc = clamp(Math.round(baseAcc + (species.accFlat ?? 0) + (classDef.accFlat ?? 0)), 10, 98);
-  p.eva = clamp(Math.round(baseEva + (species.evaFlat ?? 0) + (classDef.evaFlat ?? 0)), 0, 85);
-  p.spd = Number((baseSpd * (species.speedMult ?? 1) * (classDef.speedMult ?? 1)).toFixed(3));
+  p.acc = clamp(Math.round(baseAcc + (species.accFlat ?? 0) + (classDef.accFlat ?? 0) + effAcc), 10, 98);
+  p.eva = clamp(Math.round(baseEva + (species.evaFlat ?? 0) + (classDef.evaFlat ?? 0) + effEva), 0, 85);
+  p.spd = Number((baseSpd * (species.speedMult ?? 1) * (classDef.speedMult ?? 1) * effSpeedMult).toFixed(3));
   p.energyMax = Math.max(1, Math.round(((30 + int * 10) * PLAYER_STAT_SCALE) * energyMult + energyFlat));
   p.critChance = clamp(Math.round(2 + dex * 0.6 + (classDef.critFlat ?? 0)), 0, 45);
   p.critDamageMult = Math.max(1, Number(classDef.critDamageMult ?? 1.5));
@@ -6476,7 +7122,7 @@ function renderInventory(state) {
     invListEl.appendChild(div);
     return;
   }
-  getInventoryDisplayEntries(state).slice(0, 9).forEach((entry, idx) => {
+  getInventoryDisplayEntries(state).forEach((entry, idx) => {
     const it = entry.item;
     const invIdx = entry.invIndex;
     const nm = ITEM_TYPES[it.type]?.name ?? it.type;
@@ -6693,6 +7339,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     visitedDoors: new Set(),
     exploredChunks: new Set(),
     xpDepthKills: {},
+    poisonClouds: {},
     surfaceLink: null,
     startSpawn: null,
     shop: null,
@@ -7287,13 +7934,119 @@ function applyEffectsTick(state) {
     if (e.type === "regen") {
       if (p.hp > 0) p.hp = clamp(p.hp + e.healPerTurn, 0, p.maxHp);
     }
+    if (e.type === "poison") {
+      if (p.hp > 0) {
+        const dmg = Math.max(1, Math.floor(Number(e.dmgPerTurn ?? 1)));
+        p.hp = Math.max(0, p.hp - dmg);
+        pushLog(state, `Poison deals ${dmg} damage.`);
+      }
+    }
     e.turnsLeft -= 1;
   }
   p.effects = p.effects.filter(e => e.turnsLeft > 0);
+  if (p.hp <= 0 && !p.dead) killPlayer(state);
 
   recalcDerivedStats(state);
   renderEquipment(state);
   renderEffects(state);
+}
+
+function ensurePoisonCloudState(state) {
+  if (!state || typeof state !== "object") return {};
+  if (!state.poisonClouds || typeof state.poisonClouds !== "object") state.poisonClouds = {};
+  return state.poisonClouds;
+}
+
+function applyPoisonToPlayer(state, dmgPerTurn = 40, turns = 2, sourceLabel = "poison") {
+  const p = state?.player;
+  if (!p || p.dead) return;
+  const dpt = Math.max(1, Math.floor(dmgPerTurn));
+  const ttl = Math.max(1, Math.floor(turns));
+  const existing = p.effects.find((e) => e.type === "poison");
+  if (existing) {
+    existing.dmgPerTurn = Math.max(Math.floor(existing.dmgPerTurn ?? 1), dpt);
+    existing.turnsLeft = Math.max(Math.floor(existing.turnsLeft ?? 0), ttl);
+  } else {
+    p.effects.push({ type: "poison", dmgPerTurn: dpt, turnsLeft: ttl });
+  }
+  pushLog(state, `You are poisoned by ${sourceLabel}.`);
+}
+
+function applySlowToPlayer(state, turns = 2, accDelta = -6, evaDelta = -10, speedMult = 0.88, sourceLabel = "slowing shot") {
+  const p = state?.player;
+  if (!p || p.dead) return;
+  const ttl = Math.max(1, Math.floor(turns));
+  const existing = p.effects.find((e) => e.type === "slow");
+  if (existing) {
+    existing.turnsLeft = Math.max(Math.floor(existing.turnsLeft ?? 0), ttl);
+    existing.accDelta = Math.min(Math.floor(existing.accDelta ?? 0), Math.floor(accDelta));
+    existing.evaDelta = Math.min(Math.floor(existing.evaDelta ?? 0), Math.floor(evaDelta));
+    existing.speedMult = Math.min(Number(existing.speedMult ?? 1), Number(speedMult));
+  } else {
+    p.effects.push({
+      type: "slow",
+      turnsLeft: ttl,
+      accDelta: Math.floor(accDelta),
+      evaDelta: Math.floor(evaDelta),
+      speedMult: Number(speedMult),
+    });
+  }
+  pushLog(state, `${sourceLabel} slows you.`);
+  recalcDerivedStats(state);
+}
+
+function spawnPoisonCloudBurst(state, x, y, z, turns = 3, radius = 1, dmg = 55, sourceLabel = "spores") {
+  const clouds = ensurePoisonCloudState(state);
+  const ttl = Math.max(1, Math.floor(turns));
+  const rad = Math.max(0, Math.floor(radius));
+  const cloudDmg = Math.max(1, Math.floor(dmg));
+  for (let dy = -rad; dy <= rad; dy++) {
+    for (let dx = -rad; dx <= rad; dx++) {
+      if (Math.abs(dx) + Math.abs(dy) > rad) continue;
+      const tx = x + dx;
+      const ty = y + dy;
+      const tile = state.world.getTile(tx, ty, z);
+      if (tile === WALL || tileIsLocked(tile) || tile === DOOR_CLOSED) continue;
+      const key = keyXYZ(tx, ty, z);
+      const existing = clouds[key];
+      if (existing) {
+        existing.turnsLeft = Math.max(existing.turnsLeft ?? 0, ttl);
+        existing.dmg = Math.max(existing.dmg ?? 1, cloudDmg);
+      } else {
+        clouds[key] = { x: tx, y: ty, z, turnsLeft: ttl, dmg: cloudDmg, source: sourceLabel };
+      }
+    }
+  }
+  pushLog(state, `Toxic ${sourceLabel} spread across the area.`);
+}
+
+function tickPoisonClouds(state) {
+  const clouds = ensurePoisonCloudState(state);
+  const p = state.player;
+  if (!p || p.dead) {
+    for (const key of Object.keys(clouds)) {
+      const entry = clouds[key];
+      entry.turnsLeft = Math.max(0, Math.floor(entry.turnsLeft ?? 0) - 1);
+      if (entry.turnsLeft <= 0) delete clouds[key];
+    }
+    return;
+  }
+  const key = keyXYZ(p.x, p.y, p.z);
+  const cloud = clouds[key];
+  if (cloud) {
+    const base = Math.max(1, Math.floor(cloud.dmg ?? 1));
+    const reduced = reduceIncomingDamage(state, base, p.z);
+    const dmg = Math.max(1, Math.floor(reduced?.dmg ?? 1));
+    p.hp = Math.max(0, p.hp - dmg);
+    pushLog(state, `Toxic cloud burns you for ${dmg}.`);
+    applyPoisonToPlayer(state, Math.round(base * 0.6), 2, cloud.source ?? "the cloud");
+    if (p.hp <= 0 && !p.dead) killPlayer(state);
+  }
+  for (const k of Object.keys(clouds)) {
+    const entry = clouds[k];
+    entry.turnsLeft = Math.max(0, Math.floor(entry.turnsLeft ?? 0) - 1);
+    if (entry.turnsLeft <= 0) delete clouds[k];
+  }
 }
 
 function applyReveal(state, radius = 28) {
@@ -7401,6 +8154,11 @@ function playerAttackDamage(state, monster = null, options = null) {
   const p = state.player;
   const opts = (options && typeof options === "object") ? options : {};
   const classId = normalizeCharacterClassId(p.classId, p.speciesId);
+  const weaponProfile = (opts.weaponProfile && typeof opts.weaponProfile === "object")
+    ? opts.weaponProfile
+    : playerWeaponAttackProfile(state);
+  const profileDamageMod = Math.max(0.1, Number(weaponProfile?.damageMod ?? 1));
+  const profileCritMod = Number(weaponProfile?.critChanceMod ?? 0);
   const firstCombatStrike = !!opts.firstCombatStrike;
   const attackAfterMove = !!opts.attackAfterMove;
   const targetUnengaged = !!opts.targetUnengaged;
@@ -7418,7 +8176,20 @@ function playerAttackDamage(state, monster = null, options = null) {
     : weaponAtk;
   let raw = Math.max(1, baseRoll + scaledWeaponAtk + effectAtk);
 
-  let damageMult = Math.max(0.1, Number(p.damageMult ?? 1));
+  let damageMult = Math.max(0.1, Number(p.damageMult ?? 1)) * profileDamageMod;
+  if ((weaponProfile?.kind ?? "melee") === "ranged") {
+    const closeRangeDamageMult = clamp(Number(weaponProfile?.closeRangeDamageMult ?? 1), 0.2, 1);
+    if (distance <= 1) damageMult *= closeRangeDamageMult;
+
+    const maxRangeFalloffPct = clamp(Number(weaponProfile?.maxRangeFalloffPct ?? 0), 0, 0.8);
+    const minRange = Math.max(1, Math.floor(Number(weaponProfile?.minRange ?? 1) || 1));
+    const maxRange = Math.max(minRange, Math.floor(Number(weaponProfile?.range ?? minRange) || minRange));
+    const span = Math.max(0, maxRange - minRange);
+    if (maxRangeFalloffPct > 0 && span > 0 && distance > minRange) {
+      const t = clamp((distance - minRange) / span, 0, 1);
+      damageMult *= (1 - maxRangeFalloffPct * t);
+    }
+  }
   if ((p.lowHpDamageMult ?? 1) > 1 && p.hp <= Math.max(1, p.maxHp) * 0.4) damageMult *= p.lowHpDamageMult;
   if (attackAfterMove) damageMult *= Math.max(1, Number(p.firstStrikeMoveMult ?? 1));
   if (classId === "tunnel_striker" && distance <= 1) damageMult *= 1.15;
@@ -7432,7 +8203,8 @@ function playerAttackDamage(state, monster = null, options = null) {
   if (classId === "scrapper" && isLowTierWeaponType(p.equip?.weapon)) damageMult *= 1.1;
 
   let crit = false;
-  if (Math.random() * 100 < clamp(Math.round(p.critChance ?? 0), 0, 95)) {
+  const critChance = clamp(Math.round((p.critChance ?? 0) + profileCritMod), 0, 95);
+  if (Math.random() * 100 < critChance) {
     crit = true;
     damageMult *= Math.max(1, Number(p.critDamageMult ?? 1.5));
   }
@@ -7440,10 +8212,14 @@ function playerAttackDamage(state, monster = null, options = null) {
   raw = Math.max(1, Math.round(raw * damageMult));
 
   if (!monster) return { raw, dmg: raw, crit };
+  const classRangedDefIgnore = (weaponProfile?.kind ?? "melee") === "ranged"
+    ? Number(p.rangedDefIgnorePct ?? 0)
+    : 0;
   const mSpec = monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
   let ignorePct = Math.max(
-    Number(p.rangedDefIgnorePct ?? 0),
-    crit ? Number(p.critDefIgnorePct ?? 0) : 0
+    classRangedDefIgnore,
+    crit ? Number(p.critDefIgnorePct ?? 0) : 0,
+    Number(weaponProfile?.defIgnorePct ?? 0)
   );
   if (classId === "veilblade" && firstCombatStrike) ignorePct = Math.max(ignorePct, 0.25);
   const dmg = applyDefenseMitigation(raw, mSpec.def, ignorePct);
@@ -7723,9 +8499,35 @@ function tryKnockbackMonster(state, monster, sourceX, sourceY) {
   return true;
 }
 
+function tryKnockbackPlayer(state, sourceX, sourceY) {
+  const p = state?.player;
+  if (!p || p.dead) return false;
+  const dx = Math.sign((p.x ?? 0) - (sourceX ?? 0));
+  const dy = Math.sign((p.y ?? 0) - (sourceY ?? 0));
+  if (dx === 0 && dy === 0) return false;
+  const tx = (p.x ?? 0) + dx;
+  const ty = (p.y ?? 0) + dy;
+  const tz = p.z;
+  if (!state.world.isPassable(tx, ty, tz)) return false;
+  const occ = buildOccupancy(state);
+  if (occ.monsters.has(keyXYZ(tx, ty, tz))) return false;
+  p.x = tx;
+  p.y = ty;
+  return true;
+}
+
 function playerAttack(state, monster) {
   markCombatEvent(state, monster);
   const p = state.player;
+  const weaponProfile = playerWeaponAttackProfile(state);
+  if (!playerCanAttackMonster(state, monster, weaponProfile)) {
+    if (weaponProfile?.kind === "ranged" && weaponProfile?.cannotFireAdjacent && hasAdjacentMonster(state)) {
+      pushLog(state, "An adjacent enemy prevents you from firing.");
+    } else {
+      pushLog(state, "Target is out of range.");
+    }
+    return;
+  }
   const classId = normalizeCharacterClassId(p.classId, p.speciesId);
   const mSpec = monsterStatsForDepth(monster.type, monster.z ?? p.z);
   const attackAfterMove = !!p.attackAfterMove;
@@ -7736,9 +8538,10 @@ function playerAttack(state, monster) {
   p.combatFirstStrikeReady = false;
   let targetEva = mSpec.eva;
   if (classId === "broodmind" && distance <= 2) targetEva = Math.max(0, targetEva - 5);
-  if (!rollHit(p.acc, targetEva)) {
+  const attackAcc = Math.max(1, Math.round((p.acc ?? 70) + Number(weaponProfile?.accuracyMod ?? 0)));
+  if (!rollHit(attackAcc, targetEva)) {
     monster.awake = true;
-    pushLog(state, `You miss the ${MONSTER_TYPES[monster.type]?.name ?? monster.type}.`);
+    pushLog(state, `You miss the ${monsterDisplayName(monster, p.z)}.`);
     if (monster.origin === "base") {
       state.entityOverrides.set(monster.id, { x: monster.x, y: monster.y, z: monster.z, hp: monster.hp, cd: monster.cd ?? 0 });
     }
@@ -7750,6 +8553,7 @@ function playerAttack(state, monster) {
     firstCombatStrike,
     targetUnengaged,
     distance,
+    weaponProfile,
   });
   const dmg = attack.dmg;
   monster.hp -= dmg;
@@ -7759,16 +8563,49 @@ function playerAttack(state, monster) {
     state.entityOverrides.set(monster.id, { x: monster.x, y: monster.y, z: monster.z, hp: monster.hp, cd: monster.cd ?? 0 });
   }
 
-  pushLog(state, `You hit the ${MONSTER_TYPES[monster.type]?.name ?? monster.type} for ${dmg}${attack.crit ? " (critical)" : ""}.`);
+  pushLog(state, `You hit the ${monsterDisplayName(monster, p.z)} for ${dmg}${attack.crit ? " (critical)" : ""}.`);
   if (classId === "telekinetic" && firstCombatStrike && monster.hp > 0 && tryKnockbackMonster(state, monster, p.x, p.y)) {
-    pushLog(state, `Telekinetic force knocks the ${MONSTER_TYPES[monster.type]?.name ?? monster.type} back.`);
+    pushLog(state, `Telekinetic force knocks the ${monsterDisplayName(monster, p.z)} back.`);
   }
   const damageApplied = Math.max(0, Math.min(dmg, hpBefore));
   const xpMult = xpChallengeMultiplier(state, monster, mSpec);
   grantXP(state, Math.round(xpFromDamage(damageApplied, monster) * xpMult));
+  if (
+    !state.player.dead &&
+    (monster.type === "iron_warden") &&
+    (weaponProfile?.kind ?? "melee") === "melee" &&
+    damageApplied > 0
+  ) {
+    const reflectPct = clamp(Number(mSpec?.meleeReflectPct ?? 0.2), 0, 0.8);
+    const reflectedRaw = Math.max(1, Math.round(damageApplied * reflectPct));
+    if (stateDebug(state).godmode) {
+      pushLog(state, "Reflected impact glances off your godmode.");
+    } else {
+      const reduced = reduceIncomingDamage(state, reflectedRaw, monster.z ?? p.z);
+      const reflected = Math.max(1, Math.floor(reduced?.dmg ?? 1));
+      p.hp = Math.max(0, p.hp - reflected);
+      pushLog(state, `The ${monsterDisplayName(monster, p.z)} reflects ${reflected} damage.`);
+      if (p.hp <= 0) {
+        killPlayer(state);
+        return;
+      }
+    }
+  }
 
   if (monster.hp <= 0) {
-    pushLog(state, `The ${MONSTER_TYPES[monster.type]?.name ?? monster.type} dies.`);
+    pushLog(state, `The ${monsterDisplayName(monster, p.z)} dies.`);
+    if (mSpec?.deathCloudTurns && mSpec?.deathCloudRadius && mSpec?.deathCloudDmg) {
+      spawnPoisonCloudBurst(
+        state,
+        monster.x,
+        monster.y,
+        monster.z ?? p.z,
+        mSpec.deathCloudTurns,
+        mSpec.deathCloudRadius,
+        mSpec.deathCloudDmg,
+        "spores"
+      );
+    }
 
     grantXP(state, Math.round(xpKillBonus(monster.type, monster.z ?? p.z) * xpMult));
     markDepthKillForXp(state, monster.z ?? p.z);
@@ -8266,7 +9103,7 @@ function bfsNextStep(state, start, goal, maxNodes = 600, maxDist = 18) {
 
 function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
   markCombatEvent(state, monster);
-  const nm = MONSTER_TYPES[monster.type]?.name ?? monster.type;
+  const nm = monsterDisplayName(monster, state.player.z);
   const spec = monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
   const classId = normalizeCharacterClassId(state.player.classId, state.player.speciesId);
   const dist = Math.abs((monster?.x ?? 0) - state.player.x) + Math.abs((monster?.y ?? 0) - state.player.y);
@@ -8278,6 +9115,10 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
     return;
   }
   let raw = baseDmgLo + Math.floor(Math.random() * (baseDmgHi - baseDmgLo + 1));
+  if (monster?.type === "rift_hound" && monster?.blinkStrikeBonus) {
+    raw = Math.max(1, Math.round(raw * (spec.backstabDamageMult ?? 1.2)));
+    monster.blinkStrikeBonus = false;
+  }
 
   if (stateDebug(state).godmode) {
     pushLog(state, `The ${nm} ${verb} you, but no damage gets through.`);
@@ -8290,6 +9131,25 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
   if (classId === "overclock_unit") state.player.overclockUntilMs = Date.now() + 3000;
   pushLog(state, `The ${nm} ${verb} you for ${dmg}.`);
   if (reduced?.shaded) pushLog(state, "Shadeguard ward dampens the blow.");
+  if (Math.random() < clamp(Number(spec?.poisonOnHitChance ?? 0), 0, 1)) {
+    applyPoisonToPlayer(
+      state,
+      Math.max(1, Math.floor(spec?.poisonOnHitDmg ?? (0.28 * dmg))),
+      Math.max(1, Math.floor(spec?.poisonOnHitTurns ?? 2)),
+      nm
+    );
+  }
+  if (Math.random() < clamp(Number(spec?.slowOnHitChance ?? 0), 0, 1)) {
+    applySlowToPlayer(state, Math.max(1, Math.floor(spec?.slowTurns ?? 2)), -6, -10, 0.88, `${nm}'s shot`);
+  }
+  if (Math.random() < clamp(Number(spec?.stunOnHitChance ?? 0), 0, 1)) {
+    applySlowToPlayer(state, 1, -10, -14, 0.75, `${nm}'s impact`);
+  }
+  if (Math.random() < clamp(Number(spec?.knockbackOnHitChance ?? 0), 0, 1)) {
+    if (tryKnockbackPlayer(state, monster.x ?? state.player.x, monster.y ?? state.player.y)) {
+      pushLog(state, `${nm} knocks you back.`);
+    }
+  }
   if (state.player.hp <= 0) killPlayer(state);
 }
 
@@ -8322,6 +9182,7 @@ function monstersTurn(state) {
     if (p.dead) return;
 
     if ((m.cd ?? 0) > 0) m.cd -= 1;
+    if ((m.abilityCd ?? 0) > 0) m.abilityCd -= 1;
 
     const spec = monsterStatsForDepth(m.type, m.z ?? z);
     if ((m.maxHp ?? 0) !== spec.maxHp) {
@@ -8348,38 +9209,197 @@ function monstersTurn(state) {
     const disengageUntilTurn = Number.isFinite(disengage[m.id]) ? Math.floor(disengage[m.id]) : -1;
     const hasDisengageGrace = disengageUntilTurn >= (state.turn ?? 0);
 
-    if (spec.range && distMan <= spec.range && !adj) {
-      const sees = hasLineOfSight(state.world, z, m.x, m.y, p.x, p.y);
-      if (sees && (m.cd ?? 0) === 0) {
-        monsterHitPlayer(state, m, spec.atkLo, spec.atkHi, "shoots");
-        m.cd = spec.cdTurns ?? 2;
+    const ai = String(spec.ai ?? (spec.range ? "ranged_hold" : "melee_chase"));
+    const preferredRange = Math.max(2, Math.floor(spec.preferredRange ?? (spec.range ? Math.max(2, spec.range - 1) : 2)));
+    const minRange = Math.max(1, Math.floor(spec.minRange ?? (spec.range ? 2 : 1)));
+    const seesPlayer = hasLineOfSight(state.world, z, m.x, m.y, p.x, p.y);
+    const canShoot = !!(spec.range && distMan <= spec.range && distMan >= minRange && !adj && seesPlayer && (m.cd ?? 0) === 0);
+    const persistOverride = () => {
+      if (m.origin === "base") state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd ?? 0 });
+    };
+    const tryMoveTo = (nx, ny) => {
+      if (!state.world.isPassable(nx, ny, z)) return false;
+      const occ = monsters.get(keyXYZ(nx, ny, z));
+      if (occ) return false;
+      if (nx === p.x && ny === p.y) return false;
+      m.x = nx;
+      m.y = ny;
+      persistOverride();
+      return true;
+    };
+    const tryStepTowardPlayer = () => {
+      const next = bfsNextStep(state, { x: m.x, y: m.y }, { x: p.x, y: p.y });
+      if (!next) return false;
+      return tryMoveTo(next.x, next.y);
+    };
+    const tryStepAwayFromPlayer = () => {
+      const dirs = [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5);
+      let best = null;
+      let bestDist = distMan;
+      for (const [dx, dy] of dirs) {
+        const nx = m.x + dx;
+        const ny = m.y + dy;
+        if (!state.world.isPassable(nx, ny, z)) continue;
+        const occ = monsters.get(keyXYZ(nx, ny, z));
+        if (occ) continue;
+        if (nx === p.x && ny === p.y) continue;
+        const nd = Math.abs(nx - p.x) + Math.abs(ny - p.y);
+        if (nd <= bestDist) continue;
+        bestDist = nd;
+        best = { x: nx, y: ny };
+      }
+      if (!best) return false;
+      return tryMoveTo(best.x, best.y);
+    };
+    const tryBlinkCloser = (maxBlinkRange = 2) => {
+      const range = Math.max(1, Math.floor(maxBlinkRange ?? 2));
+      const candidates = [];
+      for (let dy = -range; dy <= range; dy++) {
+        for (let dx = -range; dx <= range; dx++) {
+          const nx = m.x + dx;
+          const ny = m.y + dy;
+          if (Math.abs(dx) + Math.abs(dy) > range) continue;
+          if (nx === m.x && ny === m.y) continue;
+          if (!state.world.isPassable(nx, ny, z)) continue;
+          const occ = monsters.get(keyXYZ(nx, ny, z));
+          if (occ) continue;
+          if (nx === p.x && ny === p.y) continue;
+          const nd = Math.abs(nx - p.x) + Math.abs(ny - p.y);
+          candidates.push({ x: nx, y: ny, d: nd });
+        }
+      }
+      if (!candidates.length) return false;
+      candidates.sort((a, b) => a.d - b.d);
+      const pick = candidates[0];
+      m.x = pick.x;
+      m.y = pick.y;
+      m.blinkStrikeBonus = pick.d <= 1;
+      persistOverride();
+      return true;
+    };
+
+    if (ai === "support_undead") {
+      let supportActed = false;
+      const nearbyUndead = [];
+      for (const ent of state.entities.values()) {
+        if (!ent || ent.kind !== "monster") continue;
+        if (ent.id === m.id || ent.z !== z) continue;
+        if (!(ent.type === "skeleton" || ent.type === "wraith" || ent.type === "bone_herald")) continue;
+        const d = Math.abs((ent.x ?? 0) - m.x) + Math.abs((ent.y ?? 0) - m.y);
+        if (d <= 4) nearbyUndead.push(ent);
+      }
+      if (!nearbyUndead.length && (m.abilityCd ?? 0) === 0) {
+        const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]].sort(() => Math.random() - 0.5);
+        for (const [dx, dy] of dirs) {
+          const nx = m.x + dx, ny = m.y + dy;
+          if (!state.world.isPassable(nx, ny, z)) continue;
+          if (monsters.get(keyXYZ(nx, ny, z))) continue;
+          if (nx === p.x && ny === p.y) continue;
+          const sumSpec = monsterStatsForDepth("skeleton", z);
+          const sid = `summon|${m.id}|${state.turn}|${nx},${ny}`;
+          state.entities.set(sid, {
+            id: sid,
+            origin: "summoned",
+            kind: "monster",
+            type: "skeleton",
+            x: nx, y: ny, z,
+            hp: sumSpec.maxHp,
+            maxHp: sumSpec.maxHp,
+            awake: true,
+            cd: 0,
+          });
+          m.abilityCd = Math.max(2, Math.floor(spec.summonCooldownTurns ?? 6));
+          m.awake = true;
+          pushLog(state, `${monsterDisplayName(m, z)} summons a Skeleton.`);
+          persistOverride();
+          supportActed = true;
+          break;
+        }
+      } else if (nearbyUndead.length && (m.abilityCd ?? 0) === 0) {
+        let didBuff = false;
+        for (const ally of nearbyUndead) {
+          const heal = Math.max(1, Math.round((ally.maxHp ?? 1) * 0.12));
+          const before = ally.hp ?? 0;
+          ally.hp = clamp((ally.hp ?? 0) + heal, 0, ally.maxHp ?? heal);
+          didBuff = didBuff || ally.hp > before;
+          if (ally.origin === "base") {
+            state.entityOverrides.set(ally.id, { x: ally.x, y: ally.y, z: ally.z, hp: ally.hp, cd: ally.cd ?? 0 });
+          }
+        }
+        if (didBuff) pushLog(state, `${monsterDisplayName(m, z)} bolsters nearby undead.`);
+        m.abilityCd = 4;
         m.awake = true;
-        if (m.origin === "base") state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd });
+        persistOverride();
+        supportActed = true;
+      }
+      if (supportActed) continue;
+    }
+
+    if (ai === "blink_flanker" && !adj && seesPlayer) {
+      if (Math.random() < 0.58 && tryBlinkCloser(spec.blinkRange ?? 2)) {
+        m.awake = true;
         continue;
       }
+    }
+
+    if (canShoot && (ai !== "ranged_kite" || distMan >= preferredRange - 1)) {
+      monsterHitPlayer(state, m, spec.atkLo, spec.atkHi, "shoots");
+      m.cd = spec.cdTurns ?? 2;
+      m.awake = true;
+      persistOverride();
+      continue;
     }
 
     if (adj) {
       monsterHitPlayer(state, m, spec.atkLo, spec.atkHi, "hits");
       m.awake = true;
-      if (m.origin === "base") state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd ?? 0 });
+      persistOverride();
       continue;
     }
 
     if (hasDisengageGrace && distMan > 1) continue;
 
-    const seesPlayer = hasLineOfSight(state.world, z, m.x, m.y, p.x, p.y);
-    if (seesPlayer) {
-      m.awake = true;
-      const next = bfsNextStep(state, { x: m.x, y: m.y }, { x: p.x, y: p.y });
-      if (next) {
-        const occ = monsters.get(keyXYZ(next.x, next.y, z));
-        if (!occ) {
-          m.x = next.x; m.y = next.y;
-          if (m.origin === "base") state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd ?? 0 });
-        }
+    if (ai === "ranged_artillery") {
+      if (seesPlayer && distMan < minRange && tryStepAwayFromPlayer()) {
+        m.awake = true;
+        continue;
+      }
+      if (canShoot) {
+        monsterHitPlayer(state, m, spec.atkLo, spec.atkHi, "shoots");
+        m.cd = spec.cdTurns ?? 2;
+        m.awake = true;
+        persistOverride();
       }
       continue;
+    }
+
+    if (ai === "ranged_kite") {
+      if ((adj || distMan < preferredRange) && tryStepAwayFromPlayer()) {
+        m.awake = true;
+        continue;
+      }
+      if (canShoot) {
+        monsterHitPlayer(state, m, spec.atkLo, spec.atkHi, "shoots");
+        m.cd = spec.cdTurns ?? 2;
+        m.awake = true;
+        persistOverride();
+        continue;
+      }
+    }
+
+    if (ai === "ranged_hold") {
+      if (canShoot) {
+        monsterHitPlayer(state, m, spec.atkLo, spec.atkHi, "shoots");
+        m.cd = spec.cdTurns ?? 2;
+        m.awake = true;
+        persistOverride();
+        continue;
+      }
+    }
+
+    if (seesPlayer) {
+      m.awake = true;
+      if (tryStepTowardPlayer()) continue;
     }
 
     const wanderChance = m.awake ? 0.60 : 0.22;
@@ -8387,13 +9407,7 @@ function monstersTurn(state) {
       const dirs = [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5);
       for (const [dx, dy] of dirs) {
         const nx = m.x + dx, ny = m.y + dy;
-        if (!state.world.isPassable(nx, ny, z)) continue;
-        const occ = monsters.get(keyXYZ(nx, ny, z));
-        if (occ) continue;
-        if (nx === p.x && ny === p.y) continue;
-        m.x = nx; m.y = ny;
-        if (m.origin === "base") state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd ?? 0 });
-        break;
+        if (tryMoveTo(nx, ny)) break;
       }
     }
   }
@@ -8560,6 +9574,17 @@ const MONSTER_SPRITE_FALLBACKS = {
   wraith: "rogue",
   basilisk: "giant_spider",
   ancient_automaton: "skeleton",
+  spore_crawler: "giant_spider",
+  rift_hound: "dire_wolf",
+  crocubot: "ancient_automaton",
+  bone_herald: "skeleton",
+  iron_warden: "ancient_automaton",
+  cave_skirmisher: "archer",
+  ruin_archer: "archer",
+  storm_sniper: "archer",
+  nullmetal_assassin: "rogue",
+  deepcore_ballista_sentinel: "ancient_automaton",
+  singularity_hunter: "wraith",
 };
 const CHEST_LOCK_SPRITE_BY_KEY = {
   key_red: "chest_red",
@@ -9219,6 +10244,17 @@ function monsterGlyph(type) {
   if (type === "wraith") return { g: "w", c: "#d0b8ff" };
   if (type === "basilisk") return { g: "B", c: "#ffe18c" };
   if (type === "ancient_automaton") return { g: "A", c: "#c7d3ea" };
+  if (type === "spore_crawler") return { g: "f", c: "#c8ff7b" };
+  if (type === "rift_hound") return { g: "h", c: "#bca8ff" };
+  if (type === "crocubot") return { g: "C", c: "#9dd7e8" };
+  if (type === "bone_herald") return { g: "N", c: "#f0f0ff" };
+  if (type === "iron_warden") return { g: "I", c: "#c4d2df" };
+  if (type === "cave_skirmisher") return { g: "k", c: "#ffd39a" };
+  if (type === "ruin_archer") return { g: "u", c: "#ffbf84" };
+  if (type === "storm_sniper") return { g: "t", c: "#9edbff" };
+  if (type === "nullmetal_assassin") return { g: "n", c: "#b9b9d8" };
+  if (type === "deepcore_ballista_sentinel") return { g: "D", c: "#d69f8a" };
+  if (type === "singularity_hunter") return { g: "Q", c: "#b386ff" };
   if (type === "slime_green") return { g: "s", c: "#79ff79" };
   if (type === "slime_yellow" || type === "slime" || type === "jelly" || type === "jelly_yellow") return { g: "s", c: "#ffd966" };
   if (type === "slime_orange") return { g: "s", c: "#ffb266" };
@@ -9494,6 +10530,7 @@ function setLevelUpOverlayOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
     renderLevelUpOverlay(game);
   }
@@ -9557,6 +10594,7 @@ function setInfoOverlayOpen(open) {
     closeShopOverlay();
     closeSaveGameOverlay();
     closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
     renderInfoOverlay(game);
   }
@@ -9666,6 +10704,828 @@ function renderInfoOverlay(state = null) {
     row.appendChild(meta);
     weaponTierListEl.appendChild(row);
   }
+}
+
+function setMonsterEditorStatus(message, isError = false) {
+  if (!monsterEditorStatusEl) return;
+  monsterEditorStatusEl.textContent = message ?? "";
+  monsterEditorStatusEl.style.color = isError ? "#ff9aa8" : "#b8c6df";
+}
+
+function isMonsterEditorOverlayOpen() {
+  return !!monsterEditorOverlayEl?.classList.contains("show");
+}
+
+function closeMonsterEditorOverlay() {
+  monsterEditorUi.open = false;
+  if (!monsterEditorOverlayEl) return;
+  monsterEditorOverlayEl.classList.remove("show");
+  monsterEditorOverlayEl.setAttribute("aria-hidden", "true");
+  syncBodyModalLock();
+}
+
+function setMonsterEditorOverlayOpen(open) {
+  if (!monsterEditorOverlayEl) return;
+  const show = !!open;
+  if (show) {
+    closeMobilePanels();
+    setDebugMenuOpen(false);
+    closeShopOverlay();
+    closeSaveGameOverlay();
+    closeInfoOverlay();
+    closeSpriteEditorOverlay();
+    if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
+  }
+  monsterEditorUi.open = show;
+  monsterEditorOverlayEl.classList.toggle("show", show);
+  monsterEditorOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
+  syncBodyModalLock();
+  if (show) monsterEditorCloseBtnEl?.focus();
+}
+
+function setMonsterEditorAdvancedVisible(show) {
+  monsterEditorUi.showAdvanced = !!show;
+  if (monsterEditorAdvancedFieldsEl) {
+    monsterEditorAdvancedFieldsEl.classList.toggle("show", monsterEditorUi.showAdvanced);
+  }
+  if (monsterEditAdvancedToggleEl) {
+    monsterEditAdvancedToggleEl.textContent = monsterEditorUi.showAdvanced ? "Advanced -" : "Advanced +";
+  }
+}
+
+function monsterEditorRuleIndexById(id) {
+  const normalizedId = normalizeMonsterEditorId(id ?? "");
+  if (!normalizedId) return -1;
+  return (monsterEditorUi.workingSpawnRules ?? []).findIndex((rule) => rule?.id === normalizedId);
+}
+
+function monsterEditorRuleById(id) {
+  const idx = monsterEditorRuleIndexById(id);
+  if (idx < 0) return null;
+  return monsterEditorUi.workingSpawnRules[idx] ?? null;
+}
+
+function upsertMonsterEditorRule(rawRule) {
+  const rule = normalizeMonsterSpawnRule(rawRule);
+  if (!rule) return false;
+  const idx = monsterEditorRuleIndexById(rule.id);
+  if (idx >= 0) monsterEditorUi.workingSpawnRules[idx] = rule;
+  else monsterEditorUi.workingSpawnRules.push(rule);
+  monsterEditorUi.workingSpawnRules.sort((a, b) => (a.minDepth - b.minDepth) || a.id.localeCompare(b.id));
+  return true;
+}
+
+function removeMonsterEditorRule(id) {
+  const idx = monsterEditorRuleIndexById(id);
+  if (idx < 0) return false;
+  monsterEditorUi.workingSpawnRules.splice(idx, 1);
+  return true;
+}
+
+function monsterEditorPayloadSignature(monsters, spawnRules) {
+  const monsterMap = {};
+  const sourceMonsters = (monsters && typeof monsters === "object") ? monsters : {};
+  for (const id of Object.keys(sourceMonsters).sort()) {
+    const normalizedId = normalizeMonsterEditorId(id);
+    if (!normalizedId) continue;
+    monsterMap[normalizedId] = normalizeMonsterEditorSpec(normalizedId, sourceMonsters[normalizedId]);
+  }
+  const rules = cloneMonsterSpawnRulesForEditor(spawnRules ?? []);
+  return JSON.stringify({ monsters: monsterMap, spawn_rules: rules });
+}
+
+function setMonsterEditorSpawnFieldState() {
+  const hasSelected = !!monsterEditorUi.selectedId && !!monsterEditorUi.workingMonsters[monsterEditorUi.selectedId];
+  const canEditSpawn = !monsterEditorUi.loading && hasSelected && !!monsterEditSpawnEnabledEl?.checked;
+  const spawnFields = [
+    monsterEditSpawnMinDepthEl,
+    monsterEditSpawnMaxDepthEl,
+    monsterEditSpawnBaseWeightEl,
+    monsterEditSpawnRampFactorEl,
+  ];
+  for (const field of spawnFields) {
+    if (!field) continue;
+    field.disabled = !canEditSpawn;
+  }
+  if (monsterEditSpawnEnabledEl) {
+    monsterEditSpawnEnabledEl.disabled = monsterEditorUi.loading || !hasSelected;
+  }
+}
+
+function updateMonsterEditorControlState() {
+  const hasSelected = !!monsterEditorUi.selectedId && !!monsterEditorUi.workingMonsters[monsterEditorUi.selectedId];
+  const busy = monsterEditorUi.loading;
+
+  if (monsterEditorSearchInputEl) monsterEditorSearchInputEl.disabled = busy;
+  if (monsterEditorPreviewDepthInputEl) monsterEditorPreviewDepthInputEl.disabled = busy;
+  if (monsterEditorNewBtnEl) monsterEditorNewBtnEl.disabled = busy;
+  if (monsterEditorDuplicateBtnEl) monsterEditorDuplicateBtnEl.disabled = busy || !hasSelected;
+  if (monsterEditorDeleteBtnEl) {
+    monsterEditorDeleteBtnEl.disabled = busy || !hasSelected || monsterEditorUi.selectedId === "rat";
+  }
+  if (monsterEditorExportBtnEl) monsterEditorExportBtnEl.disabled = busy;
+  if (monsterEditorImportBtnEl) monsterEditorImportBtnEl.disabled = busy;
+  if (monsterEditorImportInputEl) monsterEditorImportInputEl.disabled = busy;
+  if (monsterEditorRefreshBtnEl) monsterEditorRefreshBtnEl.disabled = busy;
+  if (monsterEditorRevertBtnEl) monsterEditorRevertBtnEl.disabled = busy || !monsterEditorUi.dirty;
+  if (monsterEditorSaveBtnEl) monsterEditorSaveBtnEl.disabled = busy || !monsterEditorUi.dirty;
+  if (monsterEditAdvancedToggleEl) monsterEditAdvancedToggleEl.disabled = busy || !hasSelected;
+
+  if (monsterEditorFormEl) {
+    const fields = monsterEditorFormEl.querySelectorAll("input, select");
+    for (const field of fields) {
+      if (!(field instanceof HTMLInputElement || field instanceof HTMLSelectElement)) continue;
+      if (field === monsterEditIdEl) {
+        field.disabled = true;
+        continue;
+      }
+      field.disabled = busy || !hasSelected;
+    }
+  }
+  setMonsterEditorSpawnFieldState();
+}
+
+function refreshMonsterEditorDirtyState() {
+  const workingSig = monsterEditorPayloadSignature(monsterEditorUi.workingMonsters, monsterEditorUi.workingSpawnRules);
+  const baselineSig = monsterEditorPayloadSignature(monsterEditorUi.baselineMonsters, monsterEditorUi.baselineSpawnRules);
+  monsterEditorUi.dirty = workingSig !== baselineSig;
+  updateMonsterEditorControlState();
+}
+
+function setMonsterEditorLoading(loading) {
+  monsterEditorUi.loading = !!loading;
+  monsterEditorSignature = "";
+  updateMonsterEditorControlState();
+  renderMonsterEditorList();
+}
+
+function monsterEditorListEntries() {
+  const query = (monsterEditorSearchInputEl?.value ?? "").trim().toLowerCase();
+  const entries = [];
+  for (const [id, spec] of Object.entries(monsterEditorUi.workingMonsters ?? {})) {
+    if (!spec || typeof spec !== "object") continue;
+    const rule = monsterEditorRuleById(id);
+    if (query) {
+      const haystack = `${id} ${spec.name ?? ""} ${spec.ai ?? ""}`.toLowerCase();
+      if (!haystack.includes(query)) continue;
+    }
+    entries.push({ id, spec, rule });
+  }
+  entries.sort((a, b) => {
+    const minA = Number.isFinite(a.rule?.minDepth) ? a.rule.minDepth : Number.POSITIVE_INFINITY;
+    const minB = Number.isFinite(b.rule?.minDepth) ? b.rule.minDepth : Number.POSITIVE_INFINITY;
+    if (minA !== minB) return minA - minB;
+    const hpA = Math.max(0, Math.floor(a.spec?.baseHp ?? 0));
+    const hpB = Math.max(0, Math.floor(b.spec?.baseHp ?? 0));
+    if (hpA !== hpB) return hpB - hpA;
+    return a.id.localeCompare(b.id);
+  });
+  return entries;
+}
+
+function ensureMonsterEditorAiValue(aiValue) {
+  if (!monsterEditAiEl) return;
+  for (const opt of [...monsterEditAiEl.options]) {
+    if (opt.dataset.dynamic === "1") opt.remove();
+  }
+  const wanted = String(aiValue ?? "").trim();
+  if (!wanted) {
+    monsterEditAiEl.value = "";
+    return;
+  }
+  const hasOption = [...monsterEditAiEl.options].some((opt) => opt.value === wanted);
+  if (!hasOption) {
+    const opt = document.createElement("option");
+    opt.value = wanted;
+    opt.textContent = wanted;
+    opt.dataset.dynamic = "1";
+    monsterEditAiEl.appendChild(opt);
+  }
+  monsterEditAiEl.value = wanted;
+}
+
+function populateMonsterEditorForm() {
+  if (!monsterEditorFormEl) return;
+  const id = normalizeMonsterEditorId(monsterEditorUi.selectedId ?? "");
+  const spec = id ? monsterEditorUi.workingMonsters[id] : null;
+  const rule = id ? monsterEditorRuleById(id) : null;
+
+  monsterEditorUi.suspendFormEvents = true;
+  try {
+    if (!id || !spec) {
+      if (monsterEditIdEl) monsterEditIdEl.value = "";
+      if (monsterEditNameEl) monsterEditNameEl.value = "";
+      if (monsterEditGlyphEl) monsterEditGlyphEl.value = "";
+      if (monsterEditAliasOfEl) monsterEditAliasOfEl.value = "";
+      ensureMonsterEditorAiValue("");
+      if (monsterEditSizeGrowthEl) monsterEditSizeGrowthEl.checked = true;
+      if (monsterEditBaseHpEl) monsterEditBaseHpEl.value = "";
+      if (monsterEditBaseAtkEl) monsterEditBaseAtkEl.value = "";
+      if (monsterEditBaseDefEl) monsterEditBaseDefEl.value = "";
+      if (monsterEditBaseAccEl) monsterEditBaseAccEl.value = "";
+      if (monsterEditBaseEvaEl) monsterEditBaseEvaEl.value = "";
+      if (monsterEditSpdEl) monsterEditSpdEl.value = "";
+      if (monsterEditXpEl) monsterEditXpEl.value = "";
+      if (monsterEditRangeEl) monsterEditRangeEl.value = "";
+      if (monsterEditCdTurnsEl) monsterEditCdTurnsEl.value = "";
+      if (monsterEditPreferredRangeEl) monsterEditPreferredRangeEl.value = "";
+      if (monsterEditBlinkRangeEl) monsterEditBlinkRangeEl.value = "";
+      if (monsterEditSummonCooldownTurnsEl) monsterEditSummonCooldownTurnsEl.value = "";
+      if (monsterEditPoisonOnHitChanceEl) monsterEditPoisonOnHitChanceEl.value = "";
+      if (monsterEditPoisonOnHitTurnsEl) monsterEditPoisonOnHitTurnsEl.value = "";
+      if (monsterEditPoisonOnHitDmgEl) monsterEditPoisonOnHitDmgEl.value = "";
+      if (monsterEditSlowOnHitChanceEl) monsterEditSlowOnHitChanceEl.value = "";
+      if (monsterEditSlowTurnsEl) monsterEditSlowTurnsEl.value = "";
+      if (monsterEditStunOnHitChanceEl) monsterEditStunOnHitChanceEl.value = "";
+      if (monsterEditKnockbackOnHitChanceEl) monsterEditKnockbackOnHitChanceEl.value = "";
+      if (monsterEditBackstabDamageMultEl) monsterEditBackstabDamageMultEl.value = "";
+      if (monsterEditMeleeReflectPctEl) monsterEditMeleeReflectPctEl.value = "";
+      if (monsterEditDeathCloudTurnsEl) monsterEditDeathCloudTurnsEl.value = "";
+      if (monsterEditDeathCloudRadiusEl) monsterEditDeathCloudRadiusEl.value = "";
+      if (monsterEditDeathCloudDmgEl) monsterEditDeathCloudDmgEl.value = "";
+      if (monsterEditImmunePoisonEl) monsterEditImmunePoisonEl.checked = false;
+      if (monsterEditSpawnEnabledEl) monsterEditSpawnEnabledEl.checked = false;
+      if (monsterEditSpawnMinDepthEl) monsterEditSpawnMinDepthEl.value = "0";
+      if (monsterEditSpawnMaxDepthEl) monsterEditSpawnMaxDepthEl.value = "";
+      if (monsterEditSpawnBaseWeightEl) monsterEditSpawnBaseWeightEl.value = "1";
+      if (monsterEditSpawnRampFactorEl) monsterEditSpawnRampFactorEl.value = "0";
+      return;
+    }
+    if (monsterEditIdEl) monsterEditIdEl.value = id;
+    if (monsterEditNameEl) monsterEditNameEl.value = String(spec.name ?? titleFromId(id));
+    if (monsterEditGlyphEl) monsterEditGlyphEl.value = String(spec.glyph ?? "").slice(0, 2);
+    if (monsterEditAliasOfEl) monsterEditAliasOfEl.value = String(spec.aliasOf ?? "");
+    ensureMonsterEditorAiValue(spec.ai ?? "");
+    if (monsterEditSizeGrowthEl) monsterEditSizeGrowthEl.checked = spec.sizeGrowth !== false;
+    if (monsterEditBaseHpEl) monsterEditBaseHpEl.value = `${Math.max(1, Math.floor(spec.baseHp ?? 18))}`;
+    if (monsterEditBaseAtkEl) monsterEditBaseAtkEl.value = `${Math.max(1, Math.floor(spec.baseAtk ?? 6))}`;
+    if (monsterEditBaseDefEl) monsterEditBaseDefEl.value = `${Math.max(0, Math.floor(spec.baseDef ?? 1))}`;
+    if (monsterEditBaseAccEl) monsterEditBaseAccEl.value = `${Math.max(1, Math.floor(spec.baseAcc ?? 70))}`;
+    if (monsterEditBaseEvaEl) monsterEditBaseEvaEl.value = `${Math.max(0, Math.floor(spec.baseEva ?? 8))}`;
+    if (monsterEditSpdEl) monsterEditSpdEl.value = `${Number(spec.spd ?? 1)}`;
+    if (monsterEditXpEl) monsterEditXpEl.value = `${Math.max(1, Math.floor(spec.xp ?? 3))}`;
+    if (monsterEditRangeEl) monsterEditRangeEl.value = Number.isFinite(spec.range) && spec.range > 0 ? `${Math.floor(spec.range)}` : "";
+    if (monsterEditCdTurnsEl) monsterEditCdTurnsEl.value = Number.isFinite(spec.cdTurns) && spec.cdTurns > 0 ? `${Math.floor(spec.cdTurns)}` : "";
+    if (monsterEditPreferredRangeEl) monsterEditPreferredRangeEl.value = Number.isFinite(spec.preferredRange) && spec.preferredRange > 0 ? `${Math.floor(spec.preferredRange)}` : "";
+    if (monsterEditBlinkRangeEl) monsterEditBlinkRangeEl.value = Number.isFinite(spec.blinkRange) && spec.blinkRange > 0 ? `${Math.floor(spec.blinkRange)}` : "";
+    if (monsterEditSummonCooldownTurnsEl) monsterEditSummonCooldownTurnsEl.value = Number.isFinite(spec.summonCooldownTurns) && spec.summonCooldownTurns > 0 ? `${Math.floor(spec.summonCooldownTurns)}` : "";
+    if (monsterEditPoisonOnHitChanceEl) monsterEditPoisonOnHitChanceEl.value = Number.isFinite(spec.poisonOnHitChance) && spec.poisonOnHitChance > 0 ? `${Number(spec.poisonOnHitChance)}` : "";
+    if (monsterEditPoisonOnHitTurnsEl) monsterEditPoisonOnHitTurnsEl.value = Number.isFinite(spec.poisonOnHitTurns) && spec.poisonOnHitTurns > 0 ? `${Math.floor(spec.poisonOnHitTurns)}` : "";
+    if (monsterEditPoisonOnHitDmgEl) monsterEditPoisonOnHitDmgEl.value = Number.isFinite(spec.poisonOnHitDmg) && spec.poisonOnHitDmg > 0 ? `${Math.floor(spec.poisonOnHitDmg)}` : "";
+    if (monsterEditSlowOnHitChanceEl) monsterEditSlowOnHitChanceEl.value = Number.isFinite(spec.slowOnHitChance) && spec.slowOnHitChance > 0 ? `${Number(spec.slowOnHitChance)}` : "";
+    if (monsterEditSlowTurnsEl) monsterEditSlowTurnsEl.value = Number.isFinite(spec.slowTurns) && spec.slowTurns > 0 ? `${Math.floor(spec.slowTurns)}` : "";
+    if (monsterEditStunOnHitChanceEl) monsterEditStunOnHitChanceEl.value = Number.isFinite(spec.stunOnHitChance) && spec.stunOnHitChance > 0 ? `${Number(spec.stunOnHitChance)}` : "";
+    if (monsterEditKnockbackOnHitChanceEl) monsterEditKnockbackOnHitChanceEl.value = Number.isFinite(spec.knockbackOnHitChance) && spec.knockbackOnHitChance > 0 ? `${Number(spec.knockbackOnHitChance)}` : "";
+    if (monsterEditBackstabDamageMultEl) monsterEditBackstabDamageMultEl.value = Number.isFinite(spec.backstabDamageMult) && spec.backstabDamageMult > 0 ? `${Number(spec.backstabDamageMult)}` : "";
+    if (monsterEditMeleeReflectPctEl) monsterEditMeleeReflectPctEl.value = Number.isFinite(spec.meleeReflectPct) && spec.meleeReflectPct > 0 ? `${Number(spec.meleeReflectPct)}` : "";
+    if (monsterEditDeathCloudTurnsEl) monsterEditDeathCloudTurnsEl.value = Number.isFinite(spec.deathCloudTurns) && spec.deathCloudTurns > 0 ? `${Math.floor(spec.deathCloudTurns)}` : "";
+    if (monsterEditDeathCloudRadiusEl) monsterEditDeathCloudRadiusEl.value = Number.isFinite(spec.deathCloudRadius) && spec.deathCloudRadius > 0 ? `${Math.floor(spec.deathCloudRadius)}` : "";
+    if (monsterEditDeathCloudDmgEl) monsterEditDeathCloudDmgEl.value = Number.isFinite(spec.deathCloudDmg) && spec.deathCloudDmg > 0 ? `${Math.floor(spec.deathCloudDmg)}` : "";
+    if (monsterEditImmunePoisonEl) monsterEditImmunePoisonEl.checked = !!spec.immunePoison;
+    if (monsterEditSpawnEnabledEl) monsterEditSpawnEnabledEl.checked = !!rule;
+    if (monsterEditSpawnMinDepthEl) monsterEditSpawnMinDepthEl.value = `${Math.max(0, Math.floor(rule?.minDepth ?? 0))}`;
+    if (monsterEditSpawnMaxDepthEl) monsterEditSpawnMaxDepthEl.value = Number.isFinite(rule?.maxDepth) ? `${Math.floor(rule.maxDepth)}` : "";
+    if (monsterEditSpawnBaseWeightEl) monsterEditSpawnBaseWeightEl.value = `${Number(rule?.baseWeight ?? 1)}`;
+    if (monsterEditSpawnRampFactorEl) monsterEditSpawnRampFactorEl.value = `${Number(rule?.rampFactor ?? 0)}`;
+  } finally {
+    monsterEditorUi.suspendFormEvents = false;
+    setMonsterEditorSpawnFieldState();
+    updateMonsterEditorControlState();
+  }
+}
+
+function resolveMonsterEditorPreviewSpec(id, seen = null) {
+  const normalizedId = normalizeMonsterEditorId(id ?? "");
+  if (!normalizedId) return normalizeMonsterEditorSpec("rat", monsterEditorUi.workingMonsters.rat ?? MONSTER_TYPES.rat);
+  const visited = seen instanceof Set ? seen : new Set();
+  if (visited.has(normalizedId)) {
+    return normalizeMonsterEditorSpec(normalizedId, monsterEditorUi.workingMonsters[normalizedId] ?? MONSTER_TYPES[normalizedId]);
+  }
+  visited.add(normalizedId);
+  const current = monsterEditorUi.workingMonsters[normalizedId] ?? MONSTER_TYPES[normalizedId] ?? { id: normalizedId, name: titleFromId(normalizedId) };
+  const spec = normalizeMonsterEditorSpec(normalizedId, current);
+  const aliasId = normalizeMonsterEditorId(spec.aliasOf ?? "");
+  if (aliasId && aliasId !== normalizedId) {
+    const aliasSpec = resolveMonsterEditorPreviewSpec(aliasId, visited);
+    if (aliasSpec) return { ...aliasSpec, id: normalizedId, aliasOf: aliasId };
+  }
+  return spec;
+}
+
+function monsterEditorPreviewStatsForDepth(id, z) {
+  const spec = resolveMonsterEditorPreviewSpec(id);
+  const depth = Math.max(0, Math.floor(z ?? 0));
+  const scale = monsterDepthScale(depth);
+  const sizeTier = monsterSizeTier(depth, spec);
+  const tierIndex = Math.max(0, MONSTER_SIZE_TIERS.findIndex((t) => t.id === sizeTier.id));
+  const sizePenalty = spec?.sizeGrowth ? tierIndex : 0;
+  const hpScale = scale * sizeTier.mult;
+  const depthT = clamp(depth / 20, 0, 1);
+  const offenseDepthWeight = MONSTER_OFFENSE_DEPTH_WEIGHT_SHALLOW +
+    (MONSTER_OFFENSE_DEPTH_WEIGHT_DEEP - MONSTER_OFFENSE_DEPTH_WEIGHT_SHALLOW) * depthT;
+  const defenseDepthWeight = MONSTER_DEFENSE_DEPTH_WEIGHT_SHALLOW +
+    (MONSTER_DEFENSE_DEPTH_WEIGHT_DEEP - MONSTER_DEFENSE_DEPTH_WEIGHT_SHALLOW) * depthT;
+  const offenseScale =
+    (1 + (scale - 1) * offenseDepthWeight) *
+    (1 + (sizeTier.mult - 1) * MONSTER_OFFENSE_SIZE_SCALE_WEIGHT);
+  const defenseScale =
+    (1 + (scale - 1) * defenseDepthWeight) *
+    (1 + (sizeTier.mult - 1) * MONSTER_DEFENSE_SIZE_SCALE_WEIGHT);
+  const earlyDepthPressureT = clamp((EARLY_DEPTH_PRESSURE_FADE_DEPTH - depth) / EARLY_DEPTH_PRESSURE_FADE_DEPTH, 0, 1);
+  const earlyHpMult = 1 + (EARLY_DEPTH_HP_MULT - 1) * earlyDepthPressureT;
+  const earlyOffenseMult = 1 + (EARLY_DEPTH_OFFENSE_MULT - 1) * earlyDepthPressureT;
+  const earlyDefenseMult = 1 + (EARLY_DEPTH_DEFENSE_MULT - 1) * earlyDepthPressureT;
+  const midDepthPressureT = depth < MID_DEPTH_BOOST_START || depth > MID_DEPTH_BOOST_END
+    ? 0
+    : (depth <= MID_DEPTH_BOOST_PEAK
+      ? clamp((depth - MID_DEPTH_BOOST_START) / Math.max(1, MID_DEPTH_BOOST_PEAK - MID_DEPTH_BOOST_START), 0, 1)
+      : clamp((MID_DEPTH_BOOST_END - depth) / Math.max(1, MID_DEPTH_BOOST_END - MID_DEPTH_BOOST_PEAK), 0, 1));
+  const midHpMult = 1 + (MID_DEPTH_HP_MULT_PEAK - 1) * midDepthPressureT;
+  const midOffenseMult = 1 + (MID_DEPTH_OFFENSE_MULT_PEAK - 1) * midDepthPressureT;
+  const midDefenseMult = 1 + (MID_DEPTH_DEFENSE_MULT_PEAK - 1) * midDepthPressureT;
+  const baseHpScaled = Math.round((spec.baseHp ?? 18) * hpScale * earlyHpMult * midHpMult * PLAYER_STAT_SCALE);
+  const hpFloor = monsterMinHpFloorForDepth(depth);
+  const maxHp = Math.max(1, Math.max(baseHpScaled, hpFloor));
+  const atk = Math.max(1, Math.round((spec.baseAtk ?? 6) * offenseScale * earlyOffenseMult * midOffenseMult * PLAYER_STAT_SCALE));
+  const atkLo = Math.max(1, Math.round(atk * 0.82));
+  const atkHi = Math.max(atkLo, Math.round(atk * 1.18));
+  const def = Math.max(0, Math.round((spec.baseDef ?? 1) * defenseScale * earlyDefenseMult * midDefenseMult * PLAYER_STAT_SCALE));
+  const acc = clamp(Math.round((spec.baseAcc ?? 70) + depth * 0.15), 8, 98);
+  const evaBase = Math.round((spec.baseEva ?? 8) + depth * 0.12);
+  const eva = clamp(evaBase - sizePenalty * 5, 0, 88);
+  const spd = Math.max(0.55, Number(((spec.spd ?? 1) * Math.max(0.7, 1 - sizePenalty * 0.05)).toFixed(3)));
+  return {
+    ...spec,
+    level: depth + 1,
+    sizeTier: sizeTier.id,
+    maxHp,
+    atk,
+    atkLo,
+    atkHi,
+    def,
+    acc,
+    eva,
+    spd,
+  };
+}
+
+function renderMonsterEditorPreview() {
+  if (!monsterEditorPreviewEl) return;
+  const id = normalizeMonsterEditorId(monsterEditorUi.selectedId ?? "");
+  if (!id || !monsterEditorUi.workingMonsters[id]) {
+    monsterEditorPreviewEl.textContent = "Select a monster to preview depth-scaled stats.";
+    return;
+  }
+
+  const rawDepth = Number(monsterEditorPreviewDepthInputEl?.value ?? monsterEditorUi.previewDepth ?? 1);
+  const depth = Math.max(0, Math.floor(Number.isFinite(rawDepth) ? rawDepth : 1));
+  monsterEditorUi.previewDepth = depth;
+  if (monsterEditorPreviewDepthInputEl && Number(monsterEditorPreviewDepthInputEl.value) !== depth) {
+    monsterEditorPreviewDepthInputEl.value = `${depth}`;
+  }
+  const stats = monsterEditorPreviewStatsForDepth(id, depth);
+  const rule = monsterEditorRuleById(id);
+  const spawnSummary = rule
+    ? `Spawn depth ${rule.minDepth}-${Number.isFinite(rule.maxDepth) ? rule.maxDepth : "∞"} · weight ${rule.baseWeight} · ramp ${rule.rampFactor >= 0 ? "+" : ""}${rule.rampFactor}`
+    : "Spawn disabled";
+
+  monsterEditorPreviewEl.innerHTML = "";
+  const title = document.createElement("div");
+  title.style.fontWeight = "700";
+  title.textContent = `${stats.name ?? titleFromId(id)} (${id})`;
+  const sub = document.createElement("div");
+  sub.style.opacity = "0.84";
+  sub.textContent = `Depth ${depth} · level ${stats.level} · size ${stats.sizeTier} · ${spawnSummary}`;
+  const statsLineA = document.createElement("div");
+  statsLineA.textContent = `HP ${stats.maxHp} · ATK ${stats.atkLo}-${stats.atkHi} · DEF ${stats.def} · ACC ${stats.acc} · EVA ${stats.eva} · SPD ${stats.spd}`;
+  const statsLineB = document.createElement("div");
+  statsLineB.style.opacity = "0.82";
+  statsLineB.textContent = `XP ${Math.max(1, Math.floor(stats.xp ?? 1))} · AI ${stats.ai ? stats.ai : "(default melee_chase)"}${stats.aliasOf ? ` · alias of ${stats.aliasOf}` : ""}`;
+  monsterEditorPreviewEl.appendChild(title);
+  monsterEditorPreviewEl.appendChild(sub);
+  monsterEditorPreviewEl.appendChild(statsLineA);
+  monsterEditorPreviewEl.appendChild(statsLineB);
+}
+
+function renderMonsterEditorList() {
+  if (!monsterEditorListEl) return;
+  const entries = monsterEditorListEntries();
+  const signature = `${monsterEditorUi.loading ? 1 : 0}|${monsterEditorUi.selectedId}|${monsterEditorUi.dirty ? 1 : 0}|${entries
+    .map((entry) => {
+      const maxDepth = Number.isFinite(entry.rule?.maxDepth) ? entry.rule.maxDepth : "";
+      return `${entry.id}|${entry.spec.name ?? ""}|${entry.spec.baseHp ?? 0}|${entry.spec.baseAtk ?? 0}|${entry.spec.xp ?? 0}|${entry.rule ? `${entry.rule.minDepth}|${maxDepth}|${entry.rule.baseWeight}|${entry.rule.rampFactor}` : "off"}`;
+    })
+    .join("::")}`;
+  if (signature === monsterEditorSignature && monsterEditorUi.open) return;
+  monsterEditorSignature = signature;
+
+  monsterEditorListEl.innerHTML = "";
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "spriteEditorEmpty";
+    empty.textContent = "(no monsters match the current filter)";
+    monsterEditorListEl.appendChild(empty);
+    updateMonsterEditorControlState();
+    return;
+  }
+  for (const entry of entries) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "monsterEditorListBtn";
+    if (entry.id === monsterEditorUi.selectedId) row.classList.add("active");
+    row.disabled = monsterEditorUi.loading;
+    row.addEventListener("click", () => {
+      if (monsterEditorUi.selectedId === entry.id) return;
+      monsterEditorUi.selectedId = entry.id;
+      monsterEditorSignature = "";
+      populateMonsterEditorForm();
+      renderMonsterEditorList();
+      renderMonsterEditorPreview();
+      refreshMonsterEditorDirtyState();
+    });
+    const name = document.createElement("div");
+    name.className = "monsterEditorListName";
+    name.textContent = `${entry.spec.name ?? titleFromId(entry.id)}`;
+    const sub = document.createElement("div");
+    sub.className = "monsterEditorListSub";
+    const rule = entry.rule;
+    const spawnText = rule
+      ? `spawn ${rule.minDepth}-${Number.isFinite(rule.maxDepth) ? rule.maxDepth : "∞"} w=${rule.baseWeight} r=${rule.rampFactor >= 0 ? "+" : ""}${rule.rampFactor}`
+      : "spawn disabled";
+    sub.textContent = `${entry.id} · HP ${entry.spec.baseHp ?? 0} · ATK ${entry.spec.baseAtk ?? 0} · XP ${entry.spec.xp ?? 0} · ${spawnText}`;
+    row.appendChild(name);
+    row.appendChild(sub);
+    monsterEditorListEl.appendChild(row);
+  }
+  updateMonsterEditorControlState();
+}
+
+function monsterEditorResetWorkingFromRuntime() {
+  monsterEditorUi.baselineMonsters = cloneMonsterTypeMapForEditor(MONSTER_TYPES);
+  monsterEditorUi.baselineSpawnRules = cloneMonsterSpawnRulesForEditor(MONSTER_SPAWN_RULES);
+  monsterEditorUi.workingMonsters = cloneMonsterTypeMapForEditor(monsterEditorUi.baselineMonsters);
+  monsterEditorUi.workingSpawnRules = cloneMonsterSpawnRulesForEditor(monsterEditorUi.baselineSpawnRules);
+  const ids = Object.keys(monsterEditorUi.workingMonsters).sort();
+  if (!ids.includes(monsterEditorUi.selectedId)) {
+    monsterEditorUi.selectedId = ids[0] ?? "";
+  }
+  monsterEditorSignature = "";
+  populateMonsterEditorForm();
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+}
+
+function readNumberInputValue(el, fallback = 0) {
+  const value = Number(el?.value ?? "");
+  if (!Number.isFinite(value)) return fallback;
+  return value;
+}
+
+function readOptionalIntInputValue(el) {
+  const raw = String(el?.value ?? "").trim();
+  if (raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  return Math.floor(value);
+}
+
+function readOptionalFloatInputValue(el) {
+  const raw = String(el?.value ?? "").trim();
+  if (raw === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  return value;
+}
+
+function syncMonsterEditorFromForm() {
+  if (monsterEditorUi.suspendFormEvents || monsterEditorUi.loading) return;
+  const id = normalizeMonsterEditorId(monsterEditorUi.selectedId ?? "");
+  if (!id) return;
+  const prior = monsterEditorUi.workingMonsters[id] ?? MONSTER_TYPES[id] ?? { id, name: titleFromId(id) };
+
+  const raw = {
+    id,
+    name: String(monsterEditNameEl?.value ?? prior.name ?? titleFromId(id)),
+    glyph: String(monsterEditGlyphEl?.value ?? prior.glyph ?? "").slice(0, 2),
+    aliasOf: String(monsterEditAliasOfEl?.value ?? "").trim(),
+    ai: String(monsterEditAiEl?.value ?? "").trim(),
+    sizeGrowth: !!monsterEditSizeGrowthEl?.checked,
+    baseHp: readNumberInputValue(monsterEditBaseHpEl, prior.baseHp ?? 18),
+    baseAtk: readNumberInputValue(monsterEditBaseAtkEl, prior.baseAtk ?? 6),
+    baseDef: readNumberInputValue(monsterEditBaseDefEl, prior.baseDef ?? 1),
+    baseAcc: readNumberInputValue(monsterEditBaseAccEl, prior.baseAcc ?? 70),
+    baseEva: readNumberInputValue(monsterEditBaseEvaEl, prior.baseEva ?? 8),
+    spd: readNumberInputValue(monsterEditSpdEl, prior.spd ?? 1),
+    xp: readNumberInputValue(monsterEditXpEl, prior.xp ?? 3),
+  };
+
+  const intOptionals = [
+    ["range", monsterEditRangeEl],
+    ["cdTurns", monsterEditCdTurnsEl],
+    ["preferredRange", monsterEditPreferredRangeEl],
+    ["blinkRange", monsterEditBlinkRangeEl],
+    ["summonCooldownTurns", monsterEditSummonCooldownTurnsEl],
+    ["poisonOnHitTurns", monsterEditPoisonOnHitTurnsEl],
+    ["poisonOnHitDmg", monsterEditPoisonOnHitDmgEl],
+    ["slowTurns", monsterEditSlowTurnsEl],
+    ["deathCloudTurns", monsterEditDeathCloudTurnsEl],
+    ["deathCloudRadius", monsterEditDeathCloudRadiusEl],
+    ["deathCloudDmg", monsterEditDeathCloudDmgEl],
+  ];
+  for (const [key, field] of intOptionals) {
+    const value = readOptionalIntInputValue(field);
+    if (value !== null) raw[key] = value;
+  }
+  const floatOptionals = [
+    ["poisonOnHitChance", monsterEditPoisonOnHitChanceEl],
+    ["slowOnHitChance", monsterEditSlowOnHitChanceEl],
+    ["stunOnHitChance", monsterEditStunOnHitChanceEl],
+    ["knockbackOnHitChance", monsterEditKnockbackOnHitChanceEl],
+    ["backstabDamageMult", monsterEditBackstabDamageMultEl],
+    ["meleeReflectPct", monsterEditMeleeReflectPctEl],
+  ];
+  for (const [key, field] of floatOptionals) {
+    const value = readOptionalFloatInputValue(field);
+    if (value !== null) raw[key] = value;
+  }
+  if (monsterEditImmunePoisonEl?.checked) raw.immunePoison = true;
+
+  monsterEditorUi.workingMonsters[id] = normalizeMonsterEditorSpec(id, raw);
+
+  if (monsterEditSpawnEnabledEl?.checked) {
+    const maxDepthRaw = String(monsterEditSpawnMaxDepthEl?.value ?? "").trim();
+    upsertMonsterEditorRule({
+      id,
+      minDepth: readNumberInputValue(monsterEditSpawnMinDepthEl, 0),
+      maxDepth: maxDepthRaw === "" ? null : readNumberInputValue(monsterEditSpawnMaxDepthEl, 0),
+      baseWeight: readNumberInputValue(monsterEditSpawnBaseWeightEl, 1),
+      rampFactor: readNumberInputValue(monsterEditSpawnRampFactorEl, 0),
+    });
+  } else {
+    removeMonsterEditorRule(id);
+  }
+  setMonsterEditorSpawnFieldState();
+  monsterEditorSignature = "";
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+}
+
+async function monsterEditorApiRequest(method = "GET", body = null) {
+  const headers = {
+    Accept: "application/json",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+  };
+  const init = { method, credentials: "same-origin", headers, cache: "no-store" };
+  if (body !== null) {
+    headers["Content-Type"] = "application/json";
+    headers["X-CSRF-Token"] = saveApiCsrfToken;
+    init.body = JSON.stringify(body);
+  }
+  let resp = null;
+  try {
+    resp = await fetch(withCacheBust("./index.php?api=monsters"), init);
+  } catch {
+    throw new Error("Network error while contacting the monster API.");
+  }
+  let data = null;
+  try { data = await resp.json(); } catch {}
+  if (!resp.ok || !data?.ok) {
+    const msg = data?.error ?? `Monster request failed (${resp.status})`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function refreshMonsterEditorFromServer(quiet = false) {
+  if (!canUseAdminControls()) return false;
+  setMonsterEditorLoading(true);
+  if (!quiet) setMonsterEditorStatus("Refreshing monster data...", false);
+  try {
+    const data = await monsterEditorApiRequest("GET", null);
+    applyMonsterEditorPayload(data);
+    monsterEditorResetWorkingFromRuntime();
+    if (!quiet) setMonsterEditorStatus("Monster data refreshed.", false);
+    return true;
+  } catch (err) {
+    if (!quiet) setMonsterEditorStatus(err?.message ?? "Could not refresh monster data.", true);
+    return false;
+  } finally {
+    setMonsterEditorLoading(false);
+  }
+}
+
+function buildMonsterEditorSavePayload() {
+  return {
+    monsters: cloneMonsterTypeMapForEditor(monsterEditorUi.workingMonsters),
+    spawn_rules: cloneMonsterSpawnRulesForEditor(monsterEditorUi.workingSpawnRules),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+async function saveMonsterEditorToServer() {
+  if (!canUseAdminControls()) return false;
+  if (!monsterEditorUi.dirty) {
+    setMonsterEditorStatus("No changes to save.", false);
+    return true;
+  }
+  setMonsterEditorLoading(true);
+  setMonsterEditorStatus("Saving monster data...", false);
+  try {
+    const payload = buildMonsterEditorSavePayload();
+    const data = await monsterEditorApiRequest("POST", {
+      action: "save",
+      monsters: payload.monsters,
+      spawn_rules: payload.spawn_rules,
+      updated_at: payload.updated_at,
+    });
+    applyMonsterEditorPayload(data);
+    monsterEditorResetWorkingFromRuntime();
+    setMonsterEditorStatus("Monster data saved.", false);
+    return true;
+  } catch (err) {
+    setMonsterEditorStatus(err?.message ?? "Could not save monster data.", true);
+    return false;
+  } finally {
+    setMonsterEditorLoading(false);
+  }
+}
+
+function promptMonsterEditorId(promptText, defaultValue = "") {
+  const raw = window.prompt(promptText, defaultValue);
+  if (raw === null) return null;
+  const id = normalizeMonsterEditorId(raw);
+  if (!id) {
+    setMonsterEditorStatus("Monster id must match [a-z0-9_] and be at most 80 chars.", true);
+    return null;
+  }
+  return id;
+}
+
+function createMonsterEditorFromTemplate() {
+  const suggested = "new_monster";
+  const id = promptMonsterEditorId("Enter new monster id:", suggested);
+  if (!id) return false;
+  if (monsterEditorUi.workingMonsters[id]) {
+    setMonsterEditorStatus(`Monster id '${id}' already exists.`, true);
+    return false;
+  }
+  const selectedId = normalizeMonsterEditorId(monsterEditorUi.selectedId ?? "");
+  const template = (selectedId && monsterEditorUi.workingMonsters[selectedId])
+    ? monsterEditorUi.workingMonsters[selectedId]
+    : (monsterEditorUi.workingMonsters.rat ?? MONSTER_TYPES.rat);
+  const newSpec = normalizeMonsterEditorSpec(id, {
+    ...template,
+    id,
+    name: titleFromId(id),
+    glyph: id.slice(0, 1) || (template?.glyph ?? "m"),
+    aliasOf: "",
+  });
+  monsterEditorUi.workingMonsters[id] = newSpec;
+
+  const baseDepth = Math.max(0, Math.floor(monsterEditorUi.previewDepth ?? 0));
+  const templateRule = selectedId ? monsterEditorRuleById(selectedId) : null;
+  if (templateRule) {
+    upsertMonsterEditorRule({ ...templateRule, id });
+  } else {
+    upsertMonsterEditorRule({
+      id,
+      minDepth: baseDepth,
+      maxDepth: null,
+      baseWeight: 1,
+      rampFactor: 0,
+    });
+  }
+  monsterEditorUi.selectedId = id;
+  monsterEditorSignature = "";
+  populateMonsterEditorForm();
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+  setMonsterEditorStatus(`Created '${id}'.`, false);
+  return true;
+}
+
+function duplicateSelectedMonsterEditorEntry() {
+  const sourceId = normalizeMonsterEditorId(monsterEditorUi.selectedId ?? "");
+  if (!sourceId || !monsterEditorUi.workingMonsters[sourceId]) {
+    setMonsterEditorStatus("Select a monster to duplicate.", true);
+    return false;
+  }
+  const id = promptMonsterEditorId("Enter duplicate monster id:", `${sourceId}_copy`);
+  if (!id) return false;
+  if (monsterEditorUi.workingMonsters[id]) {
+    setMonsterEditorStatus(`Monster id '${id}' already exists.`, true);
+    return false;
+  }
+  const sourceSpec = monsterEditorUi.workingMonsters[sourceId];
+  monsterEditorUi.workingMonsters[id] = normalizeMonsterEditorSpec(id, {
+    ...sourceSpec,
+    id,
+    name: `${sourceSpec.name ?? titleFromId(sourceId)} Copy`,
+  });
+  const sourceRule = monsterEditorRuleById(sourceId);
+  if (sourceRule) {
+    upsertMonsterEditorRule({ ...sourceRule, id });
+  }
+  monsterEditorUi.selectedId = id;
+  monsterEditorSignature = "";
+  populateMonsterEditorForm();
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+  setMonsterEditorStatus(`Duplicated '${sourceId}' to '${id}'.`, false);
+  return true;
+}
+
+function deleteSelectedMonsterEditorEntry() {
+  const id = normalizeMonsterEditorId(monsterEditorUi.selectedId ?? "");
+  if (!id || !monsterEditorUi.workingMonsters[id]) {
+    setMonsterEditorStatus("Select a monster to delete.", true);
+    return false;
+  }
+  if (id === "rat") {
+    setMonsterEditorStatus("The 'rat' baseline cannot be deleted.", true);
+    return false;
+  }
+  const confirmed = window.confirm(`Delete monster '${id}' from the working set?`);
+  if (!confirmed) return false;
+  delete monsterEditorUi.workingMonsters[id];
+  removeMonsterEditorRule(id);
+  const ids = Object.keys(monsterEditorUi.workingMonsters).sort();
+  monsterEditorUi.selectedId = ids[0] ?? "";
+  monsterEditorSignature = "";
+  populateMonsterEditorForm();
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+  setMonsterEditorStatus(`Deleted '${id}'.`, false);
+  return true;
+}
+
+function exportMonsterEditorPayload() {
+  const payload = {
+    monsters: cloneMonsterTypeMapForEditor(monsterEditorUi.workingMonsters),
+    spawn_rules: cloneMonsterSpawnRulesForEditor(monsterEditorUi.workingSpawnRules),
+    updated_at: new Date().toISOString(),
+  };
+  const json = JSON.stringify(payload, null, 2);
+  const blob = new Blob([`${json}\n`], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  a.href = url;
+  a.download = `monster-editor-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  setMonsterEditorStatus("Exported monster editor payload.", false);
+}
+
+async function importMonsterEditorPayloadFromFile(file) {
+  if (!file) return false;
+  let parsed = null;
+  try {
+    const text = await file.text();
+    parsed = JSON.parse(text);
+  } catch {
+    setMonsterEditorStatus("Could not parse monster JSON file.", true);
+    return false;
+  }
+  const normalized = normalizeMonsterEditorPayload(parsed);
+  const importedMonsters = cloneMonsterTypeMapForEditor(normalized.monsters);
+  const importedRules = cloneMonsterSpawnRulesForEditor(normalized.spawnRules);
+  if (!Object.keys(importedMonsters).length) {
+    setMonsterEditorStatus("Import payload contains no monsters.", true);
+    return false;
+  }
+  monsterEditorUi.workingMonsters = importedMonsters;
+  monsterEditorUi.workingSpawnRules = importedRules;
+  if (!monsterEditorUi.workingMonsters[monsterEditorUi.selectedId]) {
+    monsterEditorUi.selectedId = Object.keys(monsterEditorUi.workingMonsters).sort()[0] ?? "";
+  }
+  monsterEditorSignature = "";
+  populateMonsterEditorForm();
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+  setMonsterEditorStatus("Imported monster payload into working set. Save to apply.", false);
+  return true;
+}
+
+async function openMonsterEditorOverlay() {
+  if (!canUseAdminControls()) return false;
+  setMonsterEditorOverlayOpen(true);
+  if (!Object.keys(monsterEditorUi.baselineMonsters ?? {}).length) {
+    monsterEditorResetWorkingFromRuntime();
+  }
+  await refreshMonsterEditorFromServer(false);
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  return true;
 }
 
 async function spriteApiRequest(method = "GET", body = null) {
@@ -9987,6 +11847,7 @@ function setSpriteEditorOverlayOpen(open) {
     closeShopOverlay();
     closeSaveGameOverlay();
     closeInfoOverlay();
+    closeMonsterEditorOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   }
   spriteEditorUi.open = show;
@@ -10799,7 +12660,10 @@ function draw(state) {
 
 // ---------- Turn handling ----------
 function applyEffectsAfterPlayerAction(state) {
-  if (!state.player.dead) applyEffectsTick(state);
+  if (!state.player.dead) {
+    applyEffectsTick(state);
+    tickPoisonClouds(state);
+  }
 }
 
 function takeTurn(state, didSpendTurn) {
@@ -10864,6 +12728,11 @@ function onKey(state, e) {
   if (isSpriteEditorOverlayOpen()) {
     e.preventDefault();
     if (k === "escape") closeSpriteEditorOverlay();
+    return;
+  }
+  if (isMonsterEditorOverlayOpen()) {
+    e.preventDefault();
+    if (k === "escape") closeMonsterEditorOverlay();
     return;
   }
   if (isInfoOverlayOpen()) {
@@ -11072,6 +12941,7 @@ function exportSave(state) {
   const visitedDoors = Array.from(state.visitedDoors ?? []);
   const exploredChunks = Array.from(state.exploredChunks ?? []);
   const xpDepthKills = ensureDepthKillCounters(state);
+  const poisonClouds = ensurePoisonCloudState(state);
 
   const payload = {
     v: 8,
@@ -11090,6 +12960,7 @@ function exportSave(state) {
     visitedDoors,
     exploredChunks,
     xpDepthKills,
+    poisonClouds,
     surfaceLink: state.surfaceLink ?? null,
     startSpawn: state.startSpawn ?? null,
     shop: state.shop ?? null,
@@ -11135,6 +13006,23 @@ function normalizeDepthKillCounters(raw) {
     const count = Math.max(0, Math.floor(Number(countRaw)));
     if (!Number.isFinite(depth) || !Number.isFinite(count) || count <= 0) continue;
     out[depth] = count;
+  }
+  return out;
+}
+
+function normalizePoisonCloudState(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [k, entry] of Object.entries(raw)) {
+    if (!entry || typeof entry !== "object") continue;
+    const x = Math.floor(Number(entry.x));
+    const y = Math.floor(Number(entry.y));
+    const z = Math.floor(Number(entry.z));
+    const turnsLeft = Math.max(0, Math.floor(Number(entry.turnsLeft ?? 0)));
+    const dmg = Math.max(1, Math.floor(Number(entry.dmg ?? 1)));
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    if (turnsLeft <= 0) continue;
+    out[k] = { x, y, z, turnsLeft, dmg, source: String(entry.source ?? "spores").slice(0, 40) };
   }
   return out;
 }
@@ -11284,6 +13172,7 @@ function importSave(saveStr) {
       visitedDoors: new Set(payload.visitedDoors ?? []),
       exploredChunks: new Set(payload.exploredChunks ?? []),
       xpDepthKills: normalizeDepthKillCounters(payload.xpDepthKills ?? {}),
+      poisonClouds: normalizePoisonCloudState(payload.poisonClouds ?? {}),
       surfaceLink: payload.surfaceLink ?? null,
       startSpawn: payload.startSpawn ?? null,
       shop: payload.shop ?? null,
@@ -11413,6 +13302,9 @@ btnInfoEl?.addEventListener("click", () => {
 btnSpriteEditorEl?.addEventListener("click", () => {
   void openSpriteEditorOverlay();
 });
+btnMonsterEditorEl?.addEventListener("click", () => {
+  void openMonsterEditorOverlay();
+});
 infoCloseBtnEl?.addEventListener("click", () => {
   closeInfoOverlay();
 });
@@ -11440,6 +13332,75 @@ spriteEditorOverlayEl?.addEventListener("click", (e) => {
 });
 spriteEditorRefreshBtnEl?.addEventListener("click", () => {
   void refreshSpriteOverridesFromServer(false);
+});
+monsterEditorCloseBtnEl?.addEventListener("click", () => {
+  closeMonsterEditorOverlay();
+});
+monsterEditorOverlayEl?.addEventListener("click", (e) => {
+  if (e.target === monsterEditorOverlayEl) closeMonsterEditorOverlay();
+});
+monsterEditorSearchInputEl?.addEventListener("input", () => {
+  monsterEditorSignature = "";
+  renderMonsterEditorList();
+});
+monsterEditorPreviewDepthInputEl?.addEventListener("input", () => {
+  renderMonsterEditorPreview();
+});
+monsterEditorNewBtnEl?.addEventListener("click", () => {
+  createMonsterEditorFromTemplate();
+});
+monsterEditorDuplicateBtnEl?.addEventListener("click", () => {
+  duplicateSelectedMonsterEditorEntry();
+});
+monsterEditorDeleteBtnEl?.addEventListener("click", () => {
+  deleteSelectedMonsterEditorEntry();
+});
+monsterEditorExportBtnEl?.addEventListener("click", () => {
+  exportMonsterEditorPayload();
+});
+monsterEditorImportBtnEl?.addEventListener("click", () => {
+  monsterEditorImportInputEl?.click();
+});
+monsterEditorImportInputEl?.addEventListener("change", () => {
+  const file = monsterEditorImportInputEl.files?.[0] ?? null;
+  monsterEditorImportInputEl.value = "";
+  if (!file) return;
+  void importMonsterEditorPayloadFromFile(file);
+});
+monsterEditorRefreshBtnEl?.addEventListener("click", () => {
+  void refreshMonsterEditorFromServer(false);
+});
+monsterEditorRevertBtnEl?.addEventListener("click", () => {
+  monsterEditorUi.workingMonsters = cloneMonsterTypeMapForEditor(monsterEditorUi.baselineMonsters);
+  monsterEditorUi.workingSpawnRules = cloneMonsterSpawnRulesForEditor(monsterEditorUi.baselineSpawnRules);
+  if (!monsterEditorUi.workingMonsters[monsterEditorUi.selectedId]) {
+    monsterEditorUi.selectedId = Object.keys(monsterEditorUi.workingMonsters).sort()[0] ?? "";
+  }
+  monsterEditorSignature = "";
+  populateMonsterEditorForm();
+  renderMonsterEditorList();
+  renderMonsterEditorPreview();
+  refreshMonsterEditorDirtyState();
+  setMonsterEditorStatus("Reverted unsaved changes.", false);
+});
+monsterEditorSaveBtnEl?.addEventListener("click", () => {
+  void saveMonsterEditorToServer();
+});
+monsterEditAdvancedToggleEl?.addEventListener("click", () => {
+  setMonsterEditorAdvancedVisible(!monsterEditorUi.showAdvanced);
+});
+monsterEditSpawnEnabledEl?.addEventListener("change", () => {
+  setMonsterEditorSpawnFieldState();
+  syncMonsterEditorFromForm();
+});
+monsterEditorFormEl?.addEventListener("input", () => {
+  syncMonsterEditorFromForm();
+});
+monsterEditorFormEl?.addEventListener("change", () => {
+  syncMonsterEditorFromForm();
+});
+monsterEditorFormEl?.addEventListener("submit", (e) => {
+  e.preventDefault();
 });
 spriteFilterCategoryEl?.addEventListener("change", () => {
   spriteEditorUi.filterCategory = spriteFilterCategoryEl.value || "all";
@@ -11557,6 +13518,11 @@ document.addEventListener("keydown", (e) => {
   if (isSpriteEditorOverlayOpen()) {
     e.preventDefault();
     closeSpriteEditorOverlay();
+    return;
+  }
+  if (isMonsterEditorOverlayOpen()) {
+    e.preventDefault();
+    closeMonsterEditorOverlay();
     return;
   }
   if (isInfoOverlayOpen()) {
@@ -11730,6 +13696,15 @@ window.addEventListener("error", (e) => showFatal(e.error ?? e.message));
 window.addEventListener("unhandledrejection", (e) => showFatal(e.reason ?? e));
 
 try {
+  applyMonsterEditorPayload(
+    monsterEditorBootstrapPayload ?? {
+      monsters: cloneMonsterTypeMapForEditor(MONSTER_TYPES),
+      spawn_rules: cloneMonsterSpawnRulesForEditor(MONSTER_SPAWN_RULES),
+      updated_at: "",
+    }
+  );
+  monsterEditorResetWorkingFromRuntime();
+  setMonsterEditorAdvancedVisible(false);
   game = loadSaveOrNew();
   if (enforceAdminControlPolicy(game)) saveNow(game);
   spriteEditorUi.objects = buildSpriteObjectCatalog();
