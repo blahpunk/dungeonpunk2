@@ -1596,7 +1596,7 @@ const CLIENT_SPRITE_UPLOAD_RETRY_TARGET_BYTES = 220 * 1024;
 let saveNameWasEdited = false;
 let lastAutoSaveName = "";
 const spriteOverrideState = { overrides: {}, scales: {}, entries: [] };
-const monsterEditorState = { monsters: {}, spawnRules: [], updatedAt: "" };
+const monsterEditorState = { version: 1, monsters: {}, spawnRules: [], updatedAt: "" };
 let infoTierSignature = "";
 let spriteEditorSignature = "";
 let monsterEditorSignature = "";
@@ -3151,207 +3151,31 @@ function hasLineOfSight(world, z, x0, y0, x1, y1) {
 }
 
 // ---------- Monsters / Items ----------
-const MONSTER_TYPES = {
+const FALLBACK_MONSTERS_MIN = {
   rat: {
     id: "rat",
     name: "Rat",
     baseHp: 18, baseAtk: 6, baseDef: 1, baseAcc: 70, baseEva: 18, spd: 1.25, xp: 3, glyph: "r", sizeGrowth: true,
-  },
-  skeleton: {
-    id: "skeleton",
-    name: "Skeleton",
-    baseHp: 54, baseAtk: 15, baseDef: 7, baseAcc: 71, baseEva: 8, spd: 0.95, xp: 6, glyph: "k", sizeGrowth: true,
   },
   goblin: {
     id: "goblin",
     name: "Goblin",
     baseHp: 46, baseAtk: 17, baseDef: 5, baseAcc: 76, baseEva: 14, spd: 1.1, xp: 7, glyph: "g", sizeGrowth: true,
   },
-  archer: {
-    id: "archer",
-    name: "Archer",
-    baseHp: 24, baseAtk: 16, baseDef: 2, baseAcc: 82, baseEva: 10, spd: 1.0, xp: 10, glyph: "a",
-    range: 6, cdTurns: 2, sizeGrowth: false,
-  },
-  giant_spider: {
-    id: "giant_spider",
-    name: "Giant Spider",
-    baseHp: 40, baseAtk: 15, baseDef: 4, baseAcc: 76, baseEva: 16, spd: 1.15, xp: 12, glyph: "S", sizeGrowth: true,
-  },
-  hobgoblin: {
-    id: "hobgoblin",
-    name: "Hobgoblin",
-    baseHp: 58, baseAtk: 20, baseDef: 8, baseAcc: 72, baseEva: 8, spd: 0.95, xp: 18, glyph: "H", sizeGrowth: true,
-  },
-  dire_wolf: {
-    id: "dire_wolf",
-    name: "Dire Wolf",
-    baseHp: 46, baseAtk: 18, baseDef: 4, baseAcc: 80, baseEva: 20, spd: 1.35, xp: 15, glyph: "W", sizeGrowth: true,
-  },
-  cave_troll: {
-    id: "cave_troll",
-    name: "Cave Troll",
-    baseHp: 110, baseAtk: 28, baseDef: 14, baseAcc: 60, baseEva: 4, spd: 0.75, xp: 30, glyph: "T", sizeGrowth: true,
-  },
-  wraith: {
-    id: "wraith",
-    name: "Wraith",
-    baseHp: 42, baseAtk: 26, baseDef: 2, baseAcc: 85, baseEva: 22, spd: 1.2, xp: 26, glyph: "w", sizeGrowth: false,
-  },
-  basilisk: {
-    id: "basilisk",
-    name: "Basilisk",
-    baseHp: 78, baseAtk: 32, baseDef: 10, baseAcc: 78, baseEva: 12, spd: 1.0, xp: 40, glyph: "B", sizeGrowth: true,
-  },
-  ancient_automaton: {
-    id: "ancient_automaton",
-    name: "Ancient Automaton",
-    baseHp: 140, baseAtk: 30, baseDef: 22, baseAcc: 70, baseEva: 2, spd: 0.7, xp: 48, glyph: "A", sizeGrowth: true,
-  },
-  rogue: {
-    id: "rogue",
-    name: "Rogue",
-    baseHp: 30, baseAtk: 15, baseDef: 4, baseAcc: 77, baseEva: 18, spd: 1.15, xp: 11, glyph: "R", sizeGrowth: false,
-  },
-  spore_crawler: {
-    id: "spore_crawler",
-    name: "Spore Crawler",
-    baseHp: 34, baseAtk: 14, baseDef: 5, baseAcc: 72, baseEva: 9, spd: 0.95, xp: 12, glyph: "f", sizeGrowth: true,
-    ai: "melee_chase",
-    poisonOnHitChance: 0.26,
-    poisonOnHitTurns: 3,
-    poisonOnHitDmg: 70,
-    deathCloudTurns: 3,
-    deathCloudRadius: 1,
-    deathCloudDmg: 55,
-  },
-  rift_hound: {
-    id: "rift_hound",
-    name: "Rift Hound",
-    baseHp: 48, baseAtk: 20, baseDef: 4, baseAcc: 82, baseEva: 20, spd: 1.32, xp: 18, glyph: "h", sizeGrowth: false,
-    ai: "blink_flanker",
-    blinkRange: 2,
-    backstabDamageMult: 1.2,
-  },
-  crocubot: {
-    id: "crocubot",
-    name: "Croc-u-bot",
-    baseHp: 90, baseAtk: 26, baseDef: 18, baseAcc: 74, baseEva: 6, spd: 0.82, xp: 28, glyph: "C", sizeGrowth: true,
-    ai: "tank",
-    immunePoison: true,
-    stunOnHitChance: 0.12,
-  },
-  bone_herald: {
-    id: "bone_herald",
-    name: "Bone Herald",
-    baseHp: 52, baseAtk: 18, baseDef: 6, baseAcc: 78, baseEva: 12, spd: 1.0, xp: 30, glyph: "N", sizeGrowth: false,
-    ai: "support_undead",
-    range: 5,
-    cdTurns: 2,
-    summonCooldownTurns: 6,
-  },
-  iron_warden: {
-    id: "iron_warden",
-    name: "Iron Warden",
-    baseHp: 118, baseAtk: 30, baseDef: 24, baseAcc: 70, baseEva: 6, spd: 0.78, xp: 38, glyph: "I", sizeGrowth: true,
-    ai: "tank",
-    meleeReflectPct: 0.2,
-  },
-  cave_skirmisher: {
-    id: "cave_skirmisher",
-    name: "Cave Skirmisher",
-    baseHp: 36, baseAtk: 16, baseDef: 3, baseAcc: 82, baseEva: 15, spd: 1.16, xp: 14, glyph: "k", sizeGrowth: false,
-    ai: "ranged_kite",
-    preferredRange: 4,
-    range: 5,
-    cdTurns: 1,
-  },
-  ruin_archer: {
-    id: "ruin_archer",
-    name: "Ruin Archer",
-    baseHp: 46, baseAtk: 21, baseDef: 6, baseAcc: 80, baseEva: 12, spd: 1.0, xp: 19, glyph: "u", sizeGrowth: false,
-    ai: "ranged_hold",
-    preferredRange: 5,
-    range: 6,
-    cdTurns: 2,
-  },
-  storm_sniper: {
-    id: "storm_sniper",
-    name: "Storm Sniper",
-    baseHp: 56, baseAtk: 28, baseDef: 8, baseAcc: 84, baseEva: 14, spd: 1.04, xp: 27, glyph: "t", sizeGrowth: false,
-    ai: "ranged_kite",
-    preferredRange: 6,
-    range: 6,
-    cdTurns: 2,
-    slowOnHitChance: 0.2,
-    slowTurns: 2,
-  },
-  nullmetal_assassin: {
-    id: "nullmetal_assassin",
-    name: "Nullmetal Assassin",
-    baseHp: 58, baseAtk: 30, baseDef: 7, baseAcc: 86, baseEva: 22, spd: 1.24, xp: 34, glyph: "n", sizeGrowth: false,
-    ai: "ranged_kite",
-    preferredRange: 4,
-    range: 5,
-    cdTurns: 2,
-    blinkRange: 2,
-  },
-  deepcore_ballista_sentinel: {
-    id: "deepcore_ballista_sentinel",
-    name: "Deepcore Ballista Sentinel",
-    baseHp: 84, baseAtk: 42, baseDef: 14, baseAcc: 78, baseEva: 4, spd: 0.72, xp: 44, glyph: "D", sizeGrowth: false,
-    ai: "ranged_artillery",
-    preferredRange: 5,
-    range: 5,
-    cdTurns: 3,
-  },
-  singularity_hunter: {
-    id: "singularity_hunter",
-    name: "Singularity Hunter",
-    baseHp: 96, baseAtk: 40, baseDef: 12, baseAcc: 84, baseEva: 20, spd: 1.06, xp: 52, glyph: "Q", sizeGrowth: false,
-    ai: "ranged_kite",
-    preferredRange: 6,
-    range: 6,
-    cdTurns: 2,
-    knockbackOnHitChance: 0.2,
-  },
-  slime_green: {
-    id: "slime_green",
-    name: "Green Slime",
-    baseHp: 20, baseAtk: 7, baseDef: 2, baseAcc: 66, baseEva: 10, spd: 0.95, xp: 4, glyph: "s", sizeGrowth: true,
+  skeleton: {
+    id: "skeleton",
+    name: "Skeleton",
+    baseHp: 54, baseAtk: 15, baseDef: 7, baseAcc: 71, baseEva: 8, spd: 0.95, xp: 6, glyph: "k", sizeGrowth: true,
   },
   slime_yellow: {
     id: "slime_yellow",
     name: "Yellow Slime",
     baseHp: 26, baseAtk: 10, baseDef: 3, baseAcc: 68, baseEva: 11, spd: 1.0, xp: 6, glyph: "s", sizeGrowth: true,
   },
-  slime_orange: {
-    id: "slime_orange",
-    name: "Orange Slime",
-    baseHp: 36, baseAtk: 13, baseDef: 5, baseAcc: 70, baseEva: 12, spd: 1.02, xp: 9, glyph: "s", sizeGrowth: true,
-  },
-  slime_red: {
-    id: "slime_red",
-    name: "Red Slime",
-    baseHp: 52, baseAtk: 18, baseDef: 8, baseAcc: 72, baseEva: 12, spd: 1.05, xp: 13, glyph: "s", sizeGrowth: true,
-  },
-  slime_violet: {
-    id: "slime_violet",
-    name: "Violet Slime",
-    baseHp: 72, baseAtk: 24, baseDef: 11, baseAcc: 74, baseEva: 14, spd: 1.08, xp: 18, glyph: "s", sizeGrowth: true,
-  },
-  slime_indigo: {
-    id: "slime_indigo",
-    name: "Indigo Slime",
-    baseHp: 92, baseAtk: 30, baseDef: 14, baseAcc: 76, baseEva: 15, spd: 1.1, xp: 23, glyph: "s", sizeGrowth: true,
-  },
-  // Backward-compat aliases.
   slime: { id: "slime", name: "Slime", aliasOf: "slime_yellow", glyph: "s", sizeGrowth: true },
-  jelly_green: { id: "jelly_green", name: "Green Slime", aliasOf: "slime_green", glyph: "s", sizeGrowth: true },
-  jelly_yellow: { id: "jelly_yellow", name: "Yellow Slime", aliasOf: "slime_yellow", glyph: "s", sizeGrowth: true },
-  jelly_red: { id: "jelly_red", name: "Red Slime", aliasOf: "slime_red", glyph: "s", sizeGrowth: true },
   jelly: { id: "jelly", name: "Slime", aliasOf: "slime_yellow", glyph: "s", sizeGrowth: true },
 };
+const MONSTER_TYPES = JSON.parse(JSON.stringify(FALLBACK_MONSTERS_MIN));
 const VOID_ALIGNED_MONSTER_IDS = new Set([
   "wraith",
   "rift_hound",
@@ -4378,38 +4202,15 @@ function weightedChoice(rng, entries) {
   }
   return entries[entries.length - 1].id;
 }
-const MONSTER_SPAWN_RULES = [
-  { id: "rat", minDepth: 0, maxDepth: 5, baseWeight: 7, rampFactor: -0.9 },
-  { id: "goblin", minDepth: 0, maxDepth: 10, baseWeight: 6, rampFactor: -0.25 },
-  { id: "skeleton", minDepth: 0, maxDepth: 14, baseWeight: 5, rampFactor: -0.1 },
-  { id: "slime_green", minDepth: 0, maxDepth: 6, baseWeight: 2, rampFactor: -0.18 },
-  { id: "slime_yellow", minDepth: 1, maxDepth: 10, baseWeight: 1.8, rampFactor: 0.07 },
-  { id: "archer", minDepth: 2, maxDepth: 15, baseWeight: 2, rampFactor: 0.08 },
-  { id: "dire_wolf", minDepth: 2, maxDepth: 20, baseWeight: 2, rampFactor: 0.09 },
-  { id: "giant_spider", minDepth: 3, maxDepth: 16, baseWeight: 2.4, rampFactor: 0.09 },
-  { id: "hobgoblin", minDepth: 4, maxDepth: 26, baseWeight: 2.8, rampFactor: 0.1 },
-  { id: "wraith", minDepth: 5, maxDepth: 36, baseWeight: 2.1, rampFactor: 0.1 },
-  { id: "cave_troll", minDepth: 5, maxDepth: 34, baseWeight: 2.1, rampFactor: 0.09 },
-  { id: "basilisk", minDepth: 7, maxDepth: 60, baseWeight: 1.8, rampFactor: 0.1 },
-  { id: "ancient_automaton", minDepth: 8, maxDepth: 70, baseWeight: 1.3, rampFactor: 0.1 },
-  { id: "slime_orange", minDepth: 3, maxDepth: 15, baseWeight: 2.2, rampFactor: 0.12 },
-  { id: "slime_red", minDepth: 5, maxDepth: 24, baseWeight: 2.4, rampFactor: 0.1 },
-  { id: "slime_violet", minDepth: 8, maxDepth: 36, baseWeight: 2.1, rampFactor: 0.1 },
-  { id: "slime_indigo", minDepth: 11, maxDepth: null, baseWeight: 1.7, rampFactor: 0.09 },
-  { id: "spore_crawler", minDepth: 4, maxDepth: 22, baseWeight: 1.1, rampFactor: 0.12 },
-  { id: "cave_skirmisher", minDepth: 3, maxDepth: 18, baseWeight: 1.1, rampFactor: 0.1 },
-  { id: "ruin_archer", minDepth: 6, maxDepth: 24, baseWeight: 0.95, rampFactor: 0.09 },
-  { id: "rift_hound", minDepth: 8, maxDepth: 30, baseWeight: 0.95, rampFactor: 0.1 },
-  { id: "storm_sniper", minDepth: 12, maxDepth: 38, baseWeight: 0.78, rampFactor: 0.1 },
-  { id: "crocubot", minDepth: 14, maxDepth: 50, baseWeight: 0.72, rampFactor: 0.09 },
-  { id: "nullmetal_assassin", minDepth: 15, maxDepth: 44, baseWeight: 0.68, rampFactor: 0.09 },
-  { id: "deepcore_ballista_sentinel", minDepth: 17, maxDepth: 46, baseWeight: 0.52, rampFactor: 0.08 },
-  { id: "singularity_hunter", minDepth: 18, maxDepth: null, baseWeight: 0.42, rampFactor: 0.07 },
-  { id: "bone_herald", minDepth: 20, maxDepth: 70, baseWeight: 0.62, rampFactor: 0.08 },
-  { id: "iron_warden", minDepth: 28, maxDepth: null, baseWeight: 0.52, rampFactor: 0.07 },
+const FALLBACK_MONSTER_SPAWN_RULES_MIN = [
+  { id: "rat", minDepth: 0, maxDepth: 4, baseWeight: 6, rampFactor: -0.7 },
+  { id: "goblin", minDepth: 0, maxDepth: 10, baseWeight: 5.8, rampFactor: -0.2 },
+  { id: "skeleton", minDepth: 0, maxDepth: 14, baseWeight: 4.8, rampFactor: -0.08 },
+  { id: "slime_yellow", minDepth: 1, maxDepth: 10, baseWeight: 1.8, rampFactor: 0.06 },
 ];
-const BASE_MONSTER_TYPES = JSON.parse(JSON.stringify(MONSTER_TYPES));
-const BASE_MONSTER_SPAWN_RULES = MONSTER_SPAWN_RULES.map((rule) => ({ ...rule }));
+const MONSTER_SPAWN_RULES = FALLBACK_MONSTER_SPAWN_RULES_MIN.map((rule) => ({ ...rule }));
+const BASE_MONSTER_TYPES = JSON.parse(JSON.stringify(FALLBACK_MONSTERS_MIN));
+const BASE_MONSTER_SPAWN_RULES = FALLBACK_MONSTER_SPAWN_RULES_MIN.map((rule) => ({ ...rule }));
 
 function monsterSpawnWeightForDepth(rule, depth) {
   if (!rule || typeof rule !== "object") return 0;
@@ -4530,6 +4331,8 @@ function cloneMonsterSpawnRulesForEditor(source = MONSTER_SPAWN_RULES) {
 
 function normalizeMonsterEditorPayload(payload) {
   const src = (payload && typeof payload === "object") ? payload : {};
+  const versionRaw = Number(src.version ?? 1);
+  const version = Number.isFinite(versionRaw) ? clamp(Math.floor(versionRaw), 1, 1000) : 1;
   const monstersOut = {};
   const monstersRaw = src.monsters;
   if (Array.isArray(monstersRaw)) {
@@ -4551,10 +4354,12 @@ function normalizeMonsterEditorPayload(payload) {
   for (const ruleRaw of spawnRulesRaw) {
     const rule = normalizeMonsterSpawnRule(ruleRaw);
     if (!rule) continue;
+    if (!monstersOut[rule.id]) continue;
     spawnRulesOut.push(rule);
   }
   spawnRulesOut.sort((a, b) => (a.minDepth - b.minDepth) || a.id.localeCompare(b.id));
   return {
+    version,
     monsters: monstersOut,
     spawnRules: spawnRulesOut,
     updatedAt: String(src.updated_at ?? "").trim(),
@@ -4585,6 +4390,7 @@ function replaceMonsterRuntimeConfig(monsters = {}, spawnRules = []) {
   for (const rawRule of rulesList) {
     const rule = normalizeMonsterSpawnRule(rawRule);
     if (!rule) continue;
+    if (!MONSTER_TYPES[rule.id]) continue;
     MONSTER_SPAWN_RULES.push(rule);
   }
   if (!MONSTER_SPAWN_RULES.length) {
@@ -4601,6 +4407,7 @@ function replaceMonsterRuntimeConfig(monsters = {}, spawnRules = []) {
 function applyMonsterEditorPayload(payload, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const normalized = normalizeMonsterEditorPayload(payload);
+  monsterEditorState.version = normalized.version;
   monsterEditorState.monsters = normalized.monsters;
   monsterEditorState.spawnRules = normalized.spawnRules;
   monsterEditorState.updatedAt = normalized.updatedAt;
@@ -11319,6 +11126,7 @@ async function refreshMonsterEditorFromServer(quiet = false) {
 
 function buildMonsterEditorSavePayload() {
   return {
+    version: Math.max(1, Math.floor(Number(monsterEditorState.version) || 1)),
     monsters: cloneMonsterTypeMapForEditor(monsterEditorUi.workingMonsters),
     spawn_rules: cloneMonsterSpawnRulesForEditor(monsterEditorUi.workingSpawnRules),
     updated_at: new Date().toISOString(),
@@ -11337,6 +11145,7 @@ async function saveMonsterEditorToServer() {
     const payload = buildMonsterEditorSavePayload();
     const data = await monsterEditorApiRequest("POST", {
       action: "save",
+      version: payload.version,
       monsters: payload.monsters,
       spawn_rules: payload.spawn_rules,
       updated_at: payload.updated_at,
@@ -11467,6 +11276,7 @@ function deleteSelectedMonsterEditorEntry() {
 
 function exportMonsterEditorPayload() {
   const payload = {
+    version: Math.max(1, Math.floor(Number(monsterEditorState.version) || 1)),
     monsters: cloneMonsterTypeMapForEditor(monsterEditorUi.workingMonsters),
     spawn_rules: cloneMonsterSpawnRulesForEditor(monsterEditorUi.workingSpawnRules),
     updated_at: new Date().toISOString(),
@@ -13698,6 +13508,7 @@ window.addEventListener("unhandledrejection", (e) => showFatal(e.reason ?? e));
 try {
   applyMonsterEditorPayload(
     monsterEditorBootstrapPayload ?? {
+      version: 1,
       monsters: cloneMonsterTypeMapForEditor(MONSTER_TYPES),
       spawn_rules: cloneMonsterSpawnRulesForEditor(MONSTER_SPAWN_RULES),
       updated_at: "",

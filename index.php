@@ -758,13 +758,39 @@ function sprite_resolve_custom_file_path(string $category, string $fileName): ?s
 
 function monster_editor_file_path(): string
 {
+  return app_storage_path('data/monsters.json');
+}
+
+function monster_editor_legacy_file_path(): string
+{
   return app_storage_path('monster_editor/config.json');
+}
+
+function monster_editor_seed_file_path(): string
+{
+  return __DIR__ . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'content' . DIRECTORY_SEPARATOR . 'monsters.seed.json';
 }
 
 function ensure_monster_editor_storage_root(): bool
 {
   $dir = dirname(monster_editor_file_path());
   return is_dir($dir) || @mkdir($dir, 0700, true) || is_dir($dir);
+}
+
+function rotate_monster_editor_backups(string $path, int $maxBackups = 2): void
+{
+  $safeMax = max(1, min(9, $maxBackups));
+  for ($i = $safeMax; $i >= 1; $i--) {
+    $src = $i === 1 ? $path : ($path . '.bak.' . ($i - 1));
+    $dest = $path . '.bak.' . $i;
+    if (!is_file($src) || !is_readable($src)) {
+      continue;
+    }
+    @unlink($dest);
+    if (@copy($src, $dest)) {
+      @chmod($dest, 0640);
+    }
+  }
 }
 
 function monster_editor_normalize_id(string $value): ?string
@@ -818,10 +844,15 @@ function monster_editor_clamp_float(mixed $value, float $min, float $max, float 
 
 /**
  * @param array<string, mixed> $raw
- * @return array{monsters: array<string, array<string, mixed>>, spawn_rules: array<int, array<string, mixed>>, updated_at: string}
+ * @return array{version: int, monsters: array<string, array<string, mixed>>, spawn_rules: array<int, array<string, mixed>>, updated_at: string}
  */
 function monster_editor_normalize_payload(array $raw): array
 {
+  $versionRaw = $raw['version'] ?? 1;
+  $version = 1;
+  if (is_numeric($versionRaw)) {
+    $version = max(1, min(1000, (int) floor((float) $versionRaw)));
+  }
   $monstersRaw = $raw['monsters'] ?? [];
   $spawnRulesRaw = $raw['spawn_rules'] ?? [];
 
@@ -973,6 +1004,9 @@ function monster_editor_normalize_payload(array $raw): array
       if ($id === null) {
         continue;
       }
+      if (!isset($monsters[$id])) {
+        continue;
+      }
       $minDepth = monster_editor_clamp_int($ruleRaw['minDepth'] ?? null, 0, 5000, 0);
       $maxDepthRaw = $ruleRaw['maxDepth'] ?? null;
       $maxDepth = null;
@@ -1001,6 +1035,7 @@ function monster_editor_normalize_payload(array $raw): array
   }
 
   return [
+    'version' => $version,
     'monsters' => $monsters,
     'spawn_rules' => $spawnRules,
     'updated_at' => $updatedAt,
@@ -1008,23 +1043,30 @@ function monster_editor_normalize_payload(array $raw): array
 }
 
 /**
- * @return array{monsters: array<string, array<string, mixed>>, spawn_rules: array<int, array<string, mixed>>, updated_at: string}
+ * @return array{version: int, monsters: array<string, array<string, mixed>>, spawn_rules: array<int, array<string, mixed>>, updated_at: string}
  */
 function load_monster_editor_config(): array
 {
-  $path = monster_editor_file_path();
-  if (!is_file($path) || !is_readable($path)) {
-    return ['monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
+  $paths = [monster_editor_file_path(), monster_editor_legacy_file_path(), monster_editor_seed_file_path()];
+  foreach ($paths as $path) {
+    if (!is_file($path) || !is_readable($path)) {
+      continue;
+    }
+    $raw = @file_get_contents($path);
+    if (!is_string($raw) || trim($raw) === '') {
+      continue;
+    }
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+      continue;
+    }
+    $normalized = monster_editor_normalize_payload($decoded);
+    if ($path !== monster_editor_file_path()) {
+      persist_monster_editor_config($normalized);
+    }
+    return $normalized;
   }
-  $raw = @file_get_contents($path);
-  if (!is_string($raw) || trim($raw) === '') {
-    return ['monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
-  }
-  $decoded = json_decode($raw, true);
-  if (!is_array($decoded)) {
-    return ['monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
-  }
-  return monster_editor_normalize_payload($decoded);
+  return ['version' => 1, 'monsters' => [], 'spawn_rules' => [], 'updated_at' => ''];
 }
 
 function persist_monster_editor_config(array $payload): bool
@@ -1039,24 +1081,38 @@ function persist_monster_editor_config(array $payload): bool
     return false;
   }
   $path = monster_editor_file_path();
-  $fp = @fopen($path, 'c+');
+  $tmpSuffix = '';
+  try {
+    $tmpSuffix = bin2hex(random_bytes(8));
+  } catch (Throwable) {
+    $tmpSuffix = str_replace('.', '', uniqid('', true));
+  }
+  $tempPath = $path . '.tmp.' . $tmpSuffix;
+  $fp = @fopen($tempPath, 'wb');
   if ($fp === false) {
     return false;
   }
-  $ok = false;
-  if (@flock($fp, LOCK_EX)) {
-    ftruncate($fp, 0);
-    rewind($fp);
-    $written = fwrite($fp, $json . "\n");
+  $written = fwrite($fp, $json . "\n");
+  if (is_int($written) && $written > 0) {
     fflush($fp);
-    @flock($fp, LOCK_UN);
-    $ok = is_int($written) && $written > 0;
+    if (function_exists('fsync')) {
+      @fsync($fp);
+    }
   }
   fclose($fp);
-  if ($ok) {
-    @chmod($path, 0640);
+  if (!is_int($written) || $written <= 0) {
+    @unlink($tempPath);
+    return false;
   }
-  return $ok;
+  if (is_file($path)) {
+    rotate_monster_editor_backups($path, 2);
+  }
+  if (!@rename($tempPath, $path)) {
+    @unlink($tempPath);
+    return false;
+  }
+  @chmod($path, 0640);
+  return true;
 }
 
 function save_storage_root(): string
@@ -1681,6 +1737,7 @@ if ($apiMode === 'monsters') {
     $payload = load_monster_editor_config();
     json_response([
       'ok' => true,
+      'version' => (int) ($payload['version'] ?? 1),
       'monsters' => (object) ($payload['monsters'] ?? []),
       'spawn_rules' => $payload['spawn_rules'] ?? [],
       'updated_at' => (string) ($payload['updated_at'] ?? ''),
@@ -1712,6 +1769,7 @@ if ($apiMode === 'monsters') {
   }
 
   $payload = [
+    'version' => max(1, min(1000, (int) floor((float) ($body['version'] ?? 1)))),
     'monsters' => is_array($body['monsters'] ?? null) ? $body['monsters'] : [],
     'spawn_rules' => is_array($body['spawn_rules'] ?? null) ? $body['spawn_rules'] : [],
     'updated_at' => date('c'),
@@ -1723,6 +1781,7 @@ if ($apiMode === 'monsters') {
   json_response([
     'ok' => true,
     'message' => 'Monster editor data saved.',
+    'version' => (int) ($saved['version'] ?? 1),
     'monsters' => (object) ($saved['monsters'] ?? []),
     'spawn_rules' => $saved['spawn_rules'] ?? [],
     'updated_at' => (string) ($saved['updated_at'] ?? ''),
@@ -1941,6 +2000,7 @@ if (!is_string($spriteOverridesJson)) {
 $monsterEditorPayload = load_monster_editor_config();
 $monsterEditorJson = json_encode(
   [
+    'version' => (int) ($monsterEditorPayload['version'] ?? 1),
     'monsters' => (object) ($monsterEditorPayload['monsters'] ?? []),
     'spawn_rules' => $monsterEditorPayload['spawn_rules'] ?? [],
     'updated_at' => (string) ($monsterEditorPayload['updated_at'] ?? ''),
@@ -1948,7 +2008,7 @@ $monsterEditorJson = json_encode(
   JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
 );
 if (!is_string($monsterEditorJson)) {
-  $monsterEditorJson = '{"monsters":{},"spawn_rules":[],"updated_at":""}';
+  $monsterEditorJson = '{"version":1,"monsters":{},"spawn_rules":[],"updated_at":""}';
 }
 ?>
 <!doctype html>
