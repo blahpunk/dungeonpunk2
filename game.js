@@ -1,3 +1,10 @@
+import {
+  AUTOSAVE_DEBOUNCE_MS,
+  LOCAL_SLOT_BACKUP_MIGRATED_KEY,
+  LOCAL_SLOT_MAX,
+  createLocalSlotStore,
+} from "./client/save/saveManager.js";
+
 // Infinite Dungeon Roguelike (Explore-Generated, Chunked, Multi-depth)
 // v4.5
 // - UI/Controls:
@@ -1292,6 +1299,12 @@ const isAuthenticatedUser = document.body?.dataset?.isAuthenticated === "1";
 const saveApiCsrfToken = document.body?.dataset?.saveCsrf ?? "";
 const saveSlotMax = Math.max(1, Number.parseInt(document.body?.dataset?.saveMaxSlots ?? "10", 10) || 10);
 const saveNameMaxLen = Math.max(1, Number.parseInt(document.body?.dataset?.saveNameMaxLen ?? "48", 10) || 48);
+const localSlotStore = createLocalSlotStore({
+  storage: localStorage,
+  normalizeId: (value) => normalizeMonsterEditorId(value ?? ""),
+  maxNameLen: saveNameMaxLen,
+  defaultName: "Local Adventurer",
+});
 const appBuildVersion = String(document.body?.dataset?.appVersion ?? "").trim() || `${Date.now()}`;
 const metaEl = document.getElementById("meta");
 const headerInfoEl = document.getElementById("headerInfo");
@@ -1595,6 +1608,14 @@ const CLIENT_SPRITE_UPLOAD_SOFT_TARGET_BYTES = 450 * 1024;
 const CLIENT_SPRITE_UPLOAD_RETRY_TARGET_BYTES = 220 * 1024;
 let saveNameWasEdited = false;
 let lastAutoSaveName = "";
+const saveRuntime = {
+  dirty: false,
+  dirtyReason: "",
+  lastDirtyAt: 0,
+  lastSaveAt: 0,
+  autoTimer: 0,
+  saving: false,
+};
 const spriteOverrideState = { overrides: {}, scales: {}, entries: [] };
 const monsterEditorState = { version: 1, monsters: {}, spawnRules: [], updatedAt: "" };
 let infoTierSignature = "";
@@ -4974,6 +4995,209 @@ function setSaveGameOverlayOpen(open) {
   }
 }
 
+function localSlotPayloadKey(slotId) {
+  return localSlotStore.payloadKey(slotId);
+}
+
+function readLocalSlotIndex() {
+  return localSlotStore.readIndex();
+}
+
+function writeLocalSlotIndex(index) {
+  return localSlotStore.writeIndex(index);
+}
+
+function readLocalSlotPayload(slotId) {
+  return localSlotStore.readPayload(slotId);
+}
+
+function upsertLocalSlotSummary(slotId, name = "", updatedAt = "") {
+  return localSlotStore.upsertSummary(slotId, name, updatedAt);
+}
+
+function setActiveCharacterSlotId(slotId) {
+  const id = normalizeMonsterEditorId(slotId ?? "") ?? "";
+  if (isAuthenticatedUser) {
+    characterUi.activeSaveId = id;
+    return;
+  }
+  const idx = readLocalSlotIndex();
+  idx.activeId = id;
+  writeLocalSlotIndex(idx);
+  characterUi.activeSaveId = id;
+}
+
+function getActiveCharacterSlotId() {
+  if (isAuthenticatedUser) return String(characterUi.activeSaveId ?? "");
+  const idx = readLocalSlotIndex();
+  if (idx.activeId) return idx.activeId;
+  return String(characterUi.activeSaveId ?? "");
+}
+
+function ensureLocalSlotMigration() {
+  if (isAuthenticatedUser) return;
+  let idx = readLocalSlotIndex();
+  if (idx.slots.length > 0) {
+    if (!idx.activeId) {
+      idx.activeId = idx.slots[0]?.id ?? "";
+      writeLocalSlotIndex(idx);
+    }
+    return;
+  }
+  let legacyPayload = "";
+  try {
+    legacyPayload = String(localStorage.getItem(SAVE_KEY) ?? "");
+  } catch {}
+  if (!legacyPayload) return;
+  const migrated = importSave(legacyPayload);
+  if (!migrated) return;
+  const id = `legacy_${Date.now().toString(36)}`;
+  const profile = ensureCharacterState(migrated);
+  const name = String(profile?.name ?? "Legacy Adventurer").slice(0, saveNameMaxLen) || "Legacy Adventurer";
+  try {
+    localStorage.setItem(localSlotPayloadKey(id), legacyPayload);
+    localStorage.setItem(LOCAL_SLOT_BACKUP_MIGRATED_KEY, legacyPayload);
+  } catch {}
+  idx = writeLocalSlotIndex({
+    activeId: id,
+    slots: [{ id, name, updatedAt: new Date().toISOString() }],
+  });
+  characterUi.activeSaveId = idx.activeId;
+}
+
+async function fetchCharacterSlotsFromLocal() {
+  ensureLocalSlotMigration();
+  const idx = readLocalSlotIndex();
+  const out = [];
+  for (const slotMeta of idx.slots) {
+    const payload = readLocalSlotPayload(slotMeta.id);
+    const loaded = payload ? importSave(payload) : null;
+    const profile = normalizeCharacterProfile(loaded?.character ?? { name: slotMeta.name });
+    const level = Math.max(1, Math.floor(loaded?.player?.level ?? 1));
+    const depth = Math.trunc(loaded?.player?.z ?? 0);
+    const deepestDepth = Math.max(0, Math.floor(profile.deepestDepth ?? 0), Math.max(0, depth));
+    profile.deepestDepth = deepestDepth;
+    out.push({
+      id: slotMeta.id,
+      name: slotMeta.name,
+      updatedAt: slotMeta.updatedAt || "",
+      level,
+      depth,
+      profile,
+      deepestDepth,
+    });
+  }
+  out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  if (!isAuthenticatedUser) characterUi.activeSaveId = idx.activeId || out[0]?.id || "";
+  return out;
+}
+
+function queueAutosave(state, reason = "") {
+  if (!state) return;
+  if (saveRuntime.autoTimer) {
+    clearTimeout(saveRuntime.autoTimer);
+    saveRuntime.autoTimer = 0;
+  }
+  saveRuntime.autoTimer = setTimeout(() => {
+    saveRuntime.autoTimer = 0;
+    void autosaveIfDirty(reason || "debounced");
+  }, AUTOSAVE_DEBOUNCE_MS);
+}
+
+function markSaveDirty(state, reason = "") {
+  if (!state) return;
+  saveRuntime.dirty = true;
+  saveRuntime.dirtyReason = String(reason || "state-change");
+  saveRuntime.lastDirtyAt = Date.now();
+  queueAutosave(state, reason);
+}
+
+function clearSaveDirty() {
+  saveRuntime.dirty = false;
+  saveRuntime.dirtyReason = "";
+  saveRuntime.lastSaveAt = Date.now();
+}
+
+async function saveCurrentGameToLocalSlot(slotId = "", nameOverride = "") {
+  if (isAuthenticatedUser || !game) return false;
+  const id = normalizeMonsterEditorId(slotId || getActiveCharacterSlotId() || "") ?? `slot_${Date.now().toString(36)}`;
+  const profile = ensureCharacterState(game);
+  const className = characterClassDef(profile.classId).name;
+  const defaultName = `${profile.name} • ${className}`.slice(0, saveNameMaxLen);
+  const name = String(nameOverride || defaultName).trim().slice(0, saveNameMaxLen) || "Local Adventurer";
+  const payload = exportSave(game);
+  try {
+    localStorage.setItem(localSlotPayloadKey(id), payload);
+  } catch {
+    return false;
+  }
+  upsertLocalSlotSummary(id, name, new Date().toISOString());
+  setActiveCharacterSlotId(id);
+  return true;
+}
+
+async function autosaveIfDirty(reason = "") {
+  if (!game || !saveRuntime.dirty || saveRuntime.saving) return true;
+  saveRuntime.saving = true;
+  try {
+    if (isAuthenticatedUser) {
+      const activeId = String(getActiveCharacterSlotId() ?? "");
+      if (!activeId) return false;
+      const ok = await saveCurrentGameToServer(activeId);
+      if (ok) clearSaveDirty();
+      return !!ok;
+    }
+    const ok = await saveCurrentGameToLocalSlot(getActiveCharacterSlotId());
+    if (ok) clearSaveDirty();
+    return !!ok;
+  } finally {
+    saveRuntime.saving = false;
+  }
+}
+
+async function switchToCharacterSlot(slotId, options = null) {
+  const id = String(slotId ?? "").trim();
+  if (!id) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const forceEntrance = opts.forceEntrance !== false;
+  const currentId = String(getActiveCharacterSlotId() ?? "");
+  if (currentId && currentId === id) return true;
+
+  const saved = await autosaveIfDirty("switch-character");
+  if (!saved && game) {
+    const proceed = confirm("Could not auto-save current character. Switch anyway?");
+    if (!proceed) return false;
+  }
+
+  if (isAuthenticatedUser) {
+    const loaded = await loadSaveFromServer(id, { showStatus: false, closeOverlay: false, forceEntrance });
+    if (!loaded) return false;
+    setActiveCharacterSlotId(id);
+    clearSaveDirty();
+    return true;
+  }
+
+  const payload = readLocalSlotPayload(id);
+  if (!payload) return false;
+  const loaded = importSave(payload);
+  if (!loaded) return false;
+  game = loaded;
+  if (forceEntrance) {
+    respawnAtStart(game);
+    pushLog(game, "You re-enter at the dungeon entrance.");
+  }
+  enforceAdminControlPolicy(game);
+  updateDebugMenuUi(game);
+  setDebugMenuOpen(false);
+  updateContextActionButton(game);
+  updateDeathOverlay(game);
+  setActiveCharacterSlotId(id);
+  refreshSaveNameFromLive(true);
+  saveNow(game);
+  clearSaveDirty();
+  return true;
+}
+
 async function saveApiRequest(method = "GET", body = null, query = "") {
   const q = query ? `&${query}` : "";
   const url = withCacheBust(`./index.php?api=savegames${q}`);
@@ -5160,8 +5384,9 @@ async function loadSaveFromServer(saveId, options = null) {
     setDebugMenuOpen(false);
     updateContextActionButton(game);
     updateDeathOverlay(game);
-    characterUi.activeSaveId = String(saveId);
+    setActiveCharacterSlotId(String(saveId));
     saveNow(game);
+    clearSaveDirty();
     refreshSaveNameFromLive(true);
     if (showStatus) setSaveGameStatus(`Loaded "${data?.save?.name ?? "save"}".`, false);
     if (closeOverlay) closeSaveGameOverlay();
@@ -5200,7 +5425,8 @@ async function saveCurrentGameToServer(overwriteId = "") {
       depth,
     });
     saveMenuUi.saves = Array.isArray(data.saves) ? data.saves : [];
-    if (data?.save?.id) characterUi.activeSaveId = String(data.save.id);
+    if (data?.save?.id) setActiveCharacterSlotId(String(data.save.id));
+    clearSaveDirty();
     refreshSaveNameFromLive(true);
     setSaveGameStatus(data?.message ?? "Game saved.", false);
     renderSaveGameOverlay();
@@ -5406,7 +5632,8 @@ function renderCharacterSelectBody() {
   }
 
   characterOverlayTitleEl.textContent = "Choose Character";
-  characterOverlaySubtitleEl.textContent = `Load an existing run or start a new one (${slots.length}/${saveSlotMax} slots used).`;
+  const slotCap = isAuthenticatedUser ? saveSlotMax : LOCAL_SLOT_MAX;
+  characterOverlaySubtitleEl.textContent = `Load an existing run or start a new one (${slots.length}/${slotCap} slots used).`;
   characterOverlayBodyEl.innerHTML = characterStatusMarkup();
   for (const slot of slots) {
     const selected = slot.id === characterUi.selectedSaveId;
@@ -5443,7 +5670,7 @@ function renderCharacterSelectBody() {
   characterOverlayPrimaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId;
   characterOverlayPrimaryEl.style.display = "";
   characterOverlaySecondaryEl.textContent = "Start New Run";
-  characterOverlaySecondaryEl.disabled = characterUi.loading || slots.length >= saveSlotMax;
+  characterOverlaySecondaryEl.disabled = characterUi.loading || slots.length >= slotCap;
   characterOverlaySecondaryEl.style.display = "";
   characterOverlayTertiaryEl.textContent = "Delete Selected";
   characterOverlayTertiaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId;
@@ -5468,7 +5695,7 @@ function renderCharacterCreateBody() {
   characterOverlayTitleEl.textContent = "Create Character";
   characterOverlaySubtitleEl.textContent = isAuthenticatedUser
     ? "Build a persistent runner. Character data and dungeon state are bound to this slot."
-    : "Guest mode: your character is temporary and is cleared when you leave or refresh.";
+    : "Guest mode: characters persist on this device as local slots.";
 
   if (step === "welcome") {
     characterOverlayBodyEl.innerHTML =
@@ -5478,7 +5705,7 @@ function renderCharacterCreateBody() {
       `<p>Choose species, class, and stats. Choices are permanent per character slot.</p>` +
       `<p>${isAuthenticatedUser
         ? `You can keep up to ${saveSlotMax} characters.`
-        : "Open beta: log in first (optional) to keep progress. There is no signup flow yet, just use login."}</p>` +
+        : `You can keep up to ${LOCAL_SLOT_MAX} local characters on this browser. Login is optional for cloud slots.`}</p>` +
       `</div>`;
   } else if (step === "species") {
     characterOverlayBodyEl.innerHTML =
@@ -5701,10 +5928,10 @@ async function handleCharacterOverlayPrimary() {
     setCharacterOverlayStatus("");
     characterUi.loading = true;
     renderCharacterOverlay();
-    const loaded = await loadSaveFromServer(characterUi.selectedSaveId, { showStatus: false, closeOverlay: false, forceEntrance: true });
+    const loaded = await switchToCharacterSlot(characterUi.selectedSaveId, { forceEntrance: true });
     characterUi.loading = false;
     if (loaded) {
-      characterUi.activeSaveId = characterUi.selectedSaveId;
+      setActiveCharacterSlotId(characterUi.selectedSaveId);
       setCharacterOverlayOpen(false);
     } else {
       setCharacterOverlayStatus("Could not load that character slot.", true);
@@ -5758,6 +5985,7 @@ async function handleCharacterOverlayPrimary() {
   updateDeathOverlay(game);
   refreshSaveNameFromLive(true);
   saveNow(game);
+  clearSaveDirty();
 
   if (isAuthenticatedUser) {
     characterUi.loading = true;
@@ -5769,7 +5997,7 @@ async function handleCharacterOverlayPrimary() {
       const savedId = String(saved?.save?.id ?? "");
       characterUi.slots = await fetchCharacterSlotsFromServer();
       characterUi.selectedSaveId = savedId || characterUi.slots[0]?.id || "";
-      characterUi.activeSaveId = characterUi.selectedSaveId;
+      setActiveCharacterSlotId(characterUi.selectedSaveId);
       setCharacterOverlayStatus("");
       setCharacterOverlayOpen(false);
     } catch (err) {
@@ -5781,13 +6009,23 @@ async function handleCharacterOverlayPrimary() {
     return;
   }
 
+  const localSlotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
+  const localSaved = await saveCurrentGameToLocalSlot("", localSlotName);
+  if (!localSaved) {
+    setCharacterOverlayStatus("Could not create local character slot.", true);
+    renderCharacterOverlay();
+    return;
+  }
+  characterUi.slots = await fetchCharacterSlotsFromLocal();
+  characterUi.selectedSaveId = getActiveCharacterSlotId();
   setCharacterOverlayStatus("");
   setCharacterOverlayOpen(false);
 }
 async function handleCharacterOverlaySecondary() {
   if (characterUi.loading) return;
   if (characterUi.mode === "select") {
-    if (!isAuthenticatedUser || (characterUi.slots?.length ?? 0) >= saveSlotMax) return;
+    const slotCap = isAuthenticatedUser ? saveSlotMax : LOCAL_SLOT_MAX;
+    if ((characterUi.slots?.length ?? 0) >= slotCap) return;
     characterUi.mode = "create";
     setCharacterOverlayStatus("");
     resetCharacterCreationDraft(null, { step: "welcome" });
@@ -5812,7 +6050,7 @@ async function handleCharacterOverlaySecondary() {
   renderCharacterOverlay();
 }
 async function handleCharacterOverlayTertiary() {
-  if (characterUi.loading || !isAuthenticatedUser || characterUi.mode !== "select") return;
+  if (characterUi.loading || characterUi.mode !== "select") return;
   const selectedId = characterUi.selectedSaveId;
   if (!selectedId) return;
   const slot = characterUi.slots.find((s) => s.id === selectedId);
@@ -5822,10 +6060,19 @@ async function handleCharacterOverlayTertiary() {
   characterUi.loading = true;
   renderCharacterOverlay();
   try {
-    await saveApiRequest("POST", { action: "delete", id: selectedId });
-    characterUi.slots = await fetchCharacterSlotsFromServer();
+    if (isAuthenticatedUser) {
+      await saveApiRequest("POST", { action: "delete", id: selectedId });
+      characterUi.slots = await fetchCharacterSlotsFromServer();
+    } else {
+      const idx = readLocalSlotIndex();
+      idx.slots = idx.slots.filter((entry) => entry.id !== selectedId);
+      if (idx.activeId === selectedId) idx.activeId = idx.slots[0]?.id ?? "";
+      writeLocalSlotIndex(idx);
+      localSlotStore.removePayload(selectedId);
+      characterUi.slots = await fetchCharacterSlotsFromLocal();
+    }
     characterUi.selectedSaveId = characterUi.slots[0]?.id ?? "";
-    if (characterUi.activeSaveId === selectedId) characterUi.activeSaveId = characterUi.selectedSaveId;
+    if (characterUi.activeSaveId === selectedId) setActiveCharacterSlotId(characterUi.selectedSaveId);
     if (!characterUi.slots.length) {
       characterUi.mode = "create";
       resetCharacterCreationDraft(null, { step: "welcome" });
@@ -5855,7 +6102,8 @@ async function startCharacterFlow() {
       characterOverlaySecondaryEl.style.display = "none";
       characterOverlayTertiaryEl.style.display = "none";
       characterUi.slots = await fetchCharacterSlotsFromServer();
-      characterUi.selectedSaveId = characterUi.slots[0]?.id ?? "";
+      const activeId = getActiveCharacterSlotId();
+      characterUi.selectedSaveId = activeId || characterUi.slots[0]?.id || "";
       characterUi.mode = characterUi.slots.length ? "select" : "create";
       if (characterUi.mode === "create") resetCharacterCreationDraft(null, { step: "welcome" });
     } catch {
@@ -5870,10 +6118,29 @@ async function startCharacterFlow() {
     return;
   }
 
-  characterUi.mode = "create";
-  resetCharacterCreationDraft(null, { step: "welcome" });
-  setCharacterOverlayOpen(true);
-  renderCharacterOverlay();
+  try {
+    characterUi.loading = true;
+    setCharacterOverlayOpen(true);
+    characterOverlayTitleEl.textContent = "Loading Characters";
+    characterOverlaySubtitleEl.textContent = "Loading your local character slots...";
+    characterOverlayBodyEl.textContent = "Please wait...";
+    characterOverlayPrimaryEl.style.display = "none";
+    characterOverlaySecondaryEl.style.display = "none";
+    characterOverlayTertiaryEl.style.display = "none";
+    characterUi.slots = await fetchCharacterSlotsFromLocal();
+    const activeId = getActiveCharacterSlotId();
+    characterUi.selectedSaveId = activeId || characterUi.slots[0]?.id || "";
+    characterUi.mode = characterUi.slots.length ? "select" : "create";
+    if (characterUi.mode === "create") resetCharacterCreationDraft(null, { step: "welcome" });
+  } catch {
+    characterUi.mode = "create";
+    setCharacterOverlayStatus("Could not load local character slots. Create a new one to continue.", true);
+    resetCharacterCreationDraft(null, { step: "welcome" });
+  } finally {
+    characterUi.loading = false;
+    setCharacterOverlayOpen(true);
+    renderCharacterOverlay();
+  }
 }
 
 function hasPendingSaveAfterLoginHandoff() {
@@ -5901,24 +6168,34 @@ function clearPendingSaveAfterLoginHandoff() {
   try { localStorage.removeItem(SAVE_LOGIN_HANDOFF_KEY); } catch {}
 }
 async function openCharacterSelectionOverlay() {
-  if (!isAuthenticatedUser || !characterOverlayEl) return;
+  if (!characterOverlayEl) return;
   setCharacterOverlayStatus("");
   characterUi.loading = true;
   setCharacterOverlayOpen(true);
   characterOverlayTitleEl.textContent = "Loading Characters";
-  characterOverlaySubtitleEl.textContent = "Fetching your saved character slots...";
+  characterOverlaySubtitleEl.textContent = isAuthenticatedUser
+    ? "Fetching your saved character slots..."
+    : "Loading your local character slots...";
   characterOverlayBodyEl.textContent = "Please wait...";
   characterOverlayPrimaryEl.style.display = "none";
   characterOverlaySecondaryEl.style.display = "none";
   characterOverlayTertiaryEl.style.display = "none";
   try {
-    characterUi.slots = await fetchCharacterSlotsFromServer();
-    characterUi.selectedSaveId = characterUi.activeSaveId || characterUi.slots[0]?.id || "";
+    characterUi.slots = isAuthenticatedUser
+      ? await fetchCharacterSlotsFromServer()
+      : await fetchCharacterSlotsFromLocal();
+    const activeId = getActiveCharacterSlotId();
+    characterUi.selectedSaveId = activeId || characterUi.slots[0]?.id || "";
     characterUi.mode = characterUi.slots.length ? "select" : "create";
     if (characterUi.mode === "create") resetCharacterCreationDraft(null, { step: "welcome" });
   } catch {
     characterUi.mode = "create";
-    setCharacterOverlayStatus("Could not load your character slots. Create a new one to continue.", true);
+    setCharacterOverlayStatus(
+      isAuthenticatedUser
+        ? "Could not load your character slots. Create a new one to continue."
+        : "Could not load local character slots. Create a new one to continue.",
+      true
+    );
     resetCharacterCreationDraft(null, { step: "welcome" });
   } finally {
     characterUi.loading = false;
@@ -7696,6 +7973,23 @@ function drawMinimap(state) {
     }
   }
 
+  // Draw locked-door markers only (exclude standard closed/open doors).
+  for (let my = 0; my < size; my++) {
+    for (let mx = 0; mx < size; mx++) {
+      const wx = p.x + (mx - MINI_RADIUS);
+      const wy = p.y + (my - MINI_RADIUS);
+      if (!state.seen.has(keyXYZ(wx, wy, p.z))) continue;
+      const t = state.world.getTile(wx, wy, p.z);
+      if (!tileIsLocked(t)) continue;
+      const markerColor = tileGlyph(t)?.c ?? "#ffd966";
+      const dotSize = Math.max(1, Math.floor(MINI_SCALE * 0.66));
+      const ox = Math.floor((MINI_SCALE - dotSize) / 2);
+      const oy = Math.floor((MINI_SCALE - dotSize) / 2);
+      mctx.fillStyle = markerColor;
+      mctx.fillRect(mx * MINI_SCALE + ox, my * MINI_SCALE + oy, dotSize, dotSize);
+    }
+  }
+
   const surfaceTarget = p.z === 0
     ? (state.surfaceLink ?? resolveSurfaceLink(state))
     : (p.z === SURFACE_LEVEL ? { x: 0, y: 0, z: SURFACE_LEVEL } : null);
@@ -8597,6 +8891,7 @@ function useInventoryIndex(state, idx) {
     }
 
     renderInventory(state);
+    markSaveDirty(state, "use-potion");
     return;
   }
 
@@ -8619,6 +8914,7 @@ function useInventoryIndex(state, idx) {
     recalcDerivedStats(state);
     renderInventory(state);
     renderEquipment(state);
+    markSaveDirty(state, "equip-weapon");
     return;
   }
 
@@ -8642,6 +8938,7 @@ function useInventoryIndex(state, idx) {
     recalcDerivedStats(state);
     renderInventory(state);
     renderEquipment(state);
+    markSaveDirty(state, "equip-armor");
     return;
   }
 
@@ -13060,11 +13357,45 @@ function importSave(saveStr) {
 }
 
 function saveNow(state) {
-  try { localStorage.setItem(SAVE_KEY, exportSave(state)); } catch {}
+  const payload = exportSave(state);
+  try { localStorage.setItem(SAVE_KEY, payload); } catch {}
+  if (!isAuthenticatedUser) {
+    ensureLocalSlotMigration();
+    let activeId = getActiveCharacterSlotId();
+    if (!activeId) {
+      activeId = `slot_${Date.now().toString(36)}`;
+      setActiveCharacterSlotId(activeId);
+    }
+    const profile = ensureCharacterState(state);
+    const className = characterClassDef(profile.classId).name;
+    const slotName = `${profile.name} • ${className}`.slice(0, saveNameMaxLen) || profile.name || "Local Adventurer";
+    try {
+      localStorage.setItem(localSlotPayloadKey(activeId), payload);
+      upsertLocalSlotSummary(activeId, slotName, new Date().toISOString());
+    } catch {}
+  }
+  clearSaveDirty();
 }
 
 function loadSaveOrNew() {
   bootLoadedFromLocalSave = false;
+  if (!isAuthenticatedUser) {
+    ensureLocalSlotMigration();
+    const activeId = getActiveCharacterSlotId();
+    if (activeId) {
+      const slotPayload = readLocalSlotPayload(activeId);
+      if (slotPayload) {
+        const loaded = importSave(slotPayload);
+        if (loaded) {
+          bootLoadedFromLocalSave = true;
+          setActiveCharacterSlotId(activeId);
+          const changed = enforceAdminControlPolicy(loaded);
+          if (changed) saveNow(loaded);
+          return loaded;
+        }
+      }
+    }
+  }
   try {
     const s = localStorage.getItem(SAVE_KEY);
     if (s) {
@@ -13541,6 +13872,25 @@ try {
   });
   syncBodyModalLock();
   syncMobileUi(true);
+  const flushAutosaveLifecycle = () => {
+    if (!game) return;
+    if (saveRuntime.autoTimer) {
+      clearTimeout(saveRuntime.autoTimer);
+      saveRuntime.autoTimer = 0;
+    }
+    if (!saveRuntime.dirty) return;
+    if (!isAuthenticatedUser) {
+      saveNow(game);
+      return;
+    }
+    void autosaveIfDirty("lifecycle");
+  };
+  window.addEventListener("pagehide", flushAutosaveLifecycle);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "hidden") return;
+    flushAutosaveLifecycle();
+  });
+  window.addEventListener("beforeunload", flushAutosaveLifecycle);
   document.addEventListener("keydown", (e) => onKey(game, e));
   window.addEventListener("resize", () => syncMobileUi(true));
   // Initialize touch controls (mobile): wire on-screen buttons to existing actions
