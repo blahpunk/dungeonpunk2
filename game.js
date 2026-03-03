@@ -12421,7 +12421,8 @@ function draw(state) {
         else if (tileSpriteKind?.startsWith("door_")) tileSpriteSize = DOOR_SPRITE_SIZE;
         deferredWorldObjects.push({
           kind: "tile-sprite",
-          sortY: wy,
+          // Keep the large surface entrance sprite behind actors regardless of relative cell position.
+          sortY: tileSpriteKind === "surface_entrance" ? -1000000 : wy,
           sortX: wx,
           order: -1,
           sx,
