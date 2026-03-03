@@ -9584,11 +9584,14 @@ const SPRITE_SOURCES = {};
 const spriteImages = {};
 const spriteProcessed = {};
 const spriteReady = {};
+const spriteRequested = {};
 function buildSpriteTransparency(id, img) {
   // Use source sprites directly to avoid aggressive matte-stripping artifacts.
   return img;
 }
 function loadProcessedSprite(id, src) {
+  if (!id || !src) return;
+  spriteRequested[id] = true;
   const img = new Image();
   spriteImages[id] = img;
   spriteProcessed[id] = null;
@@ -9604,6 +9607,7 @@ function clearSpriteCache(id) {
   delete spriteImages[id];
   delete spriteProcessed[id];
   delete spriteReady[id];
+  delete spriteRequested[id];
 }
 function normalizeSpriteOverrideMap(input) {
   const out = {};
@@ -9650,13 +9654,15 @@ function syncSpriteSources(overrides = null) {
     clearSpriteCache(id);
   }
   for (const [id, src] of Object.entries(merged)) {
-    if (SPRITE_SOURCES[id] === src && spriteImages[id]) continue;
+    if (SPRITE_SOURCES[id] === src) continue;
     SPRITE_SOURCES[id] = src;
-    loadProcessedSprite(id, src);
+    clearSpriteCache(id);
   }
 }
 syncSpriteSources(spriteOverrideState.overrides);
 function getSpriteIfReady(id) {
+  if (!id) return null;
+  if (!spriteRequested[id] && SPRITE_SOURCES[id]) loadProcessedSprite(id, SPRITE_SOURCES[id]);
   if (!id || !spriteReady[id]) return null;
   return spriteProcessed[id] ?? spriteImages[id] ?? null;
 }
@@ -12786,8 +12792,7 @@ function takeTurn(state, didSpendTurn) {
   renderInventory(state);
   renderEquipment(state);
   renderEffects(state);
-
-  saveNow(state);
+  markSaveDirty(state, "turn");
 }
 
 // ---------- Input ----------
@@ -12897,14 +12902,14 @@ function onKey(state, e) {
   }
 
   else if (k === "i") { e.preventDefault(); renderInventory(state); }
-  else if (k === "m") { e.preventDefault(); minimapEnabled = !minimapEnabled; saveNow(state); }
+  else if (k === "m") { e.preventDefault(); minimapEnabled = !minimapEnabled; markSaveDirty(state, "toggle-minimap"); }
   else if (e.key === ">") { e.preventDefault(); takeTurn(state, tryUseStairs(state, "down")); }
   else if (e.key === "<") { e.preventDefault(); takeTurn(state, tryUseStairs(state, "up")); }
   else if (k === "f") {
     if (!canUseAdminControls()) return;
     e.preventDefault();
     fogEnabled = !fogEnabled;
-    saveNow(state);
+    markSaveDirty(state, "toggle-fog");
   }
 
   else if (k === "r") {
