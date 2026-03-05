@@ -4185,6 +4185,15 @@ function renderShopOverlay(state) {
 
     if (liveIsBuyMode) {
       const freeShopping = !!stateDebug(state).freeShopping;
+      if (liveSelected.type === "potion") {
+        const potionCount = invCount(state, "potion");
+        const potionCap = potionCapacityForState(state);
+        if (potionCount >= potionCap) {
+          pushLog(state, "Potion belt is full (" + potionCount + "/" + potionCap + ").");
+          renderShopOverlay(state);
+          return;
+        }
+      }
       if (!freeShopping && state.player.gold < liveSelected.price) {
         pushLog(state, "Not enough gold.");
       } else {
@@ -8977,6 +8986,7 @@ function pickup(state) {
       pushLog(state, `Picked up potion${after - before > 1 ? "s" : ""}. (${after}/${potionCapacityForState(state)})`);
     } else {
       pushLog(state, `Potion belt is full (${before}/${potionCapacityForState(state)}).`);
+      return false;
     }
   } else if (it.type.startsWith("key_")) {
     invAdd(state, it.type, it.amount ?? 1);
