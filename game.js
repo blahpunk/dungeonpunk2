@@ -1317,7 +1317,6 @@ const btnChooseCharacterEl = document.getElementById("btnChooseCharacter");
 const btnInfoEl = document.getElementById("btnInfo");
 const btnSpriteEditorEl = document.getElementById("btnSpriteEditor");
 const btnMonsterEditorEl = document.getElementById("btnMonsterEditor");
-const btnSpawnerEl = document.getElementById("btnSpawner");
 const authBtnEl = document.getElementById("authBtn");
 const vitalsDisplayEl = document.getElementById("vitalsDisplay");
 const logPanelEl = document.getElementById("logPanel");
@@ -1396,8 +1395,6 @@ const spriteEditorStatusEl = document.getElementById("spriteEditorStatus");
 const spriteEditorListEl = document.getElementById("spriteEditorList");
 const monsterEditorOverlayEl = document.getElementById("monsterEditorOverlay");
 const monsterEditorCloseBtnEl = document.getElementById("monsterEditorCloseBtn");
-const spawnerOverlayEl = document.getElementById("spawnerOverlay");
-const spawnerCloseBtnEl = document.getElementById("spawnerCloseBtn");
 const monsterEditorSearchInputEl = document.getElementById("monsterEditorSearchInput");
 const monsterEditorPreviewDepthInputEl = document.getElementById("monsterEditorPreviewDepthInput");
 const monsterEditorNewBtnEl = document.getElementById("monsterEditorNewBtn");
@@ -1475,10 +1472,6 @@ const debugDepthInputEl = document.getElementById("debugDepthInput");
 const debugDepthGoEl = document.getElementById("debugDepthGo");
 const debugLevelInputEl = document.getElementById("debugLevelInput");
 const debugLevelGoEl = document.getElementById("debugLevelGo");
-const debugSpawnerFilterEl = document.getElementById("debugSpawnerFilter");
-const debugSpawnerTypeFilterEl = document.getElementById("debugSpawnerTypeFilter");
-const debugSpawnerListEl = document.getElementById("debugSpawnerList");
-const debugSpawnerSpawnEl = document.getElementById("debugSpawnerSpawn");
 const mainCanvasWrapEl = document.getElementById("mainCanvasWrap");
 const surfaceCompassEl = document.getElementById("surfaceCompass");
 const surfaceCompassArrowEl = document.getElementById("surfaceCompassArrow");
@@ -1503,7 +1496,6 @@ function syncBodyModalLock() {
     !!infoOverlayEl?.classList.contains("show") ||
     !!spriteEditorOverlayEl?.classList.contains("show") ||
     !!monsterEditorOverlayEl?.classList.contains("show") ||
-    !!spawnerOverlayEl?.classList.contains("show") ||
     !!newDungeonConfirmOverlayEl?.classList.contains("show") ||
     !!levelUpOverlayEl?.classList.contains("show");
   document.body?.classList.toggle("modal-open", hasModal);
@@ -1511,7 +1503,6 @@ function syncBodyModalLock() {
 
 const mini = document.getElementById("mini");
 const mctx = mini.getContext("2d");
-const debugSpawnerUi = { selectedKey: "" };
 
 const MAX_RENDER_CANVAS_DIM = 4096;
 let viewRadiusX = BASE_VIEW_RADIUS;
@@ -1757,130 +1748,21 @@ function updateDebugMenuUi(state) {
   if (toggleLockpickEl) toggleLockpickEl.checked = d.lockpick;
   if (debugDepthInputEl) debugDepthInputEl.value = `${state?.player?.z ?? 0}`;
   if (debugLevelInputEl) debugLevelInputEl.value = `${Math.max(1, Math.floor(state?.player?.level ?? 1))}`;
-  renderDebugSpawnerOptions();
 }
 
-function debugSpawnerCatalogEntries() {
-  const entries = [];
-  for (const [id, item] of Object.entries(ITEM_TYPES)) {
-    const name = String(item?.name ?? id);
-    const glyphInfo = itemGlyph(id) ?? { g: "?", c: "#d5dfef" };
-    const spriteId = itemSpriteId({ type: id });
-    entries.push({
-      key: `item:${id}`,
-      type: "item",
-      id,
-      name,
-      search: `${id} ${name} item`.toLowerCase(),
-      label: `Item - ${name} (${id})`,
-      spriteId,
-      glyph: glyphInfo.g ?? "?",
-      glyphColor: glyphInfo.c ?? "#d5dfef",
-    });
-  }
-  for (const [id, monster] of Object.entries(MONSTER_TYPES)) {
-    const name = String(monster?.name ?? id);
-    const glyphInfo = monsterGlyph(id) ?? { g: "?", c: "#d5dfef" };
-    const spriteId = monsterSpriteId(id);
-    entries.push({
-      key: `monster:${id}`,
-      type: "monster",
-      id,
-      name,
-      search: `${id} ${name} monster`.toLowerCase(),
-      label: `Monster - ${name} (${id})`,
-      spriteId,
-      glyph: glyphInfo.g ?? "?",
-      glyphColor: glyphInfo.c ?? "#d5dfef",
-    });
-  }
-  entries.sort((a, b) => a.label.localeCompare(b.label));
-  return entries;
-}
-
-function renderDebugSpawnerOptions() {
-  if (!debugSpawnerListEl || !canUseAdminControls()) return;
-  const allEntries = debugSpawnerCatalogEntries();
-  const typeFilter = String(debugSpawnerTypeFilterEl?.value ?? "all").toLowerCase();
-  const rawFilter = (debugSpawnerFilterEl?.value ?? "").trim().toLowerCase();
-  const filtered = allEntries
-    .filter((entry) => {
-      if (typeFilter === "monster") return entry.type === "monster";
-      if (typeFilter === "equipment") return entry.type === "item" && (entry.id.startsWith("weapon_") || entry.id.startsWith("armor_"));
-      return true;
-    })
-    .filter((entry) => (rawFilter.length ? entry.search.includes(rawFilter) : true));
-  if (typeFilter === "equipment") {
-    filtered.sort((a, b) => (itemMarketValue(b.id) - itemMarketValue(a.id)) || a.name.localeCompare(b.name));
-  }
-  const prevKey = debugSpawnerUi.selectedKey;
-  debugSpawnerListEl.innerHTML = "";
-  if (!filtered.length) {
-    const empty = document.createElement("div");
-    empty.className = "spawnerListEmpty";
-    empty.textContent = "(no matching objects)";
-    debugSpawnerListEl.appendChild(empty);
-    if (debugSpawnerSpawnEl) debugSpawnerSpawnEl.disabled = true;
-    debugSpawnerUi.selectedKey = "";
-    return;
-  }
-  if (debugSpawnerSpawnEl) debugSpawnerSpawnEl.disabled = false;
-  const selectedKey = filtered.some((entry) => entry.key === prevKey) ? prevKey : filtered[0].key;
-  for (const entry of filtered) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = `spawnerListRow${entry.key === selectedKey ? " active" : ""}`;
-    row.setAttribute("data-spawner-key", entry.key);
-
-    const preview = document.createElement("div");
-    preview.className = "spawnerListPreview";
-    if (entry.spriteId && SPRITE_SOURCES[entry.spriteId]) {
-      const img = document.createElement("img");
-      img.src = SPRITE_SOURCES[entry.spriteId];
-      img.alt = `${entry.name} preview`;
-      preview.appendChild(img);
-    } else {
-      const glyph = document.createElement("span");
-      glyph.className = "spawnerListGlyph";
-      glyph.textContent = entry.glyph ?? "?";
-      glyph.style.color = entry.glyphColor ?? "#d5dfef";
-      preview.appendChild(glyph);
-    }
-
-    const meta = document.createElement("div");
-    meta.className = "spawnerListMeta";
-    const name = document.createElement("div");
-    name.className = "spawnerListName";
-    name.textContent = entry.name;
-    const sub = document.createElement("div");
-    sub.className = "spawnerListSub";
-    sub.textContent = `${entry.type === "monster" ? "Monster" : "Item"} - ${entry.id}`;
-    meta.appendChild(name);
-    meta.appendChild(sub);
-
-    row.appendChild(preview);
-    row.appendChild(meta);
-    debugSpawnerListEl.appendChild(row);
-  }
-  debugSpawnerUi.selectedKey = selectedKey;
-}
-
-function spawnDebugSelection(state) {
+function spawnDebugObjectByKey(state, key) {
   if (!canUseAdminControls()) return false;
   if (!state) return false;
-  const key = (debugSpawnerUi.selectedKey || "").trim();
-  if (!key) {
-    pushLog(state, "Select an object to spawn.");
-    return false;
-  }
+  const spawnKey = String(key ?? "").trim();
+  if (!spawnKey) return false;
   const p = state.player;
   if (!p || p.dead) return false;
   const targetX = p.x;
   const targetY = p.y - 2;
   const targetZ = p.z;
   const now = Date.now();
-  if (key.startsWith("item:")) {
-    const itemType = key.slice(5);
+  if (spawnKey.startsWith("item:")) {
+    const itemType = spawnKey.slice(5);
     if (!ITEM_TYPES[itemType]) {
       pushLog(state, `Unknown item type: ${itemType}.`);
       return false;
@@ -1897,8 +1779,8 @@ function spawnDebugSelection(state) {
     const amount = itemType === "gold" ? 10 : 1;
     spawnDynamicItem(state, itemType, amount, targetX, targetY, targetZ);
     pushLog(state, `Debug: spawned ${ITEM_TYPES[itemType]?.name ?? itemType} at (${targetX}, ${targetY}, ${targetZ}).`);
-  } else if (key.startsWith("monster:")) {
-    const monsterType = key.slice(8);
+  } else if (spawnKey.startsWith("monster:")) {
+    const monsterType = spawnKey.slice(8);
     if (!MONSTER_TYPES[monsterType]) {
       pushLog(state, `Unknown monster type: ${monsterType}.`);
       return false;
@@ -1923,7 +1805,7 @@ function spawnDebugSelection(state) {
     state.entities.set(id, ent);
     pushLog(state, `Debug: spawned ${monsterDisplayName(monsterType, targetZ)} at (${targetX}, ${targetY}, ${targetZ}).`);
   } else {
-    pushLog(state, "Unknown spawner object selection.");
+    pushLog(state, "Unknown spawn object selection.");
     return false;
   }
   hydrateNearby(state);
@@ -11243,7 +11125,6 @@ function setMonsterEditorOverlayOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
-    closeSpawnerOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   }
   monsterEditorUi.open = show;
@@ -12394,7 +12275,6 @@ function setSpriteEditorOverlayOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeMonsterEditorOverlay();
-    closeSpawnerOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   }
   spriteEditorUi.open = show;
@@ -12404,36 +12284,26 @@ function setSpriteEditorOverlayOpen(open) {
   if (show) spriteEditorCloseBtnEl?.focus();
 }
 
-function isSpawnerOverlayOpen() {
-  return !!spawnerOverlayEl?.classList.contains("show");
+function isSpawnableSpriteEditorObject(entry) {
+  const objectId = String(entry?.objectId ?? "");
+  return !!ITEM_TYPES[objectId] || !!MONSTER_TYPES[objectId];
 }
 
-function closeSpawnerOverlay() {
-  if (!spawnerOverlayEl) return;
-  spawnerOverlayEl.classList.remove("show");
-  spawnerOverlayEl.setAttribute("aria-hidden", "true");
-  syncBodyModalLock();
-}
-
-function setSpawnerOverlayOpen(open) {
-  if (!spawnerOverlayEl) return;
-  const show = !!open;
-  if (show && !canUseAdminControls()) return;
-  if (show) {
-    closeMobilePanels();
-    setDebugMenuOpen(false);
-    closeShopOverlay();
-    closeSaveGameOverlay();
-    closeInfoOverlay();
-    closeSpriteEditorOverlay();
-    closeMonsterEditorOverlay();
-    if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
-    renderDebugSpawnerOptions();
+function spawnSpriteEditorObject(state, entry) {
+  if (!canUseAdminControls()) return false;
+  if (!state || !entry) return false;
+  const objectId = String(entry.objectId ?? "");
+  const key = ITEM_TYPES[objectId]
+    ? `item:${objectId}`
+    : (MONSTER_TYPES[objectId] ? `monster:${objectId}` : "");
+  if (!key) {
+    setSpriteEditorStatus(`Spawn is not supported for ${objectId}.`, true);
+    return false;
   }
-  spawnerOverlayEl.classList.toggle("show", show);
-  spawnerOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
-  syncBodyModalLock();
-  if (show) spawnerCloseBtnEl?.focus();
+  const ok = spawnDebugObjectByKey(state, key);
+  if (ok) setSpriteEditorStatus(`Spawned ${entry.name} north of player.`, false);
+  else setSpriteEditorStatus(`Could not spawn ${entry.name}.`, true);
+  return ok;
 }
 
 function renderSpriteEditorList() {
@@ -12518,6 +12388,14 @@ function renderSpriteEditorList() {
 
     const actions = document.createElement("div");
     actions.className = "spriteRowActions";
+    const spawnBtn = document.createElement("button");
+    spawnBtn.type = "button";
+    spawnBtn.textContent = "Spawn";
+    spawnBtn.disabled = spriteEditorUi.loading || !canUseAdminControls() || !isSpawnableSpriteEditorObject(entry);
+    spawnBtn.addEventListener("click", () => {
+      if (!game) return;
+      void spawnSpriteEditorObject(game, entry);
+    });
     const uploadInput = document.createElement("input");
     uploadInput.type = "file";
     uploadInput.accept = "image/*";
@@ -12589,6 +12467,7 @@ function renderSpriteEditorList() {
       void setSpriteScaleForEntry(entry, 100);
     });
 
+    actions.appendChild(spawnBtn);
     actions.appendChild(uploadBtn);
     actions.appendChild(deleteBtn);
     actions.appendChild(scaleGroup);
@@ -13321,11 +13200,6 @@ function onKey(state, e) {
     if (k === "escape") closeSpriteEditorOverlay();
     return;
   }
-  if (isSpawnerOverlayOpen()) {
-    e.preventDefault();
-    if (k === "escape") closeSpawnerOverlay();
-    return;
-  }
   if (isMonsterEditorOverlayOpen()) {
     e.preventDefault();
     if (k === "escape") closeMonsterEditorOverlay();
@@ -13916,9 +13790,6 @@ btnSpriteEditorEl?.addEventListener("click", () => {
 btnMonsterEditorEl?.addEventListener("click", () => {
   void openMonsterEditorOverlay();
 });
-btnSpawnerEl?.addEventListener("click", () => {
-  setSpawnerOverlayOpen(true);
-});
 infoCloseBtnEl?.addEventListener("click", () => {
   closeInfoOverlay();
 });
@@ -13952,12 +13823,6 @@ monsterEditorCloseBtnEl?.addEventListener("click", () => {
 });
 monsterEditorOverlayEl?.addEventListener("click", (e) => {
   if (e.target === monsterEditorOverlayEl) closeMonsterEditorOverlay();
-});
-spawnerCloseBtnEl?.addEventListener("click", () => {
-  closeSpawnerOverlay();
-});
-spawnerOverlayEl?.addEventListener("click", (e) => {
-  if (e.target === spawnerOverlayEl) closeSpawnerOverlay();
 });
 monsterEditorSearchInputEl?.addEventListener("input", () => {
   monsterEditorSignature = "";
@@ -14159,11 +14024,6 @@ document.addEventListener("keydown", (e) => {
     closeSpriteEditorOverlay();
     return;
   }
-  if (isSpawnerOverlayOpen()) {
-    e.preventDefault();
-    closeSpawnerOverlay();
-    return;
-  }
   if (isMonsterEditorOverlayOpen()) {
     e.preventDefault();
     closeMonsterEditorOverlay();
@@ -14260,43 +14120,6 @@ debugLevelInputEl?.addEventListener("keydown", (e) => {
   e.preventDefault();
   e.stopPropagation();
   runDebugSetLevel();
-});
-debugSpawnerFilterEl?.addEventListener("input", () => {
-  if (!canUseAdminControls()) return;
-  renderDebugSpawnerOptions();
-});
-debugSpawnerTypeFilterEl?.addEventListener("change", () => {
-  if (!canUseAdminControls()) return;
-  renderDebugSpawnerOptions();
-});
-debugSpawnerListEl?.addEventListener("click", (e) => {
-  const btn = e.target?.closest?.("button[data-spawner-key]");
-  if (!btn) return;
-  const key = String(btn.getAttribute("data-spawner-key") ?? "").trim();
-  if (!key) return;
-  debugSpawnerUi.selectedKey = key;
-  renderDebugSpawnerOptions();
-});
-const runDebugSpawner = () => {
-  if (!canUseAdminControls()) return;
-  if (!game) return;
-  spawnDebugSelection(game);
-};
-debugSpawnerSpawnEl?.addEventListener("click", (e) => {
-  e.preventDefault();
-  runDebugSpawner();
-});
-debugSpawnerFilterEl?.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter") return;
-  e.preventDefault();
-  e.stopPropagation();
-  runDebugSpawner();
-});
-debugSpawnerListEl?.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter") return;
-  e.preventDefault();
-  e.stopPropagation();
-  runDebugSpawner();
 });
 shopCloseBtnEl?.addEventListener("click", () => {
   closeShopOverlay();

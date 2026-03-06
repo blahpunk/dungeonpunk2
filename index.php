@@ -3636,144 +3636,6 @@ if (!is_string($monsterEditorJson)) {
       #monsterEditorOverlay.show {
         display: flex;
       }
-      #spawnerOverlay {
-        position: fixed;
-        inset: 0;
-        z-index: 1737;
-        display: none;
-        align-items: center;
-        justify-content: center;
-        background: rgba(0, 0, 0, 0.72);
-        padding: 12px;
-      }
-      #spawnerOverlay.show {
-        display: flex;
-      }
-      #spawnerCard {
-        width: min(720px, 97vw);
-        height: min(430px, 90vh);
-        border: 1px solid var(--ui-border);
-        border-radius: 12px;
-        background: linear-gradient(180deg, rgba(14, 22, 34, 0.99) 0%, rgba(7, 11, 18, 0.99) 100%);
-        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-        display: grid;
-        grid-template-rows: auto auto auto 1fr;
-        overflow: hidden;
-      }
-      #spawnerHeader {
-        padding: 12px 14px 8px 14px;
-        border-bottom: 1px solid #27314a;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-      }
-      #spawnerTitle {
-        margin: 0;
-        font-size: 19px;
-        font-weight: 800;
-      }
-      #spawnerControls {
-        padding: 8px 14px;
-        border-bottom: 1px solid #1f2a40;
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 180px;
-        gap: 8px;
-        align-items: center;
-      }
-      #spawnerControls input,
-      #spawnerControls select {
-        width: 100%;
-        min-width: 0;
-        height: 34px;
-        border-radius: 8px;
-        border: 1px solid #32415f;
-        background: #0a1220;
-        color: #e6e6e6;
-        padding: 6px 8px;
-        font-size: 13px;
-      }
-      #debugSpawnerList {
-        min-height: 0;
-        overflow: auto;
-        padding: 10px 14px;
-        display: grid;
-        gap: 6px;
-        align-content: start;
-      }
-      .spawnerListEmpty {
-        opacity: 0.82;
-        font-size: 13px;
-        color: #b8c6df;
-      }
-      .spawnerListRow {
-        width: 100%;
-        border: 1px solid #2b3956;
-        border-radius: 9px;
-        background: rgba(12, 18, 30, 0.9);
-        padding: 8px;
-        display: grid;
-        grid-template-columns: 56px minmax(0, 1fr);
-        gap: 10px;
-        align-items: center;
-        text-align: left;
-      }
-      .spawnerListRow.active {
-        border-color: #4f72aa;
-        box-shadow: inset 0 0 0 1px rgba(102, 149, 224, 0.35);
-      }
-      .spawnerListPreview {
-        width: 56px;
-        height: 56px;
-        border-radius: 8px;
-        border: 1px solid #2f3e5b;
-        background: #0b1322;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        overflow: hidden;
-      }
-      .spawnerListPreview img {
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
-        display: block;
-      }
-      .spawnerListGlyph {
-        font-size: 24px;
-        line-height: 1;
-        font-weight: 800;
-      }
-      .spawnerListMeta {
-        min-width: 0;
-      }
-      .spawnerListName {
-        font-size: 14px;
-        font-weight: 700;
-        color: #eef4ff;
-      }
-      .spawnerListSub {
-        margin-top: 2px;
-        font-size: 12px;
-        color: #b8c6df;
-      }
-      #spawnerLead {
-        padding: 8px 14px;
-        border-bottom: 1px solid #1f2a40;
-        font-size: 12px;
-        color: #b8c6df;
-      }
-      #spawnerActions {
-        padding: 10px 14px;
-        display: flex;
-        justify-content: flex-end;
-        align-items: center;
-        gap: 8px;
-      }
-      @media (max-width: 760px) {
-        #spawnerControls {
-          grid-template-columns: minmax(0, 1fr);
-        }
-      }
       #monsterEditorCard {
         width: min(1180px, 97vw);
         height: min(830px, 95vh);
@@ -4454,7 +4316,6 @@ if (!is_string($monsterEditorJson)) {
         #infoOverlay,
         #spriteEditorOverlay,
         #monsterEditorOverlay,
-        #spawnerOverlay,
         #newDungeonConfirmOverlay,
         #levelUpOverlay {
           align-items: flex-start;
@@ -4468,7 +4329,6 @@ if (!is_string($monsterEditorJson)) {
         #infoCard,
         #spriteEditorCard,
         #monsterEditorCard,
-        #spawnerCard,
         #levelUpCard {
           width: min(1120px, calc(100vw - 20px));
           max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
@@ -4757,7 +4617,6 @@ if (!is_string($monsterEditorJson)) {
           <div id="debugMenu" aria-hidden="true">
             <button id="btnSpriteEditor" type="button" class="adminMenuAction">Sprite Editor</button>
             <button id="btnMonsterEditor" type="button" class="adminMenuAction">Monster Editor</button>
-            <button id="btnSpawner" type="button" class="adminMenuAction">Spawner</button>
             <div class="adminMenuDivider"></div>
             <label class="debugToggle" for="toggleGodmode">
               <span>Godmode</span>
@@ -5200,27 +5059,6 @@ if (!is_string($monsterEditorJson)) {
               </div>
             </form>
           </div>
-        </div>
-      </div>
-    </div>
-    <div id="spawnerOverlay" aria-hidden="true">
-      <div id="spawnerCard" role="dialog" aria-modal="true" aria-labelledby="spawnerTitle">
-        <div id="spawnerHeader">
-          <h2 id="spawnerTitle">Spawner (Admin)</h2>
-          <button id="spawnerCloseBtn" type="button">Close</button>
-        </div>
-        <div id="spawnerLead">Choose any object and spawn it at Player North x2.</div>
-        <div id="spawnerControls">
-          <input id="debugSpawnerFilter" type="text" placeholder="Filter objects..." autocomplete="off" />
-          <select id="debugSpawnerTypeFilter">
-            <option value="all">All Objects</option>
-            <option value="equipment">Equipment</option>
-            <option value="monster">Monsters</option>
-          </select>
-        </div>
-        <div id="debugSpawnerList"></div>
-        <div id="spawnerActions">
-          <button id="debugSpawnerSpawn" type="button">Spawn N2</button>
         </div>
       </div>
     </div>
