@@ -6306,6 +6306,34 @@ async function handleCharacterOverlaySecondary() {
   characterCreateStepMove(-1);
   renderCharacterOverlay();
 }
+
+function tryCloseCharacterOverlay() {
+  const purpose = normalizeCharacterSelectionPurpose(characterUi.selectionPurpose);
+  if (purpose === "swap_character") {
+    requiresCharacterCreation = false;
+    setCharacterOverlayStatus("");
+    setCharacterOverlayOpen(false);
+    return true;
+  }
+  if ((isAuthenticatedUser && requiresCharacterCreation) || (!isAuthenticatedUser && requiresCharacterCreation)) {
+    characterUi.mode = (isAuthenticatedUser && !mustHaveCharacterSlot()) ? "select" : "create";
+    characterUi.selectionPurpose = "load_run";
+    setCharacterOverlayStatus(
+      characterUi.mode === "create"
+        ? "Create a character to continue."
+        : "Select or create a character to continue.",
+      true
+    );
+    if (characterUi.mode === "create") resetCharacterCreationDraft(null, { step: "welcome" });
+    setCharacterOverlayOpen(true);
+    renderCharacterOverlay();
+    return false;
+  }
+  setCharacterOverlayStatus("");
+  setCharacterOverlayOpen(false);
+  return true;
+}
+
 async function handleCharacterOverlayTertiary() {
   if (characterUi.loading || characterUi.mode !== "select" || !isAuthenticatedUser) return;
   const selectedId = characterUi.selectedSaveId;
@@ -6460,11 +6488,13 @@ async function openCharacterSelectionOverlay(options = null) {
     characterUi.selectionPurpose = mustHaveCharacterSlot() ? "load_run" : requestedPurpose;
     characterUi.mode = characterUi.slots.length ? "select" : "create";
     refreshCharacterCreationRequirement();
+    if (characterUi.selectionPurpose === "swap_character") requiresCharacterCreation = false;
     if (characterUi.mode === "create") resetCharacterCreationDraft(null, { step: "welcome" });
   } catch {
     characterUi.mode = "create";
-    characterUi.selectionPurpose = "load_run";
+    characterUi.selectionPurpose = requestedPurpose;
     refreshCharacterCreationRequirement();
+    if (characterUi.selectionPurpose === "swap_character") requiresCharacterCreation = false;
     setCharacterOverlayStatus(
       "Could not load your character slots. Create a new one to continue.",
       true
@@ -7766,8 +7796,9 @@ function hydrateChunkEntities(state, z, cx, cy) {
       type: m.type,
       x: mx, y: my, z: mz,
       hp, maxHp: spec.maxHp,
-      awake: false,
+      awake: !!ov?.awake,
       cd,
+      abilityCd: Math.max(0, Math.floor(ov?.abilityCd ?? 0)),
     });
   }
 
@@ -9783,6 +9814,7 @@ function monstersTurn(state) {
 
     if (seesPlayer) {
       m.awake = true;
+      persistOverride();
       if (tryStepTowardPlayer()) continue;
     }
 
@@ -12687,6 +12719,7 @@ async function openSpriteEditorOverlay() {
 }
 
 function draw(state) {
+  if (!state || !state.world || !state.player) return;
   const frameStartMs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const nowMs = Date.now();
   touchCharacterProgress(state);
@@ -13182,7 +13215,10 @@ function onKey(state, e) {
     return;
   }
   if (isCharacterOverlayOpen()) {
-    if (k === "escape") e.preventDefault();
+    if (k === "escape") {
+      e.preventDefault();
+      tryCloseCharacterOverlay();
+    }
     return;
   }
   if (isSaveGameOverlayOpen()) {
@@ -13405,7 +13441,14 @@ function exportSave(state) {
   const areaRespawn = ensureAreaRespawnState(state);
   const tileOv = Array.from(state.world.tileOverrides.entries());
   const removed = Array.from(state.removedIds);
-  const entOv = Array.from(state.entityOverrides.entries());
+  const entOv = Array.from(state.entityOverrides.entries()).map(([id, ov]) => {
+    const ent = state.entities.get(id);
+    if (!ent || ent.kind !== "monster") return [id, ov];
+    const next = { ...(ov ?? {}) };
+    next.awake = !!ent.awake;
+    if (Number.isFinite(ent.abilityCd)) next.abilityCd = Math.floor(ent.abilityCd);
+    return [id, next];
+  });
   const seen = Array.from(state.seen).slice(0, 60000);
   const dynamic = Array.from(state.dynamic.values());
   const visitedDoors = Array.from(state.visitedDoors ?? []);
@@ -13461,9 +13504,34 @@ function normalizeDynamicEntries(items) {
   const out = [];
   for (const raw of items ?? []) {
     if (!raw || typeof raw !== "object") continue;
+    const kind = String(raw.kind ?? "item");
+    if (kind === "monster") {
+      const type = normalizeMonsterTypeId(raw.type);
+      if (!type || !MONSTER_TYPES[type]) continue;
+      const x = Math.floor(Number(raw.x));
+      const y = Math.floor(Number(raw.y));
+      const z = Math.floor(Number(raw.z));
+      const hp = Math.max(0, Math.floor(Number(raw.hp ?? 0)));
+      const maxHp = Math.max(1, Math.floor(Number(raw.maxHp ?? (hp || 1))));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      out.push({
+        ...raw,
+        kind: "monster",
+        type,
+        x,
+        y,
+        z,
+        hp: clamp(hp, 0, maxHp),
+        maxHp,
+        cd: Math.max(0, Math.floor(Number(raw.cd ?? 0))),
+        abilityCd: Math.max(0, Math.floor(Number(raw.abilityCd ?? 0))),
+        awake: !!raw.awake,
+      });
+      continue;
+    }
     const type = normalizeItemType(raw.type);
     if (!ITEM_TYPES[type]) continue;
-    out.push({ ...raw, type, amount: Math.max(1, Math.floor(raw.amount ?? 1)) });
+    out.push({ ...raw, kind: "item", type, amount: Math.max(1, Math.floor(raw.amount ?? 1)) });
   }
   return out;
 }
@@ -13961,22 +14029,7 @@ characterOverlayPrimaryEl?.addEventListener("click", () => {
   void handleCharacterOverlayPrimary();
 });
 characterOverlayCloseBtnEl?.addEventListener("click", () => {
-  if ((isAuthenticatedUser && requiresCharacterCreation) || (!isAuthenticatedUser && requiresCharacterCreation)) {
-    characterUi.mode = (isAuthenticatedUser && !mustHaveCharacterSlot()) ? "select" : "create";
-    characterUi.selectionPurpose = "load_run";
-    setCharacterOverlayStatus(
-      characterUi.mode === "create"
-        ? "Create a character to continue."
-        : "Select or create a character to continue.",
-      true
-    );
-    if (characterUi.mode === "create") resetCharacterCreationDraft(null, { step: "welcome" });
-    setCharacterOverlayOpen(true);
-    renderCharacterOverlay();
-    return;
-  }
-  setCharacterOverlayStatus("");
-  setCharacterOverlayOpen(false);
+  tryCloseCharacterOverlay();
 });
 characterOverlaySecondaryEl?.addEventListener("click", () => {
   void handleCharacterOverlaySecondary();
@@ -14017,6 +14070,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (isCharacterOverlayOpen()) {
     e.preventDefault();
+    tryCloseCharacterOverlay();
     return;
   }
   if (isSpriteEditorOverlayOpen()) {
@@ -14222,7 +14276,15 @@ try {
   );
   monsterEditorResetWorkingFromRuntime();
   setMonsterEditorAdvancedVisible(false);
-  game = loadSaveOrNew();
+  try {
+    game = loadSaveOrNew();
+  } catch (err) {
+    console.error("loadSaveOrNew failed, falling back to new game", err);
+    game = null;
+  }
+  if (!game || !game.player || !game.world) {
+    game = makeNewGame();
+  }
   if (enforceAdminControlPolicy(game)) saveNow(game);
   spriteEditorUi.objects = buildSpriteObjectCatalog();
   updateSpriteEditorFilterControls();
@@ -14348,7 +14410,24 @@ try {
       ? ts
       : ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
     if (now - lastFrameTs >= targetFrameMs) {
-      draw(game);
+      try {
+        draw(game);
+      } catch (err) {
+        showFatal(err);
+        try {
+          game = makeNewGame();
+          updateDebugMenuUi(game);
+          updateContextActionButton(game);
+          updateDeathOverlay(game);
+          renderInfoOverlay(game);
+          renderInventory(game);
+          renderEquipment(game);
+          renderEffects(game);
+          renderLog(game);
+        } catch (fallbackErr) {
+          showFatal(fallbackErr);
+        }
+      }
       lastFrameTs = now;
     }
     requestAnimationFrame(loop);
