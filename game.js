@@ -1317,6 +1317,7 @@ const btnChooseCharacterEl = document.getElementById("btnChooseCharacter");
 const btnInfoEl = document.getElementById("btnInfo");
 const btnSpriteEditorEl = document.getElementById("btnSpriteEditor");
 const btnMonsterEditorEl = document.getElementById("btnMonsterEditor");
+const btnSpawnerEl = document.getElementById("btnSpawner");
 const authBtnEl = document.getElementById("authBtn");
 const vitalsDisplayEl = document.getElementById("vitalsDisplay");
 const logPanelEl = document.getElementById("logPanel");
@@ -1384,6 +1385,7 @@ const spriteEditorOverlayEl = document.getElementById("spriteEditorOverlay");
 const spriteEditorCloseBtnEl = document.getElementById("spriteEditorCloseBtn");
 const spriteFilterCategoryEl = document.getElementById("spriteFilterCategory");
 const spriteFilterArmorTypeEl = document.getElementById("spriteFilterArmorType");
+const spriteFilterMetalTypeEl = document.getElementById("spriteFilterMetalType");
 const spriteFilterSourceEl = document.getElementById("spriteFilterSource");
 const spriteFilterSearchEl = document.getElementById("spriteFilterSearch");
 const spriteSelectAllEl = document.getElementById("spriteSelectAll");
@@ -1394,6 +1396,8 @@ const spriteEditorStatusEl = document.getElementById("spriteEditorStatus");
 const spriteEditorListEl = document.getElementById("spriteEditorList");
 const monsterEditorOverlayEl = document.getElementById("monsterEditorOverlay");
 const monsterEditorCloseBtnEl = document.getElementById("monsterEditorCloseBtn");
+const spawnerOverlayEl = document.getElementById("spawnerOverlay");
+const spawnerCloseBtnEl = document.getElementById("spawnerCloseBtn");
 const monsterEditorSearchInputEl = document.getElementById("monsterEditorSearchInput");
 const monsterEditorPreviewDepthInputEl = document.getElementById("monsterEditorPreviewDepthInput");
 const monsterEditorNewBtnEl = document.getElementById("monsterEditorNewBtn");
@@ -1465,10 +1469,16 @@ const btnDebugMenuEl = document.getElementById("btnDebugMenu");
 const debugMenuEl = document.getElementById("debugMenu");
 const toggleGodmodeEl = document.getElementById("toggleGodmode");
 const toggleFreeShoppingEl = document.getElementById("toggleFreeShopping");
+const toggleGhostEl = document.getElementById("toggleGhost");
+const toggleLockpickEl = document.getElementById("toggleLockpick");
 const debugDepthInputEl = document.getElementById("debugDepthInput");
 const debugDepthGoEl = document.getElementById("debugDepthGo");
 const debugLevelInputEl = document.getElementById("debugLevelInput");
 const debugLevelGoEl = document.getElementById("debugLevelGo");
+const debugSpawnerFilterEl = document.getElementById("debugSpawnerFilter");
+const debugSpawnerTypeFilterEl = document.getElementById("debugSpawnerTypeFilter");
+const debugSpawnerListEl = document.getElementById("debugSpawnerList");
+const debugSpawnerSpawnEl = document.getElementById("debugSpawnerSpawn");
 const mainCanvasWrapEl = document.getElementById("mainCanvasWrap");
 const surfaceCompassEl = document.getElementById("surfaceCompass");
 const surfaceCompassArrowEl = document.getElementById("surfaceCompassArrow");
@@ -1493,6 +1503,7 @@ function syncBodyModalLock() {
     !!infoOverlayEl?.classList.contains("show") ||
     !!spriteEditorOverlayEl?.classList.contains("show") ||
     !!monsterEditorOverlayEl?.classList.contains("show") ||
+    !!spawnerOverlayEl?.classList.contains("show") ||
     !!newDungeonConfirmOverlayEl?.classList.contains("show") ||
     !!levelUpOverlayEl?.classList.contains("show");
   document.body?.classList.toggle("modal-open", hasModal);
@@ -1500,6 +1511,7 @@ function syncBodyModalLock() {
 
 const mini = document.getElementById("mini");
 const mctx = mini.getContext("2d");
+const debugSpawnerUi = { selectedKey: "" };
 
 const MAX_RENDER_CANVAS_DIM = 4096;
 let viewRadiusX = BASE_VIEW_RADIUS;
@@ -1591,6 +1603,7 @@ const spriteEditorUi = {
   selectedSpriteIds: new Set(),
   filterCategory: "all",
   filterArmorType: "all",
+  filterMetalType: "all",
   filterSource: "all",
   maxUploadBytes: 50_000_000,
 };
@@ -1688,6 +1701,8 @@ function normalizeDebugFlags(flags) {
   return {
     godmode: !!flags?.godmode,
     freeShopping: !!flags?.freeShopping,
+    ghost: !!flags?.ghost,
+    lockpick: !!flags?.lockpick,
   };
 }
 function stateDebug(state) {
@@ -1709,12 +1724,22 @@ function enforceAdminControlPolicy(state) {
     d.freeShopping = false;
     changed = true;
   }
+  if (d.ghost) {
+    d.ghost = false;
+    changed = true;
+  }
+  if (d.lockpick) {
+    d.lockpick = false;
+    changed = true;
+  }
   if (!fogEnabled) {
     fogEnabled = true;
     changed = true;
   }
   if (toggleGodmodeEl) toggleGodmodeEl.checked = false;
   if (toggleFreeShoppingEl) toggleFreeShoppingEl.checked = false;
+  if (toggleGhostEl) toggleGhostEl.checked = false;
+  if (toggleLockpickEl) toggleLockpickEl.checked = false;
   if (debugMenuEl?.classList.contains("show")) setDebugMenuOpen(false);
   return changed;
 }
@@ -1728,8 +1753,184 @@ function updateDebugMenuUi(state) {
   const d = normalizeDebugFlags(state?.debug);
   if (toggleGodmodeEl) toggleGodmodeEl.checked = d.godmode;
   if (toggleFreeShoppingEl) toggleFreeShoppingEl.checked = d.freeShopping;
+  if (toggleGhostEl) toggleGhostEl.checked = d.ghost;
+  if (toggleLockpickEl) toggleLockpickEl.checked = d.lockpick;
   if (debugDepthInputEl) debugDepthInputEl.value = `${state?.player?.z ?? 0}`;
   if (debugLevelInputEl) debugLevelInputEl.value = `${Math.max(1, Math.floor(state?.player?.level ?? 1))}`;
+  renderDebugSpawnerOptions();
+}
+
+function debugSpawnerCatalogEntries() {
+  const entries = [];
+  for (const [id, item] of Object.entries(ITEM_TYPES)) {
+    const name = String(item?.name ?? id);
+    const glyphInfo = itemGlyph(id) ?? { g: "?", c: "#d5dfef" };
+    const spriteId = itemSpriteId({ type: id });
+    entries.push({
+      key: `item:${id}`,
+      type: "item",
+      id,
+      name,
+      search: `${id} ${name} item`.toLowerCase(),
+      label: `Item - ${name} (${id})`,
+      spriteId,
+      glyph: glyphInfo.g ?? "?",
+      glyphColor: glyphInfo.c ?? "#d5dfef",
+    });
+  }
+  for (const [id, monster] of Object.entries(MONSTER_TYPES)) {
+    const name = String(monster?.name ?? id);
+    const glyphInfo = monsterGlyph(id) ?? { g: "?", c: "#d5dfef" };
+    const spriteId = monsterSpriteId(id);
+    entries.push({
+      key: `monster:${id}`,
+      type: "monster",
+      id,
+      name,
+      search: `${id} ${name} monster`.toLowerCase(),
+      label: `Monster - ${name} (${id})`,
+      spriteId,
+      glyph: glyphInfo.g ?? "?",
+      glyphColor: glyphInfo.c ?? "#d5dfef",
+    });
+  }
+  entries.sort((a, b) => a.label.localeCompare(b.label));
+  return entries;
+}
+
+function renderDebugSpawnerOptions() {
+  if (!debugSpawnerListEl || !canUseAdminControls()) return;
+  const allEntries = debugSpawnerCatalogEntries();
+  const typeFilter = String(debugSpawnerTypeFilterEl?.value ?? "all").toLowerCase();
+  const rawFilter = (debugSpawnerFilterEl?.value ?? "").trim().toLowerCase();
+  const filtered = allEntries
+    .filter((entry) => {
+      if (typeFilter === "monster") return entry.type === "monster";
+      if (typeFilter === "equipment") return entry.type === "item" && (entry.id.startsWith("weapon_") || entry.id.startsWith("armor_"));
+      return true;
+    })
+    .filter((entry) => (rawFilter.length ? entry.search.includes(rawFilter) : true));
+  if (typeFilter === "equipment") {
+    filtered.sort((a, b) => (itemMarketValue(b.id) - itemMarketValue(a.id)) || a.name.localeCompare(b.name));
+  }
+  const prevKey = debugSpawnerUi.selectedKey;
+  debugSpawnerListEl.innerHTML = "";
+  if (!filtered.length) {
+    const empty = document.createElement("div");
+    empty.className = "spawnerListEmpty";
+    empty.textContent = "(no matching objects)";
+    debugSpawnerListEl.appendChild(empty);
+    if (debugSpawnerSpawnEl) debugSpawnerSpawnEl.disabled = true;
+    debugSpawnerUi.selectedKey = "";
+    return;
+  }
+  if (debugSpawnerSpawnEl) debugSpawnerSpawnEl.disabled = false;
+  const selectedKey = filtered.some((entry) => entry.key === prevKey) ? prevKey : filtered[0].key;
+  for (const entry of filtered) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `spawnerListRow${entry.key === selectedKey ? " active" : ""}`;
+    row.setAttribute("data-spawner-key", entry.key);
+
+    const preview = document.createElement("div");
+    preview.className = "spawnerListPreview";
+    if (entry.spriteId && SPRITE_SOURCES[entry.spriteId]) {
+      const img = document.createElement("img");
+      img.src = SPRITE_SOURCES[entry.spriteId];
+      img.alt = `${entry.name} preview`;
+      preview.appendChild(img);
+    } else {
+      const glyph = document.createElement("span");
+      glyph.className = "spawnerListGlyph";
+      glyph.textContent = entry.glyph ?? "?";
+      glyph.style.color = entry.glyphColor ?? "#d5dfef";
+      preview.appendChild(glyph);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "spawnerListMeta";
+    const name = document.createElement("div");
+    name.className = "spawnerListName";
+    name.textContent = entry.name;
+    const sub = document.createElement("div");
+    sub.className = "spawnerListSub";
+    sub.textContent = `${entry.type === "monster" ? "Monster" : "Item"} - ${entry.id}`;
+    meta.appendChild(name);
+    meta.appendChild(sub);
+
+    row.appendChild(preview);
+    row.appendChild(meta);
+    debugSpawnerListEl.appendChild(row);
+  }
+  debugSpawnerUi.selectedKey = selectedKey;
+}
+
+function spawnDebugSelection(state) {
+  if (!canUseAdminControls()) return false;
+  if (!state) return false;
+  const key = (debugSpawnerUi.selectedKey || "").trim();
+  if (!key) {
+    pushLog(state, "Select an object to spawn.");
+    return false;
+  }
+  const p = state.player;
+  if (!p || p.dead) return false;
+  const targetX = p.x;
+  const targetY = p.y - 2;
+  const targetZ = p.z;
+  const now = Date.now();
+  if (key.startsWith("item:")) {
+    const itemType = key.slice(5);
+    if (!ITEM_TYPES[itemType]) {
+      pushLog(state, `Unknown item type: ${itemType}.`);
+      return false;
+    }
+    if (itemType === "shopkeeper") {
+      const left = targetX - Math.floor(SHOP_FOOTPRINT_W / 2);
+      const top = targetY;
+      for (let yy = top; yy < top + SHOP_FOOTPRINT_H; yy++) {
+        for (let xx = left; xx < left + SHOP_FOOTPRINT_W; xx++) state.world.setTile(xx, yy, targetZ, FLOOR);
+      }
+    } else if (!state.world.isPassable(targetX, targetY, targetZ)) {
+      state.world.setTile(targetX, targetY, targetZ, FLOOR);
+    }
+    const amount = itemType === "gold" ? 10 : 1;
+    spawnDynamicItem(state, itemType, amount, targetX, targetY, targetZ);
+    pushLog(state, `Debug: spawned ${ITEM_TYPES[itemType]?.name ?? itemType} at (${targetX}, ${targetY}, ${targetZ}).`);
+  } else if (key.startsWith("monster:")) {
+    const monsterType = key.slice(8);
+    if (!MONSTER_TYPES[monsterType]) {
+      pushLog(state, `Unknown monster type: ${monsterType}.`);
+      return false;
+    }
+    if (!state.world.isPassable(targetX, targetY, targetZ)) state.world.setTile(targetX, targetY, targetZ, FLOOR);
+    const spec = monsterStatsForDepth(monsterType, targetZ);
+    const id = `dbg_m|${monsterType}|${targetZ}|${targetX},${targetY}|${now}|${Math.floor(Math.random() * 1e9)}`;
+    const ent = {
+      id,
+      origin: "dynamic",
+      kind: "monster",
+      type: monsterType,
+      x: targetX,
+      y: targetY,
+      z: targetZ,
+      hp: spec.maxHp,
+      maxHp: spec.maxHp,
+      awake: false,
+      cd: 0,
+    };
+    state.dynamic.set(id, ent);
+    state.entities.set(id, ent);
+    pushLog(state, `Debug: spawned ${monsterDisplayName(monsterType, targetZ)} at (${targetX}, ${targetY}, ${targetZ}).`);
+  } else {
+    pushLog(state, "Unknown spawner object selection.");
+    return false;
+  }
+  hydrateNearby(state);
+  updateContextActionButton(state);
+  updateDebugMenuUi(state);
+  saveNow(state);
+  return true;
 }
 function setDebugFlag(state, key, enabled) {
   if (!canUseAdminControls()) return;
@@ -1739,6 +1940,8 @@ function setDebugFlag(state, key, enabled) {
   d[key] = next;
   if (key === "godmode") pushLog(state, `Godmode ${next ? "enabled" : "disabled"}.`);
   if (key === "freeShopping") pushLog(state, `Free shopping ${next ? "enabled" : "disabled"}.`);
+  if (key === "ghost") pushLog(state, `Ghost ${next ? "enabled" : "disabled"}.`);
+  if (key === "lockpick") pushLog(state, `Lockpick ${next ? "enabled" : "disabled"}.`);
   saveNow(state);
 }
 
@@ -3207,7 +3410,7 @@ const VOID_ALIGNED_MONSTER_IDS = new Set([
   "singularity_hunter",
   "slime_violet",
   "slime_indigo",
-  "jelly_red",
+  "slime_red",
 ]);
 const MONSTER_SIZE_TIERS = [
   { id: "small", depthStart: 0, mult: 1 },
@@ -3228,10 +3431,19 @@ function monsterSizeTier(depth, spec) {
   }
   return out;
 }
+function normalizeMonsterTypeId(type) {
+  const id = String(type ?? "").trim();
+  if (!id) return "";
+  if (id === "jelly_green") return "slime_green";
+  if (id === "jelly_yellow") return "slime_yellow";
+  if (id === "jelly_red") return "slime_red";
+  return id;
+}
 function resolveMonsterSpec(type) {
-  const base = MONSTER_TYPES[type] ?? MONSTER_TYPES.rat;
+  const normalizedType = normalizeMonsterTypeId(type);
+  const base = MONSTER_TYPES[normalizedType] ?? MONSTER_TYPES.rat;
   if (base?.aliasOf && MONSTER_TYPES[base.aliasOf]) {
-    return { ...(MONSTER_TYPES[base.aliasOf] ?? MONSTER_TYPES.rat), id: type, aliasOf: base.aliasOf };
+    return { ...(MONSTER_TYPES[base.aliasOf] ?? MONSTER_TYPES.rat), id: normalizedType || type, aliasOf: base.aliasOf };
   }
   return base;
 }
@@ -4075,29 +4287,33 @@ function renderShopOverlay(state) {
   const renderShopItemPreview = (type) => {
     if (!shopDetailPreviewEl) return;
     shopDetailPreviewEl.innerHTML = "";
-    if (!type) {
+    const appendGlyphPreview = (glyphInfo = { g: "?", c: "#d5dfef" }) => {
       const glyph = document.createElement("span");
       glyph.className = "shopDetailPreviewGlyph";
-      glyph.textContent = "?";
-      glyph.style.color = "#9fb2cf";
+      glyph.textContent = glyphInfo.g ?? "?";
+      glyph.style.color = glyphInfo.c ?? "#d5dfef";
       shopDetailPreviewEl.appendChild(glyph);
+    };
+    if (!type) {
+      appendGlyphPreview({ g: "?", c: "#9fb2cf" });
       return;
     }
     const spriteId = SPRITE_SOURCES[type] ? type : null;
     const spriteImg = spriteId ? getSpriteIfReady(spriteId) : null;
-    if (spriteImg) {
+    const spriteSrc = spriteImg?.src ?? (spriteId ? SPRITE_SOURCES[spriteId] : null);
+    if (spriteSrc) {
       const img = document.createElement("img");
-      img.src = spriteImg.src;
+      img.src = spriteSrc;
       img.alt = `${ITEM_TYPES[type]?.name ?? type} preview`;
+      img.addEventListener("error", () => {
+        if (!shopDetailPreviewEl || !shopDetailPreviewEl.contains(img)) return;
+        img.remove();
+        appendGlyphPreview(itemGlyph(type) ?? { g: "?", c: "#d5dfef" });
+      });
       shopDetailPreviewEl.appendChild(img);
       return;
     }
-    const glyphInfo = itemGlyph(type) ?? { g: "?", c: "#d5dfef" };
-    const glyph = document.createElement("span");
-    glyph.className = "shopDetailPreviewGlyph";
-    glyph.textContent = glyphInfo.g ?? "?";
-    glyph.style.color = glyphInfo.c ?? "#d5dfef";
-    shopDetailPreviewEl.appendChild(glyph);
+    appendGlyphPreview(itemGlyph(type) ?? { g: "?", c: "#d5dfef" });
   };
 
   shopListEl.innerHTML = "";
@@ -4592,15 +4808,18 @@ function chunkBaseSpawns(worldSeed, chunk) {
     const cxr = clamp(reward.chestX ?? 0, 1, CHUNK - 2);
     const cyr = clamp(reward.chestY ?? 0, 1, CHUNK - 2);
     if (isOpenCell(cxr, cyr) && !occupiedItemCells.has(cellKey(cxr, cyr))) {
+      const rewardKeyType = reward.keyType ?? keyTypeForDepth(z, rng);
       pushItem({
         id: `chest_lock_reward|${z}|${cx},${cy}|${i}`,
         type: "chest",
         amount: 1,
         lx: cxr,
         ly: cyr,
+        locked: true,
+        keyType: rewardKeyType,
         rewardChest: true,
         lootDepth: Math.max(z + 1, Math.floor(reward.lootDepth ?? (z + 2))),
-        lockKeyType: reward.keyType ?? keyTypeForDepth(z, rng),
+        lockKeyType: rewardKeyType,
       });
     }
 
@@ -5156,7 +5375,10 @@ async function autosaveIfDirty(reason = "") {
       const activeId = String(getActiveCharacterSlotId() ?? "");
       if (!activeId) return false;
       const ok = await saveCurrentGameToServer(activeId);
-      if (ok) clearSaveDirty();
+      if (ok) {
+        saveResumeSnapshot(game);
+        clearSaveDirty();
+      }
       return !!ok;
     }
     saveNow(game);
@@ -5531,6 +5753,7 @@ async function saveCurrentGameToServer(overwriteId = "") {
     });
     saveMenuUi.saves = Array.isArray(data.saves) ? data.saves : [];
     if (data?.save?.id) setActiveCharacterSlotId(String(data.save.id));
+    saveResumeSnapshot(game);
     clearSaveDirty();
     refreshSaveNameFromLive(true);
     setSaveGameStatus(data?.message ?? "Game saved.", false);
@@ -6236,6 +6459,12 @@ async function handleCharacterOverlayTertiary() {
 async function startCharacterFlow() {
   if (!characterOverlayEl) return;
   setCharacterOverlayStatus("");
+  if (isAuthenticatedUser && bootLoadedFromLocalSave) {
+    requiresCharacterCreation = false;
+    characterUi.loading = false;
+    setCharacterOverlayOpen(false);
+    return;
+  }
   if (isAuthenticatedUser) {
     requiresCharacterCreation = true;
     try {
@@ -8617,14 +8846,16 @@ function tryUnlockDoor(state, x, y, z) {
   if (!tileIsLocked(t)) return false;
 
   const keyType = lockToKeyType(t);
-  if (!invConsume(state, keyType, 1)) {
+  const lockpickEnabled = !!stateDebug(state).lockpick;
+  if (!lockpickEnabled && !invConsume(state, keyType, 1)) {
     pushLog(state, `Locked door. Need a ${ITEM_TYPES[keyType].name}.`);
     renderInventory(state);
     return true;
   }
 
   state.world.setTile(x, y, z, lockToOpenDoorTile(t));
-  pushLog(state, "You unlock and open the door.");
+  if (lockpickEnabled) pushLog(state, "You pick the lock and open the door.");
+  else pushLog(state, "You unlock and open the door.");
   renderInventory(state);
   return true;
 }
@@ -8997,13 +9228,16 @@ function pickup(state) {
     invAdd(state, it.type, 1);
     pushLog(state, `Picked up ${ITEM_TYPES[it.type].name}.`);
   } else if (it.type === "chest") {
-    if (it.locked) {
-      const keyType = it.keyType;
-      if (!keyType || !invConsume(state, keyType, 1)) {
+    const keyType = it.keyType ?? it.lockKeyType ?? null;
+    const isLocked = !!it.locked || !!keyType;
+    if (isLocked) {
+      const lockpickEnabled = !!stateDebug(state).lockpick;
+      if (!lockpickEnabled && (!keyType || !invConsume(state, keyType, 1))) {
         pushLog(state, "The chest is locked. You need the correct key to open it.");
         return false;
       }
-      pushLog(state, `You use the ${ITEM_TYPES[keyType].name} and open the Chest.`);
+      if (lockpickEnabled) pushLog(state, "You pick the chest lock.");
+      else pushLog(state, `You use the ${ITEM_TYPES[keyType].name} and open the Chest.`);
     }
     const chestDepth = normalizeChestLootDepth(Math.max(0, Math.floor(it.z ?? p.z ?? 0)), it);
     const g = 15 + Math.floor(Math.random() * (25 + clamp(chestDepth, 0, 55)));
@@ -9423,6 +9657,7 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
 function monstersTurn(state) {
   const p = state.player;
   if (p.dead) return;
+  if (stateDebug(state).ghost) return;
 
   hydrateNearby(state);
   computeVisibility(state);
@@ -9705,9 +9940,6 @@ const DEFAULT_SPRITE_SOURCES = {
   slime_red: "./client/assets/sprites/monsters/jelly_red.png",
   slime_violet: "./client/assets/sprites/monsters/jelly_red.png",
   slime_indigo: "./client/assets/sprites/monsters/jelly_red.png",
-  jelly_green: "./client/assets/sprites/monsters/jelly_green.png",
-  jelly_yellow: "./client/assets/sprites/monsters/jelly_yellow.png",
-  jelly_red: "./client/assets/sprites/monsters/jelly_red.png",
   key_red: "./client/assets/sprites/items/key_red.png",
   key_blue: "./client/assets/sprites/items/key_blue.png",
   key_green: "./client/assets/sprites/items/key_green.png",
@@ -9831,16 +10063,13 @@ function getSpriteIfReady(id) {
 }
 const MONSTER_SPRITE_FALLBACKS = {
   slime: "slime_yellow",
-  slime_green: "jelly_green",
-  slime_yellow: "jelly_yellow",
-  slime_orange: "jelly_red",
-  slime_red: "jelly_red",
-  slime_violet: "jelly_red",
-  slime_indigo: "jelly_red",
-  jelly: "jelly_yellow",
-  jelly_green: "jelly_green",
-  jelly_yellow: "jelly_yellow",
-  jelly_red: "jelly_red",
+  slime_green: "slime_green",
+  slime_yellow: "slime_yellow",
+  slime_orange: "slime_orange",
+  slime_red: "slime_red",
+  slime_violet: "slime_violet",
+  slime_indigo: "slime_indigo",
+  jelly: "slime_yellow",
   hobgoblin: "goblin",
   dire_wolf: "rat",
   cave_troll: "goblin",
@@ -9862,7 +10091,7 @@ const MONSTER_SPRITE_FALLBACKS = {
 const CHEST_LOCK_SPRITE_BY_KEY = {
   key_red: "chest_red",
   key_green: "chest_green",
-  key_yellow: "chest_blue",
+  key_yellow: "chest_green",
   key_orange: "chest_red",
   key_violet: "chest_purple",
   key_indigo: "chest_blue",
@@ -9871,17 +10100,20 @@ const CHEST_LOCK_SPRITE_BY_KEY = {
   key_magenta: "chest_blue",
 };
 function monsterSpriteId(type) {
-  if (!type) return null;
-  if (SPRITE_SOURCES[type]) return type;
-  const fallback = MONSTER_SPRITE_FALLBACKS[type] ?? null;
+  const normalizedType = normalizeMonsterTypeId(type);
+  if (!normalizedType) return null;
+  if (SPRITE_SOURCES[normalizedType]) return normalizedType;
+  const fallback = MONSTER_SPRITE_FALLBACKS[normalizedType] ?? null;
   if (fallback && SPRITE_SOURCES[fallback]) return fallback;
   return null;
 }
 function itemSpriteId(ent) {
   if (!ent?.type) return null;
   const type = ent.type;
-  if (type === "chest" && ent.locked) {
-    const lockSprite = CHEST_LOCK_SPRITE_BY_KEY[ent.keyType] ?? null;
+  if (type === "chest") {
+    const keyType = ent.keyType ?? ent.lockKeyType ?? null;
+    const isLocked = !!ent.locked || !!keyType;
+    const lockSprite = isLocked ? (CHEST_LOCK_SPRITE_BY_KEY[keyType] ?? null) : null;
     if (lockSprite && SPRITE_SOURCES[lockSprite]) return lockSprite;
   }
   if (SPRITE_SOURCES[type]) return type;
@@ -10509,6 +10741,7 @@ function updateSurfaceCompass(state) {
 }
 
 function monsterGlyph(type) {
+  type = normalizeMonsterTypeId(type) || type;
   if (type === "rat") return { g: "r", c: "#ff6b6b" };
   if (type === "goblin") return { g: "g", c: "#ff6b6b" };
   if (type === "hobgoblin") return { g: "H", c: "#ff896b" };
@@ -10529,12 +10762,11 @@ function monsterGlyph(type) {
   if (type === "deepcore_ballista_sentinel") return { g: "D", c: "#d69f8a" };
   if (type === "singularity_hunter") return { g: "Q", c: "#b386ff" };
   if (type === "slime_green") return { g: "s", c: "#79ff79" };
-  if (type === "slime_yellow" || type === "slime" || type === "jelly" || type === "jelly_yellow") return { g: "s", c: "#ffd966" };
+  if (type === "slime_yellow" || type === "slime" || type === "jelly") return { g: "s", c: "#ffd966" };
   if (type === "slime_orange") return { g: "s", c: "#ffb266" };
-  if (type === "slime_red" || type === "jelly_red") return { g: "s", c: "#ff7b7b" };
+  if (type === "slime_red") return { g: "s", c: "#ff7b7b" };
   if (type === "slime_violet") return { g: "s", c: "#c79bff" };
   if (type === "slime_indigo") return { g: "s", c: "#9ea8ff" };
-  if (type === "jelly_green") return { g: "s", c: "#79ff79" };
   if (type === "rogue") return { g: "R", c: "#ff8a6b" };
   if (type === "giant_spider") return { g: "S", c: "#ff9f4a" };
   if (type === "skeleton") return { g: "K", c: "#ff6b6b" };
@@ -10717,6 +10949,7 @@ function buildSpriteObjectCatalog() {
       spriteId: id,
       fallbackSpriteId: MONSTER_SPRITE_FALLBACKS[id] ?? "",
       armorType: "",
+      metalType: "",
       uploadDir: SPRITE_UPLOAD_DIR_BY_CATEGORY.monster,
     });
   }
@@ -10724,6 +10957,7 @@ function buildSpriteObjectCatalog() {
   for (const [id, spec] of Object.entries(ITEM_TYPES)) {
     let category = "item";
     let armorType = "";
+    const metalType = materialIdFromItemType(id) ?? "";
     if (id.startsWith("weapon_")) category = "weapon";
     else if (id.startsWith("armor_")) {
       category = "armor";
@@ -10736,6 +10970,7 @@ function buildSpriteObjectCatalog() {
       spriteId: id,
       fallbackSpriteId: "",
       armorType,
+      metalType,
       uploadDir: SPRITE_UPLOAD_DIR_BY_CATEGORY[category] ?? SPRITE_UPLOAD_DIR_BY_CATEGORY.item,
     });
   }
@@ -10748,6 +10983,7 @@ function buildSpriteObjectCatalog() {
       spriteId: extra.spriteId,
       fallbackSpriteId: "",
       armorType: "",
+      metalType: "",
       uploadDir: SPRITE_UPLOAD_DIR_BY_CATEGORY[extra.category] ?? SPRITE_UPLOAD_DIR_BY_CATEGORY.environment,
     });
   }
@@ -11007,6 +11243,7 @@ function setMonsterEditorOverlayOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeSpriteEditorOverlay();
+    closeSpawnerOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   }
   monsterEditorUi.open = show;
@@ -12003,7 +12240,7 @@ async function compressSpriteUploadFile(file, targetBytes) {
 }
 
 function updateSpriteEditorFilterControls() {
-  if (!spriteFilterCategoryEl || !spriteFilterArmorTypeEl) return;
+  if (!spriteFilterCategoryEl || !spriteFilterArmorTypeEl || !spriteFilterMetalTypeEl) return;
   const objects = Array.isArray(spriteEditorUi.objects) ? spriteEditorUi.objects : [];
 
   const categories = [...new Set(objects.map((entry) => entry.category).filter(Boolean))]
@@ -12043,6 +12280,34 @@ function updateSpriteEditorFilterControls() {
   }
   spriteEditorUi.filterArmorType = armorTypes.includes(prevArmor) ? prevArmor : "all";
   spriteFilterArmorTypeEl.value = spriteEditorUi.filterArmorType;
+
+  const metalTypes = [...new Set(
+    objects
+      .filter((entry) => entry.category === "weapon" || entry.category === "armor")
+      .map((entry) => String(entry.metalType ?? ""))
+      .filter((metal) => !!metal)
+  )];
+  metalTypes.sort((a, b) => {
+    const ai = materialTierIndexFromId(a);
+    const bi = materialTierIndexFromId(b);
+    if (ai !== bi) return ai - bi;
+    return a.localeCompare(b);
+  });
+  const prevMetal = spriteEditorUi.filterMetalType;
+  spriteFilterMetalTypeEl.innerHTML = "";
+  const allMetal = document.createElement("option");
+  allMetal.value = "all";
+  allMetal.textContent = "All metals";
+  spriteFilterMetalTypeEl.appendChild(allMetal);
+  for (const metal of metalTypes) {
+    const opt = document.createElement("option");
+    opt.value = metal;
+    opt.textContent = materialLabel(metal);
+    spriteFilterMetalTypeEl.appendChild(opt);
+  }
+  spriteEditorUi.filterMetalType = metalTypes.includes(prevMetal) ? prevMetal : "all";
+  spriteFilterMetalTypeEl.value = spriteEditorUi.filterMetalType;
+
   if (spriteFilterSourceEl) {
     const src = spriteEditorUi.filterSource;
     spriteEditorUi.filterSource = src === "has" || src === "missing" ? src : "all";
@@ -12054,6 +12319,7 @@ function filteredSpriteEditorObjects() {
   const sourceFilter = spriteEditorUi.filterSource;
   const categoryFilter = spriteEditorUi.filterCategory;
   const armorTypeFilter = spriteEditorUi.filterArmorType;
+  const metalTypeFilter = spriteEditorUi.filterMetalType;
   const query = (spriteFilterSearchEl?.value ?? "").trim().toLowerCase();
 
   return (spriteEditorUi.objects ?? []).filter((entry) => {
@@ -12061,6 +12327,10 @@ function filteredSpriteEditorObjects() {
     if (armorTypeFilter !== "all") {
       if (entry.category !== "armor") return false;
       if (entry.armorType !== armorTypeFilter) return false;
+    }
+    if (metalTypeFilter !== "all") {
+      if (entry.category !== "weapon" && entry.category !== "armor") return false;
+      if (entry.metalType !== metalTypeFilter) return false;
     }
     const display = resolveSpriteDisplayForEntry(entry);
     if (sourceFilter === "has" && !display.hasSprite) return false;
@@ -12124,6 +12394,7 @@ function setSpriteEditorOverlayOpen(open) {
     closeSaveGameOverlay();
     closeInfoOverlay();
     closeMonsterEditorOverlay();
+    closeSpawnerOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
   }
   spriteEditorUi.open = show;
@@ -12131,6 +12402,38 @@ function setSpriteEditorOverlayOpen(open) {
   spriteEditorOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
   syncBodyModalLock();
   if (show) spriteEditorCloseBtnEl?.focus();
+}
+
+function isSpawnerOverlayOpen() {
+  return !!spawnerOverlayEl?.classList.contains("show");
+}
+
+function closeSpawnerOverlay() {
+  if (!spawnerOverlayEl) return;
+  spawnerOverlayEl.classList.remove("show");
+  spawnerOverlayEl.setAttribute("aria-hidden", "true");
+  syncBodyModalLock();
+}
+
+function setSpawnerOverlayOpen(open) {
+  if (!spawnerOverlayEl) return;
+  const show = !!open;
+  if (show && !canUseAdminControls()) return;
+  if (show) {
+    closeMobilePanels();
+    setDebugMenuOpen(false);
+    closeShopOverlay();
+    closeSaveGameOverlay();
+    closeInfoOverlay();
+    closeSpriteEditorOverlay();
+    closeMonsterEditorOverlay();
+    if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
+    renderDebugSpawnerOptions();
+  }
+  spawnerOverlayEl.classList.toggle("show", show);
+  spawnerOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
+  syncBodyModalLock();
+  if (show) spawnerCloseBtnEl?.focus();
 }
 
 function renderSpriteEditorList() {
@@ -12742,12 +13045,13 @@ function draw(state) {
 
   const heroCx = viewRadiusX * TILE + TILE / 2;
   const heroCy = viewRadiusY * TILE + TILE / 2;
+  const heroSortY = player.y + 0.01;
   const heroSpriteId = playerCharacterSpriteId(state);
   const heroSprite = getSpriteIfReady(heroSpriteId) || getSpriteIfReady("hero");
   if (heroSprite) {
     deferredWorldObjects.push({
       kind: "hero-sprite",
-      sortY: player.y,
+      sortY: heroSortY,
       sortX: player.x,
       order: 2,
       sx: viewRadiusX,
@@ -12758,7 +13062,7 @@ function draw(state) {
   } else {
     deferredWorldObjects.push({
       kind: "hero-fallback",
-      sortY: player.y,
+      sortY: heroSortY,
       sortX: player.x,
       order: 2,
       sx: viewRadiusX,
@@ -12770,9 +13074,15 @@ function draw(state) {
   }
 
   // Painter's algorithm for world objects: lower tiles (higher Y) render over higher tiles.
-  deferredWorldObjects.sort((a, b) =>
-    (a.sortY - b.sortY) || (a.sortX - b.sortX) || (a.order - b.order)
-  );
+  deferredWorldObjects.sort((a, b) => {
+    const aIsHero = a.kind === "hero-sprite" || a.kind === "hero-fallback";
+    const bIsHero = b.kind === "hero-sprite" || b.kind === "hero-fallback";
+    const aIsShop = a.kind === "item-sprite" && a.entType === "shopkeeper";
+    const bIsShop = b.kind === "item-sprite" && b.entType === "shopkeeper";
+    if (aIsHero && bIsShop) return 1;
+    if (aIsShop && bIsHero) return -1;
+    return (a.sortY - b.sortY) || (a.sortX - b.sortX) || (a.order - b.order);
+  });
   for (const obj of deferredWorldObjects) {
     if (obj.kind === "tile-aura") {
       const cx = obj.sx * TILE + TILE / 2;
@@ -13009,6 +13319,11 @@ function onKey(state, e) {
   if (isSpriteEditorOverlayOpen()) {
     e.preventDefault();
     if (k === "escape") closeSpriteEditorOverlay();
+    return;
+  }
+  if (isSpawnerOverlayOpen()) {
+    e.preventDefault();
+    if (k === "escape") closeSpawnerOverlay();
     return;
   }
   if (isMonsterEditorOverlayOpen()) {
@@ -13536,6 +13851,11 @@ function saveNow(state) {
   clearSaveDirty();
 }
 
+function saveResumeSnapshot(state) {
+  if (!state) return;
+  try { localStorage.setItem(SAVE_KEY, exportSave(state)); } catch {}
+}
+
 function loadSaveOrNew() {
   bootLoadedFromLocalSave = false;
   const authState = isAuthenticatedUser ? "auth" : "guest";
@@ -13596,6 +13916,9 @@ btnSpriteEditorEl?.addEventListener("click", () => {
 btnMonsterEditorEl?.addEventListener("click", () => {
   void openMonsterEditorOverlay();
 });
+btnSpawnerEl?.addEventListener("click", () => {
+  setSpawnerOverlayOpen(true);
+});
 infoCloseBtnEl?.addEventListener("click", () => {
   closeInfoOverlay();
 });
@@ -13629,6 +13952,12 @@ monsterEditorCloseBtnEl?.addEventListener("click", () => {
 });
 monsterEditorOverlayEl?.addEventListener("click", (e) => {
   if (e.target === monsterEditorOverlayEl) closeMonsterEditorOverlay();
+});
+spawnerCloseBtnEl?.addEventListener("click", () => {
+  closeSpawnerOverlay();
+});
+spawnerOverlayEl?.addEventListener("click", (e) => {
+  if (e.target === spawnerOverlayEl) closeSpawnerOverlay();
 });
 monsterEditorSearchInputEl?.addEventListener("input", () => {
   monsterEditorSignature = "";
@@ -13700,6 +14029,11 @@ spriteFilterCategoryEl?.addEventListener("change", () => {
 });
 spriteFilterArmorTypeEl?.addEventListener("change", () => {
   spriteEditorUi.filterArmorType = spriteFilterArmorTypeEl.value || "all";
+  spriteEditorSignature = "";
+  renderSpriteEditorList();
+});
+spriteFilterMetalTypeEl?.addEventListener("change", () => {
+  spriteEditorUi.filterMetalType = spriteFilterMetalTypeEl.value || "all";
   spriteEditorSignature = "";
   renderSpriteEditorList();
 });
@@ -13825,6 +14159,11 @@ document.addEventListener("keydown", (e) => {
     closeSpriteEditorOverlay();
     return;
   }
+  if (isSpawnerOverlayOpen()) {
+    e.preventDefault();
+    closeSpawnerOverlay();
+    return;
+  }
   if (isMonsterEditorOverlayOpen()) {
     e.preventDefault();
     closeMonsterEditorOverlay();
@@ -13859,6 +14198,18 @@ toggleFreeShoppingEl?.addEventListener("change", () => {
   setDebugFlag(game, "freeShopping", !!toggleFreeShoppingEl.checked);
   updateDebugMenuUi(game);
   if (shopUi.open) renderShopOverlay(game);
+});
+toggleGhostEl?.addEventListener("change", () => {
+  if (!game) return;
+  if (!canUseAdminControls()) return;
+  setDebugFlag(game, "ghost", !!toggleGhostEl.checked);
+  updateDebugMenuUi(game);
+});
+toggleLockpickEl?.addEventListener("change", () => {
+  if (!game) return;
+  if (!canUseAdminControls()) return;
+  setDebugFlag(game, "lockpick", !!toggleLockpickEl.checked);
+  updateDebugMenuUi(game);
 });
 const runDebugDepthTeleport = () => {
   if (!canUseAdminControls()) return;
@@ -13909,6 +14260,43 @@ debugLevelInputEl?.addEventListener("keydown", (e) => {
   e.preventDefault();
   e.stopPropagation();
   runDebugSetLevel();
+});
+debugSpawnerFilterEl?.addEventListener("input", () => {
+  if (!canUseAdminControls()) return;
+  renderDebugSpawnerOptions();
+});
+debugSpawnerTypeFilterEl?.addEventListener("change", () => {
+  if (!canUseAdminControls()) return;
+  renderDebugSpawnerOptions();
+});
+debugSpawnerListEl?.addEventListener("click", (e) => {
+  const btn = e.target?.closest?.("button[data-spawner-key]");
+  if (!btn) return;
+  const key = String(btn.getAttribute("data-spawner-key") ?? "").trim();
+  if (!key) return;
+  debugSpawnerUi.selectedKey = key;
+  renderDebugSpawnerOptions();
+});
+const runDebugSpawner = () => {
+  if (!canUseAdminControls()) return;
+  if (!game) return;
+  spawnDebugSelection(game);
+};
+debugSpawnerSpawnEl?.addEventListener("click", (e) => {
+  e.preventDefault();
+  runDebugSpawner();
+});
+debugSpawnerFilterEl?.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  e.stopPropagation();
+  runDebugSpawner();
+});
+debugSpawnerListEl?.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  e.stopPropagation();
+  runDebugSpawner();
 });
 shopCloseBtnEl?.addEventListener("click", () => {
   closeShopOverlay();
@@ -14038,6 +14426,7 @@ try {
   syncMobileUi(true);
   const flushAutosaveLifecycle = () => {
     if (!game) return;
+    saveResumeSnapshot(game);
     if (saveRuntime.autoTimer) {
       clearTimeout(saveRuntime.autoTimer);
       saveRuntime.autoTimer = 0;

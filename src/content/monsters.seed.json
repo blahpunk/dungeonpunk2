@@ -435,27 +435,6 @@
       "glyph": "s",
       "sizeGrowth": true
     },
-    "jelly_green": {
-      "id": "jelly_green",
-      "name": "Green Slime",
-      "aliasOf": "slime_green",
-      "glyph": "s",
-      "sizeGrowth": true
-    },
-    "jelly_yellow": {
-      "id": "jelly_yellow",
-      "name": "Yellow Slime",
-      "aliasOf": "slime_yellow",
-      "glyph": "s",
-      "sizeGrowth": true
-    },
-    "jelly_red": {
-      "id": "jelly_red",
-      "name": "Red Slime",
-      "aliasOf": "slime_red",
-      "glyph": "s",
-      "sizeGrowth": true
-    },
     "jelly": {
       "id": "jelly",
       "name": "Slime",
