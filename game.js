@@ -6392,7 +6392,10 @@ async function startCharacterFlow() {
       characterUi.selectedSaveId = activeSlotExists ? activeId : (characterUi.slots[0]?.id || "");
       characterUi.selectionPurpose = "load_run";
       characterUi.mode = hasSlots ? "select" : "create";
-      if (bootLoadedFromLocalSave && activeSlotExists) {
+      // On refresh, keep the in-progress run if the account still has at least one slot.
+      // We only block resume when there are zero slots (all characters deleted).
+      if (bootLoadedFromLocalSave && hasSlots) {
+        if (!activeSlotExists && characterUi.selectedSaveId) setActiveCharacterSlotId(characterUi.selectedSaveId);
         requiresCharacterCreation = false;
         setCharacterOverlayStatus("");
         allowResumeWithoutOverlay = true;
