@@ -3785,6 +3785,20 @@ const CLASS_NATIVE_ATTACKS = {
     closeRangeDamageMult: 0.72,
     maxRangeFalloffPct: 0.1,
   },
+  spitter: {
+    kind: "ranged",
+    flavor: "toxin",
+    range: 5,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.8,
+    accuracyMod: 8,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.72,
+    maxRangeFalloffPct: 0.1,
+  },
 };
 const WEAPON_MATERIAL_ATK = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.atkBonus]));
 const ARMOR_MATERIAL_DEF = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.defBonus]));
@@ -8087,6 +8101,7 @@ function hydrateChunkEntities(state, z, cx, cy) {
     const spec = monsterStatsForDepth(m.type, z);
     const hp = ov?.hp ?? spec.maxHp;
     const cd = ov?.cd ?? 0;
+    const effects = normalizeMonsterEffects(ov?.effects ?? []);
 
     state.entities.set(m.id, {
       id: m.id,
@@ -8098,6 +8113,7 @@ function hydrateChunkEntities(state, z, cx, cy) {
       awake: !!ov?.awake,
       cd,
       abilityCd: Math.max(0, Math.floor(ov?.abilityCd ?? 0)),
+      effects,
     });
   }
 
@@ -8673,6 +8689,97 @@ function ensurePoisonCloudState(state) {
   return state.poisonClouds;
 }
 
+function normalizeMonsterEffects(rawEffects) {
+  const out = [];
+  for (const raw of rawEffects ?? []) {
+    if (!raw || typeof raw !== "object") continue;
+    const type = String(raw.type ?? "").trim().toLowerCase();
+    if (type !== "poison") continue;
+    const dmgPerTurn = Math.max(1, Math.floor(Number(raw.dmgPerTurn ?? 1)));
+    const turnsLeft = Math.max(0, Math.floor(Number(raw.turnsLeft ?? 0)));
+    if (turnsLeft <= 0) continue;
+    out.push({ type: "poison", dmgPerTurn, turnsLeft });
+  }
+  return out;
+}
+
+function ensureMonsterEffects(monster) {
+  if (!monster || typeof monster !== "object") return [];
+  if (!Array.isArray(monster.effects)) monster.effects = [];
+  monster.effects = normalizeMonsterEffects(monster.effects);
+  return monster.effects;
+}
+
+function persistMonsterOverride(state, monster) {
+  if (!state || !monster || monster.origin !== "base") return;
+  const next = {
+    x: Math.floor(monster.x ?? 0),
+    y: Math.floor(monster.y ?? 0),
+    z: Math.floor(monster.z ?? 0),
+    hp: Math.max(0, Math.floor(monster.hp ?? 0)),
+    cd: Math.max(0, Math.floor(monster.cd ?? 0)),
+    awake: !!monster.awake,
+  };
+  if (Number.isFinite(monster.abilityCd)) next.abilityCd = Math.max(0, Math.floor(monster.abilityCd));
+  const effects = normalizeMonsterEffects(monster.effects ?? []);
+  if (effects.length) next.effects = effects;
+  state.entityOverrides.set(monster.id, next);
+}
+
+function applyPoisonToMonster(state, monster, dmgPerTurn = 1, turns = 2, sourceLabel = "toxic spit") {
+  if (!monster || monster.kind !== "monster") return false;
+  const spec = monsterStatsForDepth(monster.type, monster.z ?? state?.player?.z ?? 0);
+  if (spec?.immunePoison) return false;
+  const dpt = Math.max(1, Math.floor(Number(dmgPerTurn ?? 1)));
+  const ttl = Math.max(1, Math.floor(Number(turns ?? 1)));
+  const effects = ensureMonsterEffects(monster);
+  const existing = effects.find((e) => e.type === "poison");
+  const isNew = !existing;
+  if (existing) {
+    existing.dmgPerTurn = Math.max(Math.floor(existing.dmgPerTurn ?? 1), dpt);
+    existing.turnsLeft = Math.max(Math.floor(existing.turnsLeft ?? 0), ttl);
+  } else {
+    effects.push({ type: "poison", dmgPerTurn: dpt, turnsLeft: ttl });
+  }
+  persistMonsterOverride(state, monster);
+  if (isNew) {
+    pushLog(state, `The ${monsterDisplayName(monster, state?.player?.z ?? monster.z ?? 0)} is poisoned by ${sourceLabel}.`);
+  }
+  return true;
+}
+
+function tickMonsterEffects(state) {
+  const p = state?.player;
+  if (!p || p.dead) return;
+  for (const monster of Array.from(state.entities.values())) {
+    if (!monster || monster.kind !== "monster") continue;
+    if (monster.z !== p.z) continue;
+    if (!Array.isArray(monster.effects) || monster.effects.length <= 0) continue;
+    let poisonDamage = 0;
+    for (const e of monster.effects) {
+      if (e.type === "poison" && monster.hp > 0) {
+        const dmg = Math.max(1, Math.floor(Number(e.dmgPerTurn ?? 1)));
+        monster.hp = Math.max(0, monster.hp - dmg);
+        poisonDamage += dmg;
+      }
+      e.turnsLeft = Math.max(0, Math.floor(Number(e.turnsLeft ?? 0)) - 1);
+    }
+    monster.effects = normalizeMonsterEffects(monster.effects);
+    if (poisonDamage > 0) {
+      pushLog(state, `Poison deals ${poisonDamage} to the ${monsterDisplayName(monster, p.z)}.`);
+    }
+    if (monster.hp <= 0) {
+      const xpMult = xpChallengeMultiplier(state, monster, monsterStatsForDepth(monster.type, monster.z ?? p.z));
+      handleMonsterDefeat(state, monster, {
+        xpMult,
+        deathMessage: `The ${monsterDisplayName(monster, p.z)} succumbs to poison.`,
+      });
+      continue;
+    }
+    persistMonsterOverride(state, monster);
+  }
+}
+
 function applyPoisonToPlayer(state, dmgPerTurn = 40, turns = 2, sourceLabel = "poison") {
   const p = state?.player;
   if (!p || p.dead) return;
@@ -9211,9 +9318,7 @@ function tryKnockbackMonster(state, monster, sourceX, sourceY) {
   if (occ.monsters.has(occKey) || occ.items.has(occKey)) return false;
   monster.x = tx;
   monster.y = ty;
-  if (monster.origin === "base") {
-    state.entityOverrides.set(monster.id, { x: monster.x, y: monster.y, z: monster.z, hp: monster.hp, cd: monster.cd ?? 0 });
-  }
+  persistMonsterOverride(state, monster);
   return true;
 }
 
@@ -9232,6 +9337,54 @@ function tryKnockbackPlayer(state, sourceX, sourceY) {
   p.x = tx;
   p.y = ty;
   return true;
+}
+
+function handleMonsterDefeat(state, monster, options = null) {
+  if (!monster || monster.kind !== "monster") return;
+  const opts = (options && typeof options === "object") ? options : {};
+  const p = state.player;
+  const xpMult = Math.max(0, Number(opts.xpMult ?? 1));
+  const mSpec = monsterStatsForDepth(monster.type, monster.z ?? p.z);
+  pushLog(state, String(opts.deathMessage ?? `The ${monsterDisplayName(monster, p.z)} dies.`));
+  if (mSpec?.deathCloudTurns && mSpec?.deathCloudRadius && mSpec?.deathCloudDmg) {
+    spawnPoisonCloudBurst(
+      state,
+      monster.x,
+      monster.y,
+      monster.z ?? p.z,
+      mSpec.deathCloudTurns,
+      mSpec.deathCloudRadius,
+      mSpec.deathCloudDmg,
+      "spores"
+    );
+  }
+
+  grantXP(state, Math.round(xpKillBonus(monster.type, monster.z ?? p.z) * xpMult));
+  markDepthKillForXp(state, monster.z ?? p.z);
+
+  if (monster.origin === "base") {
+    state.removedIds.add(monster.id);
+    state.entityOverrides.delete(monster.id);
+  } else if (monster.origin === "dynamic") {
+    state.dynamic.delete(monster.id);
+  }
+
+  let droppedSpecial = false;
+  if (maybeDropKeyFromMonster(state, monster)) droppedSpecial = true;
+
+  if (monster.type === "skeleton" && Math.random() < 0.24) {
+    const drop = Math.random() < 0.5 ? weaponForDepth(state.player.z, Math.random) : armorForDepth(state.player.z);
+    spawnDynamicItem(state, drop, 1, monster.x, monster.y, monster.z);
+    pushLog(state, `It dropped ${ITEM_TYPES[drop].name}!`);
+    droppedSpecial = true;
+  }
+
+  if (!droppedSpecial && Math.random() < 0.30) {
+    const amt = 2 + Math.floor(Math.random() * (10 + clamp(state.player.z, 0, 20)));
+    spawnDynamicItem(state, "gold", amt, monster.x, monster.y, monster.z);
+  }
+
+  state.entities.delete(monster.id);
 }
 
 function playerAttack(state, monster) {
@@ -9260,9 +9413,7 @@ function playerAttack(state, monster) {
   if (!rollHit(attackAcc, targetEva)) {
     monster.awake = true;
     pushLog(state, `You miss the ${monsterDisplayName(monster, p.z)}.`);
-    if (monster.origin === "base") {
-      state.entityOverrides.set(monster.id, { x: monster.x, y: monster.y, z: monster.z, hp: monster.hp, cd: monster.cd ?? 0 });
-    }
+    persistMonsterOverride(state, monster);
     return;
   }
   const hpBefore = monster.hp;
@@ -9276,12 +9427,28 @@ function playerAttack(state, monster) {
   const dmg = attack.dmg;
   monster.hp -= dmg;
   monster.awake = true;
+  persistMonsterOverride(state, monster);
 
-  if (monster.origin === "base") {
-    state.entityOverrides.set(monster.id, { x: monster.x, y: monster.y, z: monster.z, hp: monster.hp, cd: monster.cd ?? 0 });
+  if (
+    classId === "spitter" &&
+    weaponProfile?.source === "class_native" &&
+    weaponProfile?.flavor === "toxin" &&
+    (weaponProfile?.kind ?? "melee") === "ranged" &&
+    dmg > 0 &&
+    monster.hp > 0
+  ) {
+    const poisonDpt = Math.max(1, Math.round(dmg * 0.1));
+    applyPoisonToMonster(state, monster, poisonDpt, 2, "toxic spit");
   }
-
-  pushLog(state, `You hit the ${monsterDisplayName(monster, p.z)} for ${dmg}${attack.crit ? " (critical)" : ""}.`);
+  const attackVerb = (
+    classId === "spitter" &&
+    weaponProfile?.source === "class_native" &&
+    weaponProfile?.flavor === "toxin" &&
+    (weaponProfile?.kind ?? "melee") === "ranged"
+  )
+    ? "You spit venom at"
+    : "You hit";
+  pushLog(state, `${attackVerb} the ${monsterDisplayName(monster, p.z)} for ${dmg}${attack.crit ? " (critical)" : ""}.`);
   if (classId === "telekinetic" && firstCombatStrike && monster.hp > 0 && tryKnockbackMonster(state, monster, p.x, p.y)) {
     pushLog(state, `Telekinetic force knocks the ${monsterDisplayName(monster, p.z)} back.`);
   }
@@ -9310,48 +9477,7 @@ function playerAttack(state, monster) {
     }
   }
 
-  if (monster.hp <= 0) {
-    pushLog(state, `The ${monsterDisplayName(monster, p.z)} dies.`);
-    if (mSpec?.deathCloudTurns && mSpec?.deathCloudRadius && mSpec?.deathCloudDmg) {
-      spawnPoisonCloudBurst(
-        state,
-        monster.x,
-        monster.y,
-        monster.z ?? p.z,
-        mSpec.deathCloudTurns,
-        mSpec.deathCloudRadius,
-        mSpec.deathCloudDmg,
-        "spores"
-      );
-    }
-
-    grantXP(state, Math.round(xpKillBonus(monster.type, monster.z ?? p.z) * xpMult));
-    markDepthKillForXp(state, monster.z ?? p.z);
-
-    if (monster.origin === "base") {
-      state.removedIds.add(monster.id);
-      state.entityOverrides.delete(monster.id);
-    } else if (monster.origin === "dynamic") {
-      state.dynamic.delete(monster.id);
-    }
-
-    let droppedSpecial = false;
-    if (maybeDropKeyFromMonster(state, monster)) droppedSpecial = true;
-
-    if (monster.type === "skeleton" && Math.random() < 0.24) {
-      const drop = Math.random() < 0.5 ? weaponForDepth(state.player.z, Math.random) : armorForDepth(state.player.z);
-      spawnDynamicItem(state, drop, 1, monster.x, monster.y, monster.z);
-      pushLog(state, `It dropped ${ITEM_TYPES[drop].name}!`);
-      droppedSpecial = true;
-    }
-
-    if (!droppedSpecial && Math.random() < 0.30) {
-      const amt = 2 + Math.floor(Math.random() * (10 + clamp(state.player.z, 0, 20)));
-      spawnDynamicItem(state, "gold", amt, monster.x, monster.y, monster.z);
-    }
-
-    state.entities.delete(monster.id);
-  }
+  if (monster.hp <= 0) handleMonsterDefeat(state, monster, { xpMult });
 }
 
 function markDisengageGraceFromStep(state, fromX, fromY, toX, toY, z) {
@@ -9915,9 +10041,7 @@ function monstersTurn(state) {
       const hpRatio = m.maxHp > 0 ? clamp(m.hp / m.maxHp, 0, 1) : 1;
       m.maxHp = spec.maxHp;
       m.hp = Math.max(0, Math.min(m.maxHp, Math.round(m.maxHp * hpRatio)));
-      if (m.origin === "base") {
-        state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd ?? 0 });
-      }
+      persistMonsterOverride(state, m);
     }
     if ((m.hp ?? 0) <= 0) {
       state.entities.delete(m.id);
@@ -9941,7 +10065,7 @@ function monstersTurn(state) {
     const seesPlayer = hasLineOfSight(state.world, z, m.x, m.y, p.x, p.y);
     const canShoot = !!(spec.range && distMan <= spec.range && distMan >= minRange && !adj && seesPlayer && (m.cd ?? 0) === 0);
     const persistOverride = () => {
-      if (m.origin === "base") state.entityOverrides.set(m.id, { x: m.x, y: m.y, z: m.z, hp: m.hp, cd: m.cd ?? 0 });
+      persistMonsterOverride(state, m);
     };
     const tryMoveTo = (nx, ny) => {
       if (!state.world.isPassable(nx, ny, z)) return false;
@@ -10048,9 +10172,7 @@ function monstersTurn(state) {
           const before = ally.hp ?? 0;
           ally.hp = clamp((ally.hp ?? 0) + heal, 0, ally.maxHp ?? heal);
           didBuff = didBuff || ally.hp > before;
-          if (ally.origin === "base") {
-            state.entityOverrides.set(ally.id, { x: ally.x, y: ally.y, z: ally.z, hp: ally.hp, cd: ally.cd ?? 0 });
-          }
+          persistMonsterOverride(state, ally);
         }
         if (didBuff) pushLog(state, `${monsterDisplayName(m, z)} bolsters nearby undead.`);
         m.abilityCd = 4;
@@ -13483,6 +13605,7 @@ function applyEffectsAfterPlayerAction(state) {
   if (!state.player.dead) {
     applyEffectsTick(state);
     tickPoisonClouds(state);
+    tickMonsterEffects(state);
   }
 }
 
@@ -13768,6 +13891,9 @@ function exportSave(state) {
     const next = { ...(ov ?? {}) };
     next.awake = !!ent.awake;
     if (Number.isFinite(ent.abilityCd)) next.abilityCd = Math.floor(ent.abilityCd);
+    const effects = normalizeMonsterEffects(ent.effects ?? []);
+    if (effects.length > 0) next.effects = effects;
+    else delete next.effects;
     return [id, next];
   });
   const seen = Array.from(state.seen).slice(0, 60000);
@@ -13834,8 +13960,9 @@ function normalizeDynamicEntries(items) {
       const z = Math.floor(Number(raw.z));
       const hp = Math.max(0, Math.floor(Number(raw.hp ?? 0)));
       const maxHp = Math.max(1, Math.floor(Number(raw.maxHp ?? (hp || 1))));
+      const effects = normalizeMonsterEffects(raw.effects ?? []);
       if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-      out.push({
+      const entry = {
         ...raw,
         kind: "monster",
         type,
@@ -13847,7 +13974,10 @@ function normalizeDynamicEntries(items) {
         cd: Math.max(0, Math.floor(Number(raw.cd ?? 0))),
         abilityCd: Math.max(0, Math.floor(Number(raw.abilityCd ?? 0))),
         awake: !!raw.awake,
-      });
+      };
+      if (effects.length > 0) entry.effects = effects;
+      else delete entry.effects;
+      out.push(entry);
       continue;
     }
     const type = normalizeItemType(raw.type);
