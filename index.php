@@ -3478,6 +3478,15 @@ if (!is_string($monsterEditorJson)) {
         font-size: 13px;
         color: #d5dfef;
       }
+      .levelUpPendingDelta {
+        color: #9ee49f;
+        font-weight: 700;
+      }
+      .levelUpSpendControls {
+        display: inline-flex;
+        gap: 6px;
+        justify-content: flex-end;
+      }
       .levelUpSpendBtn {
         min-width: 36px;
         height: 28px;

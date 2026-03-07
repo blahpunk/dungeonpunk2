@@ -1586,7 +1586,7 @@ const characterUi = {
   },
 };
 const infoUi = { open: false };
-const levelUpUi = { open: false };
+const levelUpUi = { open: false, draft: {} };
 const spriteEditorUi = {
   open: false,
   loading: false,
@@ -7410,6 +7410,96 @@ function spendCharacterStatPoint(state, statKey) {
   saveNow(state);
   return true;
 }
+function applyCharacterStatPointAllocations(state, allocations = {}) {
+  if (!state?.player || state.player.dead) return false;
+  const profile = ensureCharacterState(state);
+  if (!profile) return false;
+  const stats = normalizeCharacterStats(profile.stats, profile.speciesId);
+  const unspent = Math.max(0, Math.floor(profile.unspentStatPoints ?? 0));
+  const applied = {};
+  let totalSpent = 0;
+  for (const key of CHARACTER_STAT_KEYS) {
+    const raw = allocations?.[key];
+    const delta = Math.max(0, Math.floor(Number(raw ?? 0)));
+    if (delta <= 0) continue;
+    const cur = Math.max(0, Math.floor(stats[key] ?? 0));
+    const headroom = Math.max(0, CHARACTER_STAT_MAX - cur);
+    const spend = Math.min(delta, headroom);
+    if (spend <= 0) continue;
+    applied[key] = spend;
+    totalSpent += spend;
+  }
+  if (totalSpent <= 0) return true;
+  if (totalSpent > unspent) {
+    pushLog(state, "Not enough attribute points to confirm allocation.");
+    return false;
+  }
+  for (const key of CHARACTER_STAT_KEYS) {
+    const spend = Math.max(0, Math.floor(applied[key] ?? 0));
+    if (spend <= 0) continue;
+    const cur = Math.max(0, Math.floor(stats[key] ?? 0));
+    stats[key] = Math.min(CHARACTER_STAT_MAX, cur + spend);
+  }
+  profile.stats = stats;
+  profile.unspentStatPoints = unspent - totalSpent;
+  touchCharacterProgress(state);
+  recalcDerivedStats(state);
+  renderInventory(state);
+  renderEquipment(state);
+  renderEffects(state);
+  renderCharacterStatsPanel(state);
+  const summaries = CHARACTER_STAT_KEYS
+    .map((key) => {
+      const spend = Math.max(0, Math.floor(applied[key] ?? 0));
+      if (spend <= 0) return "";
+      return `${characterStatLabelShort(key)} +${spend}`;
+    })
+    .filter(Boolean);
+  if (summaries.length > 0) {
+    pushLog(state, `Allocated attribute point${totalSpent === 1 ? "" : "s"}: ${summaries.join(", ")}.`);
+  }
+  saveNow(state);
+  return true;
+}
+function clearLevelUpDraft() {
+  levelUpUi.draft = {};
+}
+function levelUpDraftForKey(key) {
+  return Math.max(0, Math.floor(levelUpUi.draft?.[key] ?? 0));
+}
+function levelUpDraftSpentTotal() {
+  let total = 0;
+  for (const key of CHARACTER_STAT_KEYS) total += levelUpDraftForKey(key);
+  return Math.max(0, Math.floor(total));
+}
+function updateLevelUpDraft(state, statKey, delta) {
+  if (!state?.player || state.player.dead) return false;
+  if (!CHARACTER_STAT_KEYS.includes(statKey)) return false;
+  const profile = ensureCharacterState(state);
+  const stats = normalizeCharacterStats(profile?.stats, profile?.speciesId);
+  const unspent = Math.max(0, Math.floor(profile?.unspentStatPoints ?? 0));
+  const step = Math.trunc(Number(delta));
+  if (!Number.isFinite(step) || step === 0) return false;
+  const currentDraft = levelUpDraftForKey(statKey);
+  if (step > 0) {
+    const remaining = Math.max(0, unspent - levelUpDraftSpentTotal());
+    const baseVal = Math.max(0, Math.floor(stats[statKey] ?? 0));
+    const headroom = Math.max(0, CHARACTER_STAT_MAX - (baseVal + currentDraft));
+    if (remaining <= 0 || headroom <= 0) return false;
+    levelUpUi.draft[statKey] = currentDraft + 1;
+    return true;
+  }
+  if (currentDraft <= 0) return false;
+  levelUpUi.draft[statKey] = currentDraft - 1;
+  if (levelUpUi.draft[statKey] <= 0) delete levelUpUi.draft[statKey];
+  return true;
+}
+function confirmLevelUpDraft(state) {
+  const ok = applyCharacterStatPointAllocations(state, levelUpUi.draft);
+  if (!ok) return false;
+  clearLevelUpDraft();
+  return true;
+}
 function renderCharacterStatsPanel(state) {
   if (!characterStatsPanelEl) return;
   const profile = ensureCharacterState(state);
@@ -8046,6 +8136,17 @@ function respawnEntitiesForArea(state, areaKey, now = Date.now()) {
   if (!cells.length) return false;
   const areaCellKeys = new Set(cells.map((c) => keyXY(c.x, c.y)));
 
+  // Remove any prior respawn wave for this area even if those entities wandered out.
+  // Without this, repeated area respawns can stack roaming monsters over time.
+  const respawnMonsterPrefix = `resp_m|${areaKey}|`;
+  const respawnItemPrefix = `resp_i|${areaKey}|`;
+  for (const ent of Array.from(state.dynamic.values())) {
+    const id = String(ent?.id ?? "");
+    if (!(id.startsWith(respawnMonsterPrefix) || id.startsWith(respawnItemPrefix))) continue;
+    state.dynamic.delete(id);
+    state.entities.delete(id);
+  }
+
   for (const ent of Array.from(state.entities.values())) {
     if (ent.z !== z) continue;
     if (!areaCellKeys.has(keyXY(ent.x, ent.y))) continue;
@@ -8279,6 +8380,7 @@ function drawMinimap(state) {
 
       const mk = monsters.get(keyXYZ(wx, wy, p.z));
       if (mk) {
+        if (!state.visible.has(keyXY(wx, wy))) continue;
         mctx.fillStyle = "#ff6b6b";
         mctx.fillRect(mx * MINI_SCALE, my * MINI_SCALE, MINI_SCALE, MINI_SCALE);
       }
@@ -10964,6 +11066,7 @@ function isLevelUpOverlayOpen() {
 
 function closeLevelUpOverlay() {
   levelUpUi.open = false;
+  clearLevelUpDraft();
   if (!levelUpOverlayEl) return;
   levelUpOverlayEl.classList.remove("show");
   levelUpOverlayEl.setAttribute("aria-hidden", "true");
@@ -10997,18 +11100,27 @@ function renderLevelUpOverlay(state) {
   const profile = ensureCharacterState(state);
   const stats = normalizeCharacterStats(profile?.stats, profile?.speciesId);
   const unspent = Math.max(0, Math.floor(profile?.unspentStatPoints ?? 0));
+  const drafted = levelUpDraftSpentTotal();
+  const remaining = Math.max(0, unspent - drafted);
 
   levelUpStatsListEl.innerHTML = CHARACTER_STAT_KEYS.map((key) => {
-    const val = Math.max(0, Math.floor(stats[key] ?? 0));
-    const canSpend = unspent > 0 && val < CHARACTER_STAT_MAX;
+    const baseVal = Math.max(0, Math.floor(stats[key] ?? 0));
+    const pending = levelUpDraftForKey(key);
+    const val = baseVal + pending;
+    const canSpend = remaining > 0 && val < CHARACTER_STAT_MAX;
+    const canRefund = pending > 0;
+    const pendingText = pending > 0 ? ` <span class="levelUpPendingDelta">(+${pending})</span>` : "";
     return `<div class="levelUpRow">` +
       `<div class="levelUpStatLabel">${characterStatLabelShort(key)}</div>` +
-      `<div class="levelUpStatValue">${val} / ${CHARACTER_STAT_MAX}</div>` +
-      `<button class="levelUpSpendBtn" type="button" data-stat-key="${key}"${canSpend ? "" : " disabled"}>+</button>` +
+      `<div class="levelUpStatValue">${val} / ${CHARACTER_STAT_MAX}${pendingText}</div>` +
+      `<div class="levelUpSpendControls">` +
+        `<button class="levelUpSpendBtn" type="button" data-stat-key="${key}" data-delta="-1"${canRefund ? "" : " disabled"}>-</button>` +
+        `<button class="levelUpSpendBtn" type="button" data-stat-key="${key}" data-delta="1"${canSpend ? "" : " disabled"}>+</button>` +
+      `</div>` +
     `</div>`;
   }).join("");
 
-  levelUpCloseBtnEl.textContent = "Confirm";
+  levelUpCloseBtnEl.textContent = drafted > 0 ? `Confirm (+${drafted})` : "Close";
   levelUpCloseBtnEl.disabled = false;
 }
 
@@ -13892,6 +14004,9 @@ infoOverlayEl?.addEventListener("click", (e) => {
   if (e.target === infoOverlayEl) closeInfoOverlay();
 });
 levelUpCloseBtnEl?.addEventListener("click", () => {
+  if (!game) return;
+  const ok = confirmLevelUpDraft(game);
+  if (!ok) return;
   closeLevelUpOverlay();
 });
 levelUpOverlayEl?.addEventListener("click", (e) => {
@@ -13899,10 +14014,14 @@ levelUpOverlayEl?.addEventListener("click", (e) => {
 });
 levelUpStatsListEl?.addEventListener("click", (e) => {
   if (!game) return;
-  const btn = e.target?.closest?.("button[data-stat-key]");
+  const btn = e.target?.closest?.("button[data-stat-key][data-delta]");
   if (!btn) return;
   const key = String(btn.getAttribute("data-stat-key") ?? "");
-  spendCharacterStatPoint(game, key);
+  const delta = Number(btn.getAttribute("data-delta") ?? "0");
+  if (!Number.isFinite(delta) || delta === 0) return;
+  const changed = updateLevelUpDraft(game, key, delta);
+  if (!changed) return;
+  renderLevelUpOverlay(game);
 });
 spriteEditorCloseBtnEl?.addEventListener("click", () => {
   closeSpriteEditorOverlay();
