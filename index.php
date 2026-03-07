@@ -2234,6 +2234,28 @@ if ($apiMode === 'savegames') {
       'character_states' => character_states_public_meta($characterStates),
     ]);
   }
+  if ($action === 'character_delete') {
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    if ($characterId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character id.'], 400);
+    }
+    if (!isset($characterStates[$characterId])) {
+      json_response(['ok' => false, 'error' => 'Character not found.'], 404);
+    }
+    unset($characterStates[$characterId]);
+    if (!persist_user_character_states($userEmail, $characterStates, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist character state deletion.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'message' => 'Character deleted.',
+      'max_saves' => MAX_SERVER_SAVES,
+      'name_max_len' => SAVE_NAME_MAX_LEN,
+      'characters' => character_entries_public_meta($entries),
+      'character_states' => character_states_public_meta($characterStates),
+      'saves' => save_entries_public_meta($entries),
+    ]);
+  }
   if ($action === 'delete') {
     $targetId = trim((string) ($body['id'] ?? ''));
     if ($targetId === '') {

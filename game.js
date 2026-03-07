@@ -1358,6 +1358,18 @@ function characterStateSlotId(characterId = "") {
   return `${CHARACTER_STATE_SLOT_PREFIX}${id}`;
 }
 
+function normalizeCharacterProfileId(value = "") {
+  const id = String(value ?? "").trim().toLowerCase();
+  return /^[a-z0-9_]{4,80}$/.test(id) ? id : "";
+}
+
+function activeCharacterProfileIdFromCurrentState() {
+  const slotId = String(getActiveCharacterSlotId() ?? "");
+  const fromSlot = normalizeCharacterProfileIdFromSlotId(slotId);
+  if (fromSlot) return fromSlot;
+  return normalizeCharacterProfileId(game?.character?.id ?? "");
+}
+
 // ---------- DOM ----------
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
@@ -1689,6 +1701,7 @@ const saveRuntime = {
   autoTimer: 0,
   saving: false,
   pendingAutosaveReason: "",
+  activeRunSaveId: "",
 };
 const characterSyncRuntime = {
   dirty: false,
@@ -5580,8 +5593,7 @@ async function autosaveIfDirty(reason = "") {
   saveRuntime.saving = true;
   try {
     if (isAuthenticatedUser) {
-      const activeIdRaw = String(getActiveCharacterSlotId() ?? "");
-      const overwriteId = (activeIdRaw && !isCharacterStateSlotId(activeIdRaw)) ? activeIdRaw : "";
+      const overwriteId = String(saveRuntime.activeRunSaveId ?? "").trim();
       const ok = await saveCurrentGameToServer(overwriteId, { autosave: true });
       if (ok) {
         saveResumeSnapshot(game);
@@ -5810,6 +5822,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
       updateContextActionButton(game);
       updateDeathOverlay(game);
       setActiveCharacterSlotId(id);
+      saveRuntime.activeRunSaveId = "";
       refreshSaveNameFromLive(true);
       saveNow(game);
       clearSaveDirty();
@@ -5819,7 +5832,6 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
     }
     const loaded = await loadSaveFromServer(id, { showStatus: false, closeOverlay: false, forceEntrance });
     if (!loaded) return false;
-    setActiveCharacterSlotId(id);
     clearSaveDirty();
     markCharacterStateDirty(game, "load-run");
     void syncCharacterStateIfDirty("load-run");
@@ -5896,7 +5908,12 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId) {
   }
   if (!snapshot) return false;
   if (!applyCharacterSnapshot(game, snapshot)) return false;
-  setActiveCharacterSlotId(id);
+  if (isAuthenticatedUser) {
+    const nextSlotId = characterStateSlotId(loadedCharacterId);
+    setActiveCharacterSlotId(nextSlotId || id);
+  } else {
+    setActiveCharacterSlotId(id);
+  }
   refreshSaveNameFromLive(true);
   saveNow(game);
   clearSaveDirty();
@@ -5944,8 +5961,8 @@ function renderSaveGameOverlay() {
   saveGameTitleEl.textContent = mode === "save" ? "Save Game" : "Load Game";
   saveGameModeEl.textContent =
     mode === "save"
-      ? `Store this character + current dungeon state on the server. You can keep up to ${saveSlotMax} character slots.`
-      : `Load one of your server character slots (${saves.length}/${saveSlotMax} used).`;
+      ? `Store current dungeon state on the server. You can keep up to ${saveSlotMax} save slots.`
+      : `Load one of your server dungeon saves (${saves.length}/${saveSlotMax} used).`;
   saveGameNameRowEl.style.display = mode === "save" ? "grid" : "none";
   if (saveGameCreateBtnEl) {
     saveGameCreateBtnEl.disabled = saveMenuUi.loading || (mode === "save" && full);
@@ -6008,7 +6025,7 @@ function renderSaveGameOverlay() {
     deleteBtn.disabled = saveMenuUi.loading;
     deleteBtn.addEventListener("click", () => {
       if (!confirm(`Delete save-game run "${save.name ?? "this save"}"? Character will be kept.`)) return;
-      void deleteServerSave(save.id, save.name ?? "");
+      void deleteServerSave(save.id);
     });
     actions.appendChild(deleteBtn);
 
@@ -6048,49 +6065,22 @@ async function openSaveGameOverlay(mode = "load") {
   return true;
 }
 
-async function resetServerSaveRun(saveId, nameHint = "") {
-  if (!isAuthenticatedUser || !saveId) return null;
-  const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
-  const payload = String(detail?.save?.payload ?? "");
-  let carryover = null;
-  const loaded = importSave(payload);
-  if (loaded) {
-    carryover = buildCharacterCarryoverSnapshot(loaded);
-  } else {
-    const summary = parseCharacterSummaryPayload(payload);
-    const profile = normalizeCharacterProfile(
-      summary?.profile ?? { name: String(nameHint || detail?.save?.name || DEFAULT_CHARACTER_NAME) }
-    );
-    const level = Math.max(1, Math.floor(summary?.level ?? 1));
-    const starter = starterCarryoverForClass(profile.classId);
-    carryover = {
-      character: profile,
-      level,
-      xp: 0,
-      gold: starter.gold ?? 0,
-      inv: starter.inv ?? [],
-      equip: starter.equip ?? { weapon: null, head: null, chest: null, legs: null },
-      maxHp: maxHpForLevel(level, profile),
-    };
-  }
-  const resetRun = makeNewGame(randomSeedString(), carryover ? { carryover } : undefined);
-  const preferredName = String(nameHint || detail?.save?.name || "").trim().slice(0, saveNameMaxLen);
-  return saveStateToServerSlot(resetRun, String(saveId), preferredName);
-}
-
-async function deleteServerSave(saveId, nameHint = "") {
+async function deleteServerSave(saveId) {
   if (!isAuthenticatedUser || !saveId) return false;
   saveMenuUi.loading = true;
   renderSaveGameOverlay();
-  setSaveGameStatus("Resetting run at dungeon entrance...", false);
+  setSaveGameStatus("Deleting save...", false);
   try {
-    const data = await resetServerSaveRun(saveId, nameHint);
+    const data = await saveApiRequest("POST", { action: "delete", id: saveId });
     saveMenuUi.saves = Array.isArray(data.saves) ? data.saves : [];
-    setSaveGameStatus("Run reset. Character preserved.", false);
+    if (String(saveRuntime.activeRunSaveId ?? "") === String(saveId)) {
+      saveRuntime.activeRunSaveId = "";
+    }
+    setSaveGameStatus("Save deleted.", false);
     renderSaveGameOverlay();
     return true;
   } catch (err) {
-    setSaveGameStatus(err?.message ?? "Could not reset this run.", true);
+    setSaveGameStatus(err?.message ?? "Delete failed.", true);
     renderSaveGameOverlay();
     return false;
   } finally {
@@ -6109,6 +6099,7 @@ async function loadSaveFromServer(saveId, options = null) {
   renderSaveGameOverlay();
   if (showStatus) setSaveGameStatus("Loading save...", false);
   try {
+    const activeCharacterId = activeCharacterProfileIdFromCurrentState();
     const data = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
     const payload = String(data?.save?.payload ?? "");
     const loaded = importSave(payload);
@@ -6116,9 +6107,9 @@ async function loadSaveFromServer(saveId, options = null) {
       throw new Error("Save payload is invalid.");
     }
     game = loaded;
-    const loadedCharacterId = String(loaded?.character?.id ?? "").trim();
-    if (loadedCharacterId) {
-      const latestSnapshot = await resolveLatestCharacterSnapshot(loadedCharacterId);
+    const targetCharacterId = activeCharacterId || normalizeCharacterProfileId(loaded?.character?.id ?? "");
+    if (targetCharacterId) {
+      const latestSnapshot = await resolveLatestCharacterSnapshot(targetCharacterId);
       if (latestSnapshot) applyCharacterSnapshot(game, latestSnapshot);
     }
     if (forceEntrance) {
@@ -6130,7 +6121,9 @@ async function loadSaveFromServer(saveId, options = null) {
     setDebugMenuOpen(false);
     updateContextActionButton(game);
     updateDeathOverlay(game);
-    setActiveCharacterSlotId(String(saveId));
+    saveRuntime.activeRunSaveId = String(saveId);
+    const activeCharacterSlotId = characterStateSlotId(targetCharacterId);
+    if (activeCharacterSlotId) setActiveCharacterSlotId(activeCharacterSlotId);
     saveNow(game);
     clearSaveDirty();
     markCharacterStateDirty(game, "load-run");
@@ -6176,7 +6169,7 @@ async function saveCurrentGameToServer(overwriteId = "", options = null) {
       depth,
     });
     saveMenuUi.saves = Array.isArray(data.saves) ? data.saves : [];
-    if (data?.save?.id) setActiveCharacterSlotId(String(data.save.id));
+    if (data?.save?.id) saveRuntime.activeRunSaveId = String(data.save.id);
     saveResumeSnapshot(game);
     clearSaveDirty();
     refreshSaveNameFromLive(true);
@@ -6326,85 +6319,69 @@ async function fetchCharacterSlotsFromServer() {
   const base = await saveApiRequest("GET");
   const characters = Array.isArray(base?.characters) ? base.characters : [];
   const characterStates = Array.isArray(base?.character_states) ? base.character_states : [];
-  const saves = Array.isArray(base?.saves) ? base.saves : [];
   const out = [];
-  if (characters.length) {
-    for (const entry of characters) {
-      const saveId = String(entry?.latest_save_id ?? "").trim();
-      if (!saveId) continue;
+  const knownCharacterIds = new Set();
+  if (characterStates.length) {
+    for (const stateMeta of characterStates) {
+      const characterId = normalizeCharacterProfileId(stateMeta?.id ?? "");
+      if (!characterId || knownCharacterIds.has(characterId)) continue;
+      const slotId = characterStateSlotId(characterId);
+      if (!slotId) continue;
       const profileFallback = normalizeCharacterProfile({
-        id: String(entry?.character_id ?? ""),
+        id: characterId,
+        name: String(stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
+      });
+      const snapshot = await resolveCharacterSnapshotFromServerState(characterId);
+      const slot = {
+        id: slotId,
+        name: String(stateMeta?.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
+        updatedAt: String(stateMeta?.updated_at ?? ""),
+        level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
+        depth: 0,
+        profile: snapshot?.character ? normalizeCharacterProfile(snapshot.character) : profileFallback,
+        deepestDepth: Math.max(
+          0,
+          Math.floor(snapshot?.character?.deepestDepth ?? profileFallback.deepestDepth ?? 0)
+        ),
+      };
+      out.push(slot);
+      knownCharacterIds.add(characterId);
+    }
+  } else {
+    for (const entry of characters) {
+      const characterId = normalizeCharacterProfileId(entry?.character_id ?? "");
+      if (!characterId || knownCharacterIds.has(characterId)) continue;
+      const slotId = characterStateSlotId(characterId);
+      if (!slotId) continue;
+      const profileFallback = normalizeCharacterProfile({
+        id: characterId,
         name: String(entry?.character_name ?? DEFAULT_CHARACTER_NAME),
       });
       const slot = {
-        id: saveId,
-        name: String(entry?.character_name ?? profileFallback.name ?? "(unnamed save)"),
+        id: slotId,
+        name: String(entry?.character_name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
         updatedAt: String(entry?.updated_at ?? ""),
         level: Math.max(1, Math.floor(entry?.level ?? 1)),
         depth: Math.trunc(entry?.depth ?? 0),
         profile: profileFallback,
         deepestDepth: Math.max(0, Math.trunc(entry?.depth ?? 0)),
       };
-      try {
-        const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
-        const summary = parseCharacterSummaryPayload(detail?.save?.payload ?? "");
-        if (summary) {
-          slot.profile = summary.profile;
-          slot.level = summary.level;
-          slot.depth = summary.depth;
-          slot.deepestDepth = summary.deepestDepth;
-        }
-      } catch {
-        // Keep fallback metadata from list endpoint.
+      const saveId = String(entry?.latest_save_id ?? "").trim();
+      if (saveId) {
+        try {
+          const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
+          const summary = parseCharacterSummaryPayload(detail?.save?.payload ?? "");
+          if (summary) {
+            slot.profile = summary.profile;
+            slot.level = summary.level;
+            slot.depth = summary.depth;
+            slot.deepestDepth = summary.deepestDepth;
+          }
+        } catch {}
       }
       out.push(slot);
+      knownCharacterIds.add(characterId);
     }
-  } else if (saves.length) {
-    const byCharacterId = new Map();
-    for (const save of saves) {
-      const slot = {
-        id: String(save.id ?? ""),
-        name: String(save.name ?? "(unnamed save)"),
-        updatedAt: String(save.updated_at ?? ""),
-        level: Math.max(1, Math.floor(save.level ?? 1)),
-        depth: Math.trunc(save.depth ?? 0),
-        profile: normalizeCharacterProfile({
-          id: String(save.character_id ?? "") || `save_${String(save.id ?? "")}`,
-          name: String(save.character_name ?? save.name ?? DEFAULT_CHARACTER_NAME),
-        }),
-        deepestDepth: Math.max(0, Math.trunc(save.depth ?? 0)),
-      };
-      const characterKey = String(slot.profile?.id ?? "").trim() || `save:${slot.id}`;
-      const prev = byCharacterId.get(characterKey) ?? null;
-      byCharacterId.set(characterKey, chooseNewerCharacterSaveEntry(prev, slot));
-    }
-    out.push(...Array.from(byCharacterId.values()).filter(Boolean));
-  }
-  const knownCharacterIds = new Set(out.map((slot) => String(slot?.profile?.id ?? "").trim()).filter(Boolean));
-  for (const stateMeta of characterStates) {
-    const characterId = String(stateMeta?.id ?? "").trim();
-    if (!characterId || knownCharacterIds.has(characterId)) continue;
-    const stateSlotId = characterStateSlotId(characterId);
-    if (!stateSlotId) continue;
-    const profileFallback = normalizeCharacterProfile({
-      id: characterId,
-      name: String(stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
-    });
-    const snapshot = await resolveCharacterSnapshotFromServerState(characterId);
-    const slot = {
-      id: stateSlotId,
-      name: String(stateMeta?.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
-      updatedAt: String(stateMeta?.updated_at ?? ""),
-      level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
-      depth: 0,
-      profile: snapshot?.character ? normalizeCharacterProfile(snapshot.character) : profileFallback,
-      deepestDepth: Math.max(
-        0,
-        Math.floor(snapshot?.character?.deepestDepth ?? profileFallback.deepestDepth ?? 0)
-      ),
-    };
-    out.push(slot);
-    knownCharacterIds.add(characterId);
   }
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   return out;
@@ -6600,9 +6577,8 @@ function renderCharacterSelectBody() {
   characterOverlaySecondaryEl.textContent = "Start New Run";
   characterOverlaySecondaryEl.disabled = characterUi.loading || slots.length >= slotCap;
   characterOverlaySecondaryEl.style.display = "";
-  const selectedIsCharacterStateOnly = isCharacterStateSlotId(characterUi.selectedSaveId);
   characterOverlayTertiaryEl.textContent = "Delete Selected";
-  characterOverlayTertiaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId || selectedIsCharacterStateOnly;
+  characterOverlayTertiaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId;
   characterOverlayTertiaryEl.style.display = "";
 }
 function renderCharacterCreateBody() {
@@ -7028,11 +7004,6 @@ async function handleCharacterOverlayTertiary() {
   if (characterUi.loading || characterUi.mode !== "select") return;
   const selectedId = characterUi.selectedSaveId;
   if (!selectedId) return;
-  if (isAuthenticatedUser && isCharacterStateSlotId(selectedId)) {
-    setCharacterOverlayStatus("This character has no dungeon save row to delete.", true);
-    renderCharacterOverlay();
-    return;
-  }
   const slot = characterUi.slots.find((s) => s.id === selectedId);
   if (!slot) return;
   if (!confirm(`Delete character slot "${slot.profile?.name ?? slot.name}"?`)) return;
@@ -7040,15 +7011,32 @@ async function handleCharacterOverlayTertiary() {
   characterUi.loading = true;
   renderCharacterOverlay();
   try {
+    let deletedActiveCharacter = false;
     if (isAuthenticatedUser) {
-      await saveApiRequest("POST", { action: "delete", id: selectedId });
+      const characterId = normalizeCharacterProfileId(
+        normalizeCharacterProfileIdFromSlotId(selectedId) || slot.profile?.id || ""
+      );
+      if (!characterId) throw new Error("Could not resolve character id to delete.");
+      await saveApiRequest("POST", { action: "character_delete", character_id: characterId });
+      if (normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId()) === characterId) {
+        deletedActiveCharacter = true;
+        setActiveCharacterSlotId("");
+      }
       characterUi.slots = await fetchCharacterSlotsFromServer();
     } else {
       removeLocalSlot(selectedId);
+      const localCharacterId = normalizeCharacterProfileId(slot.profile?.id ?? "");
+      if (localCharacterId) {
+        try { localStorage.removeItem(characterStatePayloadKey(localCharacterId)); } catch {}
+      }
       characterUi.slots = await fetchCharacterSlotsFromLocal();
     }
     characterUi.selectedSaveId = characterUi.slots[0]?.id ?? "";
-    if (characterUi.activeSaveId === selectedId) setActiveCharacterSlotId(characterUi.selectedSaveId);
+    if (deletedActiveCharacter && characterUi.selectedSaveId) {
+      setActiveCharacterSlotId(characterUi.selectedSaveId);
+    } else if (characterUi.activeSaveId === selectedId) {
+      setActiveCharacterSlotId(characterUi.selectedSaveId);
+    }
     if (!characterUi.slots.length) {
       setActiveCharacterSlotId("");
       requiresCharacterCreation = true;
