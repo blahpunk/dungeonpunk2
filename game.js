@@ -257,6 +257,10 @@ const MONSTER_MIN_HP_FLOOR_START_DEPTH = 3;
 const MONSTER_MIN_HP_FLOOR_BASE = 40;
 const MONSTER_MIN_HP_FLOOR_PER_DEPTH = 10;
 const BASE_POTION_CAPACITY = 5;
+const TRAP_TYPE_PRESSURE = "pressure_floor";
+const TRAP_REVEALED_SPRITE_ID = "trap_pressure_revealed";
+const TRAP_DETECTION_CHANCE_MIN = 0.03;
+const TRAP_DETECTION_CHANCE_MAX = 0.92;
 const DEFAULT_CHARACTER_STATS = { vit: 2, str: 3, dex: 2, int: 1, agi: 2 };
 const CHARACTER_CREATION_DRAFT_STATS = { vit: 0, str: 0, dex: 0, int: 0, agi: 0 };
 const CHARACTER_CREATE_STEPS = ["welcome", "species", "class", "stats", "name"];
@@ -290,6 +294,7 @@ const SPECIES_DEFS = {
     evaFlat: 0,
     speedMult: 1,
     lowHpDamageMult: 1,
+    poisonImmune: true,
     healMult: 0.9,
     xpGainMult: 1,
     energyFlat: 0,
@@ -306,6 +311,7 @@ const SPECIES_DEFS = {
     accFlat: 0,
     evaFlat: 10,
     speedMult: 1,
+    fearImmune: true,
     lowHpDamageMult: 1,
     healMult: 1,
     xpGainMult: 1,
@@ -323,6 +329,7 @@ const SPECIES_DEFS = {
     accFlat: 0,
     evaFlat: 8,
     speedMult: 1.05,
+    trapDetectRadiusMult: 1.1,
     lowHpDamageMult: 1,
     healMult: 1,
     xpGainMult: 1,
@@ -357,6 +364,7 @@ const SPECIES_DEFS = {
     accFlat: 0,
     evaFlat: 0,
     speedMult: 1.06,
+    fireResistMult: 0.9,
     lowHpDamageMult: 1,
     healMult: 1,
     xpGainMult: 1,
@@ -634,6 +642,8 @@ const CLASS_DEFS = {
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0,
     healMult: 1.25,
+    consumableSlotBonus: 1,
+    repairKitHealMult: 1.25,
     potionCapBonus: 1,
     energyFlat: 0,
     energyMult: 1,
@@ -784,6 +794,7 @@ const CLASS_DEFS = {
     speedMult: 1,
     critFlat: 0,
     firstStrikeMoveMult: 1,
+    abilityCostMult: 0.9,
     rangedDefIgnorePct: 0,
     healMult: 1,
     potionCapBonus: 0,
@@ -884,6 +895,7 @@ const CLASS_DEFS = {
     accFlat: 0,
     evaFlat: 0,
     speedMult: 1,
+    knockbackResistPct: 0.5,
     critFlat: 0,
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0,
@@ -935,6 +947,7 @@ const CLASS_DEFS = {
     evaFlat: 0,
     speedMult: 1,
     critFlat: 0,
+    salvageChanceBonus: 1,
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0,
     healMult: 1,
@@ -956,6 +969,8 @@ const CLASS_DEFS = {
     armorEffect: 1.05,
     weaponDamageMult: 1,
     damageMult: 1.04,
+    trapDamageMult: 1.2,
+    ignoreOwnTraps: true,
     accFlat: 0,
     evaFlat: 0,
     speedMult: 1,
@@ -1036,6 +1051,7 @@ const CLASS_DEFS = {
     accFlat: 12,
     evaFlat: 0,
     speedMult: 1,
+    rareLootChanceBonus: 0.05,
     critFlat: 0,
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0,
@@ -1061,6 +1077,7 @@ const CLASS_DEFS = {
     accFlat: 0,
     evaFlat: 0,
     speedMult: 1,
+    abilityRangeMult: 1.1,
     critFlat: 0,
     firstStrikeMoveMult: 1.12,
     rangedDefIgnorePct: 0,
@@ -1084,6 +1101,7 @@ const CLASS_DEFS = {
     weaponDamageMult: 1,
     damageMult: 1,
     accFlat: 5,
+    allyAccAura: 5,
     evaFlat: 0,
     speedMult: 1,
     critFlat: 0,
@@ -1111,6 +1129,7 @@ const CLASS_DEFS = {
     accFlat: 0,
     evaFlat: 0,
     speedMult: 1,
+    floorMilestoneBuffEnabled: true,
     critFlat: 0,
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0,
@@ -1163,6 +1182,14 @@ const CLASS_DEFS = {
     accFlat: 10,
     evaFlat: 0,
     speedMult: 1,
+    rangedPoisonOnHit: {
+      chance: 1,
+      dmgPct: 0.10,
+      turns: 2,
+      sourceLabel: "toxic spit",
+      nativeOnly: true,
+      requiredFlavor: "toxin",
+    },
     critFlat: 0,
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0.1,
@@ -1263,6 +1290,14 @@ const CLASS_DEFS = {
     accFlat: 0,
     evaFlat: 0,
     speedMult: 1,
+    meleePoisonOnHit: {
+      chance: 1,
+      dmgPct: 0.08,
+      turns: 2,
+      sourceLabel: "venom strike",
+      stack: true,
+      maxStacks: 4,
+    },
     critFlat: 5,
     firstStrikeMoveMult: 1,
     rangedDefIgnorePct: 0,
@@ -1641,7 +1676,7 @@ let hydrationStateRef = null;
 let hydrationSig = "";
 let occupancyStateRef = null;
 let occupancySig = "";
-let occupancyCache = { monsters: new Map(), items: new Map() };
+let occupancyCache = { monsters: new Map(), items: new Map(), traps: new Map() };
 
 function maybeAdjustVisualQuality(frameMs) {
   if (!Number.isFinite(frameMs) || frameMs <= 0) return;
@@ -4820,13 +4855,14 @@ function samplePassableCellsInChunk(grid, rng, count) {
 
 function chunkBaseSpawns(worldSeed, chunk) {
   const { z, cx, cy, grid, specials, lockedDoorRewards = [] } = chunk;
-  if (z === SURFACE_LEVEL || chunk.surface) return { monsters: [], items: [] };
+  if (z === SURFACE_LEVEL || chunk.surface) return { monsters: [], items: [], traps: [] };
   const rng = makeRng(`${worldSeed}|spawns|z${z}|${cx},${cy}`);
   const isOpenCell = (x, y) => {
     const t = grid[y]?.[x];
     return t === FLOOR || isOpenDoorTile(t) || t === STAIRS_DOWN || t === STAIRS_UP;
   };
   const occupiedItemCells = new Set();
+  const occupiedMonsterCells = new Set();
   const cellKey = (x, y) => `${x},${y}`;
 
   const depthBoost = clamp(z, 0, 60);
@@ -4839,8 +4875,15 @@ function chunkBaseSpawns(worldSeed, chunk) {
 
   // Higher baseline item density for a richer dungeon.
   const itemCount = clamp(randInt(rng, 2, 6) + (rng() < 0.30 ? 1 : 0), 0, 9);
+  const trapCount = clamp(
+    randInt(rng, 0, 1) +
+      (rng() < clamp(0.18 + z * 0.012, 0.18, 0.46) ? 1 : 0) +
+      (rng() < clamp((z - 6) * 0.01, 0, 0.22) ? 1 : 0),
+    0,
+    3
+  );
 
-  const cells = samplePassableCellsInChunk(grid, rng, monsterCount + itemCount + 18);
+  const cells = samplePassableCellsInChunk(grid, rng, monsterCount + itemCount + trapCount + 24);
   const monsters = [];
   const mTable = monsterTableForDepth(z);
 
@@ -4850,6 +4893,7 @@ function chunkBaseSpawns(worldSeed, chunk) {
     const type = weightedChoice(rng, mTable);
     const id = `m|${z}|${cx},${cy}|${i}`;
     monsters.push({ id, type, lx: c.x, ly: c.y });
+    occupiedMonsterCells.add(cellKey(c.x, c.y));
   }
 
   const items = [];
@@ -4995,7 +5039,43 @@ function chunkBaseSpawns(worldSeed, chunk) {
     });
   }
 
-  return { monsters, items };
+  const traps = [];
+  const trapCellUsed = new Set();
+  const isTrapCellCandidate = (x, y) => {
+    const t = grid[y]?.[x];
+    if (t !== FLOOR) return false;
+    const ck = cellKey(x, y);
+    if (occupiedItemCells.has(ck)) return false;
+    if (occupiedMonsterCells.has(ck)) return false;
+    if (trapCellUsed.has(ck)) return false;
+    return true;
+  };
+  const trapStartIdx = monsterCount + itemCount + 4;
+  for (let i = 0; i < trapCount; i++) {
+    let c = cells[trapStartIdx + i];
+    if (!c || !isTrapCellCandidate(c.x, c.y)) {
+      c = null;
+      for (let attempts = 0; attempts < 48; attempts++) {
+        const x = randInt(rng, 1, CHUNK - 2);
+        const y = randInt(rng, 1, CHUNK - 2);
+        if (!isTrapCellCandidate(x, y)) continue;
+        c = { x, y };
+        break;
+      }
+    }
+    if (!c) continue;
+    const ck = cellKey(c.x, c.y);
+    trapCellUsed.add(ck);
+    traps.push({
+      id: `t|${z}|${cx},${cy}|${i}`,
+      type: TRAP_TYPE_PRESSURE,
+      depth: z,
+      lx: c.x,
+      ly: c.y,
+    });
+  }
+
+  return { monsters, items, traps };
 }
 
 // ---------- Game state ----------
@@ -6730,6 +6810,14 @@ function stairContextLabel(state, dir) {
 function resolveContextAction(state, occupancy = null) {
   const p = state.player;
   if (p.dead) return null;
+  const trapHere = getTrapAt(state, p.x, p.y, p.z, { requireArmed: true, requireRevealed: true });
+  if (trapHere) {
+    return {
+      type: "disarm-trap",
+      label: "Disarm Trap",
+      run: () => disarmTrapAtPlayer(state),
+    };
+  }
 
   const occ = occupancy ?? buildOccupancy(state);
   if (shouldShowPotionContext(state)) {
@@ -6944,6 +7032,7 @@ function iconSpecForContextAction(state, action) {
   if (action.type === "pickup") {
     return iconSpecForItemType(action.pickupType ?? null);
   }
+  if (action.type === "disarm-trap") return { glyph: "X", color: "#ffb26b" };
   if (action.type === "shop") return iconSpecForItemType("shopkeeper");
   if (action.type === "shrine") return iconSpecForItemType("shrine");
   if (action.type === "open-door") {
@@ -7551,6 +7640,21 @@ function recalcDerivedStats(state) {
   p.lowHpDamageMult = species.lowHpDamageMult ?? 1;
   p.firstStrikeMoveMult = classDef.firstStrikeMoveMult ?? 1;
   p.rangedDefIgnorePct = clamp(classDef.rangedDefIgnorePct ?? 0, 0, 0.75);
+  p.poisonImmune = !!(species.poisonImmune || classDef.poisonImmune);
+  p.fearImmune = !!(species.fearImmune || classDef.fearImmune);
+  p.knockbackResistPct = clamp(Number(classDef.knockbackResistPct ?? 0), 0, 1);
+  p.trapDetectRadiusMult = Math.max(0.1, Number(species.trapDetectRadiusMult ?? classDef.trapDetectRadiusMult ?? 1));
+  p.fireResistMult = Math.max(0, Number(species.fireResistMult ?? classDef.fireResistMult ?? 1));
+  p.abilityCostMult = Math.max(0.1, Number(classDef.abilityCostMult ?? 1));
+  p.abilityRangeMult = Math.max(0.1, Number(classDef.abilityRangeMult ?? 1));
+  p.rareLootChanceBonus = Math.max(0, Number(classDef.rareLootChanceBonus ?? 0));
+  p.salvageChanceBonus = Math.max(0, Number(classDef.salvageChanceBonus ?? 0));
+  p.consumableSlotBonus = Math.max(0, Math.floor(Number(classDef.consumableSlotBonus ?? 0)));
+  p.repairKitHealMult = Math.max(0.1, Number(classDef.repairKitHealMult ?? 1));
+  p.allyAccAura = Math.max(0, Math.floor(Number(classDef.allyAccAura ?? 0)));
+  p.floorMilestoneBuffEnabled = !!classDef.floorMilestoneBuffEnabled;
+  p.trapDamageMult = Math.max(0, Number(classDef.trapDamageMult ?? 1));
+  p.ignoreOwnTraps = !!classDef.ignoreOwnTraps;
   p.potionCapacity = potionCapacityForState(state);
   if (typeof p.combatFirstStrikeReady !== "boolean") p.combatFirstStrikeReady = true;
   if (typeof p.slipbladeBonusReady !== "boolean") p.slipbladeBonusReady = false;
@@ -8139,6 +8243,28 @@ function hydrateChunkEntities(state, z, cx, cy) {
     });
   }
 
+  for (const trap of base.traps ?? []) {
+    if (state.removedIds.has(trap.id)) continue;
+    if (state.entities.has(trap.id)) continue;
+    const wx = cx * CHUNK + trap.lx;
+    const wy = cy * CHUNK + trap.ly;
+    const ov = state.entityOverrides.get(trap.id);
+    state.entities.set(trap.id, {
+      id: trap.id,
+      origin: "base",
+      kind: "trap",
+      trapType: trap.type ?? TRAP_TYPE_PRESSURE,
+      x: Math.floor(ov?.x ?? wx),
+      y: Math.floor(ov?.y ?? wy),
+      z: Math.floor(ov?.z ?? z),
+      depth: Math.max(0, Math.floor(ov?.depth ?? trap.depth ?? z)),
+      armed: ov?.armed !== false,
+      detected: !!ov?.detected,
+      triggered: !!ov?.triggered,
+      disarmed: !!ov?.disarmed,
+    });
+  }
+
   if (z === SURFACE_LEVEL && cx === 0 && cy === 0) {
     // Keep the surface dungeon entrance fixed at center.
     state.world.setTile(0, 0, z, STAIRS_DOWN);
@@ -8188,20 +8314,22 @@ function hydrateNearby(state) {
 function buildOccupancy(state) {
   const monsters = new Map();
   const items = new Map();
+  const traps = new Map();
   const pz = state.player.z;
   for (const e of state.entities.values()) {
     if (e.z !== pz) continue;
     const k = keyXYZ(e.x, e.y, e.z);
     if (e.kind === "monster") monsters.set(k, e.id);
     else if (e.kind === "item") items.set(k, e.id);
+    else if (e.kind === "trap") traps.set(k, e.id);
   }
-  return { monsters, items };
+  return { monsters, items, traps };
 }
 function getCachedOccupancy(state) {
   if (occupancyStateRef !== state) {
     occupancyStateRef = state;
     occupancySig = "";
-    occupancyCache = { monsters: new Map(), items: new Map() };
+    occupancyCache = { monsters: new Map(), items: new Map(), traps: new Map() };
   }
   const sig = `${state.turn ?? 0}|${state.player.z}|${state.entities.size}`;
   if (sig !== occupancySig) {
@@ -8243,6 +8371,128 @@ function findItemAtByType(state, x, y, z, type) {
     if (e.x === x && e.y === y) return e;
   }
   return null;
+}
+function getTrapAt(state, x, y, z, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  for (const e of state.entities.values()) {
+    if (e.kind !== "trap") continue;
+    if (e.z !== z) continue;
+    if (e.x !== x || e.y !== y) continue;
+    if (opts.requireArmed && !e.armed) continue;
+    if (opts.requireRevealed && !(e.detected || e.triggered)) continue;
+    return e;
+  }
+  return null;
+}
+function persistTrapOverride(state, trap) {
+  if (!state || !trap || trap.origin !== "base") return;
+  state.entityOverrides.set(trap.id, {
+    x: Math.floor(trap.x ?? 0),
+    y: Math.floor(trap.y ?? 0),
+    z: Math.floor(trap.z ?? 0),
+    depth: Math.max(0, Math.floor(trap.depth ?? trap.z ?? 0)),
+    armed: !!trap.armed,
+    detected: !!trap.detected,
+    triggered: !!trap.triggered,
+    disarmed: !!trap.disarmed,
+  });
+}
+function trapDepth(trap, state) {
+  return Math.max(0, Math.floor(trap?.depth ?? trap?.z ?? state?.player?.z ?? 0));
+}
+function playerTrapDetectionScore(state) {
+  const profile = ensureCharacterState(state);
+  const stats = normalizeCharacterStats(profile?.stats, profile?.speciesId);
+  const dex = Math.max(0, Math.floor(stats.dex ?? 0));
+  const int = Math.max(0, Math.floor(stats.int ?? 0));
+  const level = Math.max(1, Math.floor(state?.player?.level ?? 1));
+  const accBonus = Math.max(0, ((state?.player?.acc ?? 70) - 70) * 0.08);
+  return 10 + level * 1.8 + dex * 2.6 + int * 1.9 + accBonus;
+}
+function trapDetectionRadius(state) {
+  const mult = Math.max(0.5, Number(state?.player?.trapDetectRadiusMult ?? 1));
+  return Math.max(1, Math.floor(1 + Math.max(0, mult - 1) * 10));
+}
+function trapDetectionChance(state, trap, dist) {
+  const score = playerTrapDetectionScore(state);
+  const difficulty = 14 + trapDepth(trap, state) * 2.8;
+  let chance = 0.05 + (score - difficulty) * 0.045;
+  if (dist <= 0) chance += 0.20;
+  else if (dist === 1) chance += 0.08;
+  return clamp(chance, TRAP_DETECTION_CHANCE_MIN, TRAP_DETECTION_CHANCE_MAX);
+}
+function revealNearbyTrapsBySkill(state) {
+  const p = state.player;
+  const radius = trapDetectionRadius(state);
+  let detectedCount = 0;
+  for (const trap of state.entities.values()) {
+    if (trap.kind !== "trap") continue;
+    if (trap.z !== p.z) continue;
+    if (!trap.armed || trap.detected || trap.disarmed) continue;
+    const dist = Math.abs((trap.x ?? 0) - p.x) + Math.abs((trap.y ?? 0) - p.y);
+    if (dist > radius) continue;
+    if (dist > 0 && !hasLineOfSight(state.world, p.z, p.x, p.y, trap.x, trap.y)) continue;
+    if (Math.random() > trapDetectionChance(state, trap, dist)) continue;
+    trap.detected = true;
+    persistTrapOverride(state, trap);
+    detectedCount += 1;
+  }
+  if (detectedCount > 0) pushLog(state, detectedCount === 1 ? "You detect a hidden pressure trap." : `You detect ${detectedCount} hidden pressure traps.`);
+  return detectedCount;
+}
+function trapPressureRawDamage(depth) {
+  const legacyDamage = 7 + depth * 2.2;
+  return Math.max(1, Math.round(legacyDamage * COMBAT_SCALE));
+}
+function triggerPressureTrap(state, trap) {
+  const p = state?.player;
+  if (!p || p.dead || !trap || trap.kind !== "trap" || !trap.armed) return false;
+  const depth = trapDepth(trap, state);
+  trap.detected = true;
+  trap.triggered = true;
+  trap.armed = false;
+  persistTrapOverride(state, trap);
+  if (stateDebug(state).godmode) {
+    pushLog(state, "A pressure trap triggers, but godmode negates the blast.");
+    return true;
+  }
+  const reduced = reduceIncomingDamage(state, trapPressureRawDamage(depth), depth);
+  const dmg = Math.max(1, Math.floor(reduced?.dmg ?? 1));
+  p.hp = Math.max(0, p.hp - dmg);
+  pushLog(state, `A hidden pressure trap triggers for ${dmg} damage.`);
+  if (p.hp <= 0 && !p.dead) killPlayer(state);
+  return true;
+}
+function trapDisarmXp(depth) {
+  return Math.max(1, Math.round((3 + depth * 0.8) * XP_SCALE));
+}
+function disarmTrapAtPlayer(state) {
+  const p = state?.player;
+  if (!p || p.dead) return false;
+  const trap = getTrapAt(state, p.x, p.y, p.z, { requireArmed: true, requireRevealed: true });
+  if (!trap) return false;
+  const xp = trapDisarmXp(trapDepth(trap, state));
+  trap.armed = false;
+  trap.disarmed = true;
+  if (trap.origin === "base") {
+    state.removedIds.add(trap.id);
+    state.entityOverrides.delete(trap.id);
+  } else if (trap.origin === "dynamic") {
+    state.dynamic.delete(trap.id);
+  }
+  state.entities.delete(trap.id);
+  grantXP(state, xp);
+  pushLog(state, `You disarm the pressure trap. (+${xp} XP)`);
+  return true;
+}
+function processPlayerTrapInteractions(state) {
+  const p = state?.player;
+  if (!p || p.dead) return false;
+  revealNearbyTrapsBySkill(state);
+  const trap = getTrapAt(state, p.x, p.y, p.z, { requireArmed: true });
+  if (!trap) return false;
+  if (trap.detected || trap.triggered) return false;
+  return triggerPressureTrap(state, trap);
 }
 
 function isDirectlyTakeableItem(type) {
@@ -8348,6 +8598,7 @@ function respawnEntitiesForArea(state, areaKey, now = Date.now()) {
   for (const ent of Array.from(state.entities.values())) {
     if (ent.z !== z) continue;
     if (!areaCellKeys.has(keyXY(ent.x, ent.y))) continue;
+    if (ent.kind === "trap") continue;
     if (ent.kind === "item" && (ent.type === "shopkeeper" || ent.type === "shrine")) continue;
     if (ent.origin === "base") {
       state.removedIds.add(ent.id);
@@ -8660,6 +8911,9 @@ function drawMinimap(state) {
 // ---------- Effects tick ----------
 function applyEffectsTick(state) {
   const p = state.player;
+  if (p.poisonImmune) {
+    p.effects = (p.effects ?? []).filter((e) => e?.type !== "poison");
+  }
   if (!p.effects.length) return;
 
   for (const e of p.effects) {
@@ -8696,9 +8950,14 @@ function normalizeMonsterEffects(rawEffects) {
     const type = String(raw.type ?? "").trim().toLowerCase();
     if (type !== "poison") continue;
     const dmgPerTurn = Math.max(1, Math.floor(Number(raw.dmgPerTurn ?? 1)));
+    const stacks = Math.max(1, Math.floor(Number(raw.stacks ?? 1)));
+    const baseDmgPerTurn = Math.max(1, Math.floor(Number(raw.baseDmgPerTurn ?? Math.max(1, Math.round(dmgPerTurn / stacks)))));
     const turnsLeft = Math.max(0, Math.floor(Number(raw.turnsLeft ?? 0)));
     if (turnsLeft <= 0) continue;
-    out.push({ type: "poison", dmgPerTurn, turnsLeft });
+    const entry = { type: "poison", dmgPerTurn, turnsLeft };
+    if (stacks > 1) entry.stacks = stacks;
+    if (baseDmgPerTurn > 0) entry.baseDmgPerTurn = baseDmgPerTurn;
+    out.push(entry);
   }
   return out;
 }
@@ -8726,20 +8985,38 @@ function persistMonsterOverride(state, monster) {
   state.entityOverrides.set(monster.id, next);
 }
 
-function applyPoisonToMonster(state, monster, dmgPerTurn = 1, turns = 2, sourceLabel = "toxic spit") {
+function applyPoisonToMonster(state, monster, dmgPerTurn = 1, turns = 2, sourceLabel = "toxic spit", options = null) {
   if (!monster || monster.kind !== "monster") return false;
   const spec = monsterStatsForDepth(monster.type, monster.z ?? state?.player?.z ?? 0);
   if (spec?.immunePoison) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const stackMode = !!opts.stack;
+  const maxStacks = Math.max(1, Math.floor(Number(opts.maxStacks ?? 4)));
   const dpt = Math.max(1, Math.floor(Number(dmgPerTurn ?? 1)));
   const ttl = Math.max(1, Math.floor(Number(turns ?? 1)));
   const effects = ensureMonsterEffects(monster);
   const existing = effects.find((e) => e.type === "poison");
   const isNew = !existing;
   if (existing) {
-    existing.dmgPerTurn = Math.max(Math.floor(existing.dmgPerTurn ?? 1), dpt);
-    existing.turnsLeft = Math.max(Math.floor(existing.turnsLeft ?? 0), ttl);
+    if (stackMode) {
+      const prevStacks = Math.max(1, Math.floor(existing.stacks ?? 1));
+      const nextStacks = Math.min(maxStacks, prevStacks + 1);
+      const prevBase = Math.max(1, Math.floor(existing.baseDmgPerTurn ?? Math.max(1, Math.round((existing.dmgPerTurn ?? 1) / prevStacks))));
+      const baseDmg = Math.max(prevBase, dpt);
+      existing.stacks = nextStacks;
+      existing.baseDmgPerTurn = baseDmg;
+      existing.dmgPerTurn = Math.max(1, Math.floor(baseDmg * nextStacks));
+      existing.turnsLeft = Math.max(Math.floor(existing.turnsLeft ?? 0), ttl);
+    } else {
+      existing.dmgPerTurn = Math.max(Math.floor(existing.dmgPerTurn ?? 1), dpt);
+      existing.turnsLeft = Math.max(Math.floor(existing.turnsLeft ?? 0), ttl);
+      existing.stacks = Math.max(1, Math.floor(existing.stacks ?? 1));
+      if (existing.stacks <= 1) delete existing.stacks;
+      delete existing.baseDmgPerTurn;
+    }
   } else {
-    effects.push({ type: "poison", dmgPerTurn: dpt, turnsLeft: ttl });
+    if (stackMode) effects.push({ type: "poison", dmgPerTurn: dpt, turnsLeft: ttl, stacks: 1, baseDmgPerTurn: dpt });
+    else effects.push({ type: "poison", dmgPerTurn: dpt, turnsLeft: ttl });
   }
   persistMonsterOverride(state, monster);
   if (isNew) {
@@ -8783,6 +9060,7 @@ function tickMonsterEffects(state) {
 function applyPoisonToPlayer(state, dmgPerTurn = 40, turns = 2, sourceLabel = "poison") {
   const p = state?.player;
   if (!p || p.dead) return;
+  if (p.poisonImmune) return;
   const dpt = Math.max(1, Math.floor(dmgPerTurn));
   const ttl = Math.max(1, Math.floor(turns));
   const existing = p.effects.find((e) => e.type === "poison");
@@ -9325,6 +9603,8 @@ function tryKnockbackMonster(state, monster, sourceX, sourceY) {
 function tryKnockbackPlayer(state, sourceX, sourceY) {
   const p = state?.player;
   if (!p || p.dead) return false;
+  const resistPct = clamp(Number(p.knockbackResistPct ?? 0), 0, 1);
+  if (resistPct >= 1 || Math.random() < resistPct) return false;
   const dx = Math.sign((p.x ?? 0) - (sourceX ?? 0));
   const dy = Math.sign((p.y ?? 0) - (sourceY ?? 0));
   if (dx === 0 && dy === 0) return false;
@@ -9400,6 +9680,7 @@ function playerAttack(state, monster) {
     return;
   }
   const classId = normalizeCharacterClassId(p.classId, p.speciesId);
+  const classDef = characterClassDef(classId);
   const mSpec = monsterStatsForDepth(monster.type, monster.z ?? p.z);
   const attackAfterMove = !!p.attackAfterMove;
   const firstCombatStrike = !!p.combatFirstStrikeReady;
@@ -9429,23 +9710,57 @@ function playerAttack(state, monster) {
   monster.awake = true;
   persistMonsterOverride(state, monster);
 
-  if (
-    classId === "spitter" &&
-    weaponProfile?.source === "class_native" &&
-    weaponProfile?.flavor === "toxin" &&
-    (weaponProfile?.kind ?? "melee") === "ranged" &&
-    dmg > 0 &&
-    monster.hp > 0
-  ) {
-    const poisonDpt = Math.max(1, Math.round(dmg * 0.1));
-    applyPoisonToMonster(state, monster, poisonDpt, 2, "toxic spit");
+  const profileKind = weaponProfile?.kind ?? "melee";
+  const nativeFlavor = String(weaponProfile?.flavor ?? "").trim().toLowerCase();
+  const isNativeToxinShot = profileKind === "ranged" && weaponProfile?.source === "class_native" && nativeFlavor === "toxin";
+  if (dmg > 0 && monster.hp > 0) {
+    const rangedPoison = (classDef?.rangedPoisonOnHit && typeof classDef.rangedPoisonOnHit === "object")
+      ? classDef.rangedPoisonOnHit
+      : null;
+    if (rangedPoison && profileKind === "ranged") {
+      const chance = clamp(Number(rangedPoison.chance ?? 1), 0, 1);
+      const nativeOnly = !!rangedPoison.nativeOnly;
+      const requiredFlavor = String(rangedPoison.requiredFlavor ?? "").trim().toLowerCase();
+      const flavorMatch = !requiredFlavor || requiredFlavor === nativeFlavor;
+      if ((!nativeOnly || weaponProfile?.source === "class_native") && flavorMatch && Math.random() < chance) {
+        const poisonDpt = Math.max(1, Math.round(dmg * Math.max(0.02, Number(rangedPoison.dmgPct ?? 0.1))));
+        const turns = Math.max(1, Math.floor(Number(rangedPoison.turns ?? 2)));
+        applyPoisonToMonster(
+          state,
+          monster,
+          poisonDpt,
+          turns,
+          String(rangedPoison.sourceLabel ?? "poison shot"),
+          {
+            stack: !!rangedPoison.stack,
+            maxStacks: Math.max(1, Math.floor(Number(rangedPoison.maxStacks ?? 4))),
+          }
+        );
+      }
+    }
+    const meleePoison = (classDef?.meleePoisonOnHit && typeof classDef.meleePoisonOnHit === "object")
+      ? classDef.meleePoisonOnHit
+      : null;
+    if (meleePoison && profileKind === "melee") {
+      const chance = clamp(Number(meleePoison.chance ?? 1), 0, 1);
+      if (Math.random() < chance) {
+        const poisonDpt = Math.max(1, Math.round(dmg * Math.max(0.02, Number(meleePoison.dmgPct ?? 0.08))));
+        const turns = Math.max(1, Math.floor(Number(meleePoison.turns ?? 2)));
+        applyPoisonToMonster(
+          state,
+          monster,
+          poisonDpt,
+          turns,
+          String(meleePoison.sourceLabel ?? "venom"),
+          {
+            stack: !!meleePoison.stack,
+            maxStacks: Math.max(1, Math.floor(Number(meleePoison.maxStacks ?? 4))),
+          }
+        );
+      }
+    }
   }
-  const attackVerb = (
-    classId === "spitter" &&
-    weaponProfile?.source === "class_native" &&
-    weaponProfile?.flavor === "toxin" &&
-    (weaponProfile?.kind ?? "melee") === "ranged"
-  )
+  const attackVerb = isNativeToxinShot
     ? "You spit venom at"
     : "You hit";
   pushLog(state, `${attackVerb} the ${monsterDisplayName(monster, p.z)} for ${dmg}${attack.crit ? " (critical)" : ""}.`);
@@ -9900,6 +10215,7 @@ function interactContext(state) {
   const here = state.world.getTile(p.x, p.y, p.z);
   if (here === STAIRS_DOWN) return tryUseStairs(state, "down");
   if (here === STAIRS_UP) return tryUseStairs(state, "up");
+  if (disarmTrapAtPlayer(state)) return true;
 
   const shopResult = interactShopkeeper(state);
   if (shopResult !== null) return shopResult;
@@ -13174,8 +13490,8 @@ function draw(state) {
   syncMobileUi();
 
   const { world, player, seen, visible } = state;
-  const { monsters, items } = getCachedOccupancy(state);
-  updateContextActionButton(state, { monsters, items });
+  const { monsters, items, traps } = getCachedOccupancy(state);
+  updateContextActionButton(state, { monsters, items, traps });
   const theme = applyVisibilityBoostToTheme(themeForDepth(player.z, world.seedStr ?? ""));
   const timeSec = Date.now() / 1000;
   const deferredWorldObjects = [];
@@ -13269,9 +13585,49 @@ function draw(state) {
         }
       }
 
+      const occKey = keyXYZ(wx, wy, player.z);
+      const trapId = traps.get(occKey);
+      if (trapId) {
+        const trapEnt = state.entities.get(trapId);
+        const revealed = !!(trapEnt?.detected || trapEnt?.triggered);
+        if (revealed && (isSeen || isVisible || !fogEnabled)) {
+          const trapSprite = getSpriteIfReady(TRAP_REVEALED_SPRITE_ID);
+          if (trapSprite) {
+            deferredWorldObjects.push({
+              kind: "item-sprite",
+              sortY: wy,
+              sortX: wx,
+              order: -0.08,
+              sx,
+              sy,
+              img: trapSprite,
+              spriteId: TRAP_REVEALED_SPRITE_ID,
+              size: ITEM_SPRITE_SIZE,
+              entType: "trap",
+              wx,
+              wy,
+            });
+          } else {
+            const trapColor = trapEnt?.armed
+              ? "#ffb26b"
+              : (trapEnt?.triggered ? "#ff6f6f" : "#a7bfd8");
+            deferredWorldObjects.push({
+              kind: "glyph",
+              sortY: wy,
+              sortX: wx,
+              order: -0.08,
+              sx,
+              sy,
+              glyph: "X",
+              color: trapColor,
+            });
+          }
+        }
+      }
+
       if (isVisible || !fogEnabled) {
-        const mk = monsters.get(keyXYZ(wx, wy, player.z));
-        const ik = items.get(keyXYZ(wx, wy, player.z));
+        const mk = monsters.get(occKey);
+        const ik = items.get(occKey);
 
         if (ik) {
           const ent = state.entities.get(ik);
@@ -13616,6 +13972,14 @@ function takeTurn(state, didSpendTurn) {
   if (!didSpendTurn) return;
   state.turn += 1;
   maybeGrantExplorationXP(state);
+  processPlayerTrapInteractions(state);
+  if (state.player.dead) {
+    renderInventory(state);
+    renderEquipment(state);
+    renderEffects(state);
+    markSaveDirty(state, "turn");
+    return;
+  }
 
   applyEffectsAfterPlayerAction(state);
   monstersTurn(state);
@@ -13887,7 +14251,17 @@ function exportSave(state) {
   const removed = Array.from(state.removedIds);
   const entOv = Array.from(state.entityOverrides.entries()).map(([id, ov]) => {
     const ent = state.entities.get(id);
-    if (!ent || ent.kind !== "monster") return [id, ov];
+    if (!ent) return [id, ov];
+    if (ent.kind === "trap") {
+      const next = { ...(ov ?? {}) };
+      next.armed = !!ent.armed;
+      next.detected = !!ent.detected;
+      next.triggered = !!ent.triggered;
+      next.disarmed = !!ent.disarmed;
+      next.depth = Math.max(0, Math.floor(ent.depth ?? ent.z ?? 0));
+      return [id, next];
+    }
+    if (ent.kind !== "monster") return [id, ov];
     const next = { ...(ov ?? {}) };
     next.awake = !!ent.awake;
     if (Number.isFinite(ent.abilityCd)) next.abilityCd = Math.floor(ent.abilityCd);
