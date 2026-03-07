@@ -2610,7 +2610,7 @@ if (!is_string($monsterEditorJson)) {
         background: linear-gradient(180deg, rgba(14, 22, 34, 0.99) 0%, rgba(7, 11, 18, 0.99) 100%);
         box-shadow: 0 10px 30px rgba(0,0,0,0.45);
         display: grid;
-        grid-template-rows: auto auto 1fr auto;
+        grid-template-rows: auto minmax(0, 1fr) auto;
         overflow: hidden;
       }
       #characterOverlayHeader {
@@ -4371,24 +4371,24 @@ if (!is_string($monsterEditorJson)) {
         #characterOverlayCard {
           width: min(920px, calc(100vw - 20px));
           min-height: 0;
-          max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
-          height: min(900px, calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom))));
+          max-height: calc(100% - 6px);
+          height: calc(100% - 6px);
           margin-top: 6px;
           overflow: hidden;
-          grid-template-rows: auto auto minmax(0, 1fr) auto;
+          grid-template-rows: auto minmax(0, 1fr) auto;
         }
         #characterOverlayBody {
           max-height: none;
           min-height: 0;
           overflow: auto;
           -webkit-overflow-scrolling: touch;
-          padding-bottom: 16px;
+          padding-bottom: max(18px, env(safe-area-inset-bottom));
         }
         #characterOverlayActions {
-          position: sticky;
-          bottom: 0;
+          position: static;
           background: linear-gradient(180deg, rgba(10, 15, 24, 0.96) 0%, rgba(7, 11, 18, 0.99) 100%);
           z-index: 2;
+          padding-bottom: max(12px, env(safe-area-inset-bottom));
         }
         body {
           background: #131c2b;
