@@ -6369,14 +6369,9 @@ async function handleCharacterOverlayTertiary() {
 async function startCharacterFlow() {
   if (!characterOverlayEl) return;
   setCharacterOverlayStatus("");
-  if (isAuthenticatedUser && bootLoadedFromLocalSave) {
-    requiresCharacterCreation = false;
-    characterUi.loading = false;
-    setCharacterOverlayOpen(false);
-    return;
-  }
   if (isAuthenticatedUser) {
     requiresCharacterCreation = true;
+    let allowResumeWithoutOverlay = false;
     try {
       characterUi.loading = true;
       setCharacterOverlayOpen(true);
@@ -6388,9 +6383,22 @@ async function startCharacterFlow() {
       characterOverlayTertiaryEl.style.display = "none";
       characterUi.slots = await fetchCharacterSlotsFromServer();
       const activeId = getActiveCharacterSlotId();
-      characterUi.selectedSaveId = activeId || characterUi.slots[0]?.id || "";
+      const hasSlots = characterUi.slots.length > 0;
+      const activeSlotExists = !!(activeId && characterUi.slots.some((slot) => slot.id === activeId));
+      characterUi.selectedSaveId = activeSlotExists ? activeId : (characterUi.slots[0]?.id || "");
       characterUi.selectionPurpose = "load_run";
-      characterUi.mode = characterUi.slots.length ? "select" : "create";
+      characterUi.mode = hasSlots ? "select" : "create";
+      if (bootLoadedFromLocalSave && activeSlotExists) {
+        requiresCharacterCreation = false;
+        setCharacterOverlayStatus("");
+        allowResumeWithoutOverlay = true;
+        return;
+      }
+      if (!hasSlots) {
+        setActiveCharacterSlotId("");
+        try { localStorage.removeItem(SAVE_KEY); } catch {}
+        bootLoadedFromLocalSave = false;
+      }
       if (characterUi.mode === "create") {
         resetCharacterCreationDraft(null, { step: "welcome" });
         setCharacterOverlayStatus("Create a character to continue.", true);
@@ -6405,8 +6413,12 @@ async function startCharacterFlow() {
       resetCharacterCreationDraft(null, { step: "welcome" });
     } finally {
       characterUi.loading = false;
-      setCharacterOverlayOpen(true);
-      renderCharacterOverlay();
+      if (allowResumeWithoutOverlay) {
+        setCharacterOverlayOpen(false);
+      } else {
+        setCharacterOverlayOpen(true);
+        renderCharacterOverlay();
+      }
     }
     return;
   }
