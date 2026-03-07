@@ -31,6 +31,7 @@ const ADMIN_EMAIL = 'eric.zeigenbein@gmail.com';
 const MAX_SERVER_SAVES = 5;
 const SAVE_NAME_MAX_LEN = 48;
 const SAVE_PAYLOAD_MAX_LEN = 2000000;
+const CHARACTER_STATE_PAYLOAD_MAX_LEN = 350000;
 const SPRITE_UPLOAD_MAX_BYTES = 100000000;
 const MONSTER_EDITOR_PAYLOAD_MAX_BYTES = 1200000;
 const LOCAL_AUTH_COOKIE = 'bp_auth_user';
@@ -1162,12 +1163,33 @@ function user_save_file_path(string $email): string
   return save_storage_root() . DIRECTORY_SEPARATOR . safe_file_token($email) . '.json';
 }
 
+function user_character_state_file_path(string $email): string
+{
+  return save_storage_root() . DIRECTORY_SEPARATOR . safe_file_token($email) . '.characters.json';
+}
+
 /**
  * @return array<int, string>
  */
 function user_save_file_path_candidates(string $email): array
 {
   $token = safe_file_token($email) . '.json';
+  $paths = [];
+  foreach (save_storage_root_candidates() as $root) {
+    $candidate = $root . DIRECTORY_SEPARATOR . $token;
+    if (!in_array($candidate, $paths, true)) {
+      $paths[] = $candidate;
+    }
+  }
+  return $paths;
+}
+
+/**
+ * @return array<int, string>
+ */
+function user_character_state_file_path_candidates(string $email): array
+{
+  $token = safe_file_token($email) . '.characters.json';
   $paths = [];
   foreach (save_storage_root_candidates() as $root) {
     $candidate = $root . DIRECTORY_SEPARATOR . $token;
@@ -1206,7 +1228,69 @@ function default_save_name(int $level, int $depth): string
   return trim_save_name(sprintf('Lvl %d, Depth %d, %s', $safeLevel, $safeDepth, date('Y-m-d H:i:s')));
 }
 
+function normalize_character_profile_id(string $value): string
+{
+  $id = strtolower(trim($value));
+  if ($id === '' || !preg_match('/^[a-z0-9_]{4,80}$/', $id)) {
+    return '';
+  }
+  return $id;
+}
+
+/**
+ * @return array{character_id: string, character_name: string}|null
+ */
+function extract_character_meta_from_save_payload(string $payloadB64): ?array
+{
+  $raw = base64_decode($payloadB64, true);
+  if (!is_string($raw) || $raw === '') {
+    return null;
+  }
+  if (function_exists('iconv')) {
+    $json = @iconv('UTF-8', 'UTF-8//IGNORE', $raw);
+    if (!is_string($json) || $json === '') {
+      $json = $raw;
+    }
+  } else {
+    $json = $raw;
+  }
+  $decoded = json_decode($json, true);
+  if (!is_array($decoded)) {
+    return null;
+  }
+  $character = is_array($decoded['character'] ?? null) ? $decoded['character'] : null;
+  if ($character === null) {
+    return null;
+  }
+  $characterId = normalize_character_profile_id((string) ($character['id'] ?? ''));
+  if ($characterId === '') {
+    return null;
+  }
+  $nameRaw = trim((string) ($character['name'] ?? ''));
+  $characterName = $nameRaw === '' ? 'Adventurer' : trim_save_name($nameRaw);
+  return [
+    'character_id' => $characterId,
+    'character_name' => $characterName,
+  ];
+}
+
 function save_entry_signature(array $entry, string $secret): string
+{
+  $parts = [
+    (string) ($entry['id'] ?? ''),
+    (string) ($entry['character_id'] ?? ''),
+    (string) ($entry['character_name'] ?? ''),
+    (string) ($entry['name'] ?? ''),
+    (string) ($entry['payload'] ?? ''),
+    (string) ($entry['level'] ?? ''),
+    (string) ($entry['depth'] ?? ''),
+    (string) ($entry['created_at'] ?? ''),
+    (string) ($entry['updated_at'] ?? ''),
+  ];
+  return hash_hmac('sha256', implode('|', $parts), $secret);
+}
+
+function save_entry_signature_legacy(array $entry, string $secret): string
 {
   $parts = [
     (string) ($entry['id'] ?? ''),
@@ -1223,6 +1307,8 @@ function save_entry_signature(array $entry, string $secret): string
 /**
  * @return array{
  *   id: string,
+ *   character_id: string,
+ *   character_name: string,
  *   name: string,
  *   payload: string,
  *   level: int,
@@ -1259,8 +1345,26 @@ function normalize_save_entry(array $entry, string $secret): ?array
     $name = default_save_name($level, $depth);
   }
 
+  $characterId = normalize_character_profile_id((string) ($entry['character_id'] ?? ''));
+  $characterName = trim_save_name((string) ($entry['character_name'] ?? ''));
+  if ($characterId === '') {
+    $meta = extract_character_meta_from_save_payload($payload);
+    $characterId = (string) ($meta['character_id'] ?? '');
+    if ($characterName === '') {
+      $characterName = trim_save_name((string) ($meta['character_name'] ?? ''));
+    }
+  }
+  if ($characterId === '') {
+    $characterId = 'legacy_' . substr(hash('sha256', $id), 0, 16);
+  }
+  if ($characterName === '') {
+    $characterName = 'Adventurer';
+  }
+
   $normalized = [
     'id' => $id,
+    'character_id' => $characterId,
+    'character_name' => $characterName,
     'name' => $name,
     'payload' => $payload,
     'level' => $level,
@@ -1273,7 +1377,9 @@ function normalize_save_entry(array $entry, string $secret): ?array
   $providedSig = trim((string) ($entry['sig'] ?? ''));
   if ($secret !== '') {
     $expectedSig = save_entry_signature($normalized, $secret);
-    if ($providedSig === '' || !hash_equals($expectedSig, $providedSig)) {
+    $expectedLegacySig = save_entry_signature_legacy($normalized, $secret);
+    $validSig = $providedSig !== '' && (hash_equals($expectedSig, $providedSig) || hash_equals($expectedLegacySig, $providedSig));
+    if (!$validSig) {
       return null;
     }
     $normalized['sig'] = $expectedSig;
@@ -1398,6 +1504,8 @@ function persist_user_saves(string $email, array $entries, string $secret): bool
 /**
  * @param array{
  *   id: string,
+ *   character_id: string,
+ *   character_name: string,
  *   name: string,
  *   payload: string,
  *   level: int,
@@ -1406,12 +1514,14 @@ function persist_user_saves(string $email, array $entries, string $secret): bool
  *   updated_at: string,
  *   sig: string
  * } $entry
- * @return array{id: string, name: string, level: int, depth: int, created_at: string, updated_at: string}
+ * @return array{id: string, character_id: string, character_name: string, name: string, level: int, depth: int, created_at: string, updated_at: string}
  */
 function save_entry_public_meta(array $entry): array
 {
   return [
     'id' => (string) $entry['id'],
+    'character_id' => (string) ($entry['character_id'] ?? ''),
+    'character_name' => (string) ($entry['character_name'] ?? ''),
     'name' => (string) $entry['name'],
     'level' => (int) $entry['level'],
     'depth' => (int) $entry['depth'],
@@ -1431,7 +1541,7 @@ function save_entry_public_meta(array $entry): array
  *   updated_at: string,
  *   sig: string
  * }> $entries
- * @return array<int, array{id: string, name: string, level: int, depth: int, created_at: string, updated_at: string}>
+ * @return array<int, array{id: string, character_id: string, character_name: string, name: string, level: int, depth: int, created_at: string, updated_at: string}>
  */
 function save_entries_public_meta(array $entries): array
 {
@@ -1439,6 +1549,216 @@ function save_entries_public_meta(array $entries): array
   foreach ($entries as $entry) {
     $out[] = save_entry_public_meta($entry);
   }
+  return $out;
+}
+
+/**
+ * @param array<int, array{
+ *   id: string,
+ *   character_id: string,
+ *   character_name: string,
+ *   name: string,
+ *   payload: string,
+ *   level: int,
+ *   depth: int,
+ *   created_at: string,
+ *   updated_at: string,
+ *   sig: string
+ * }> $entries
+ * @return array<int, array{character_id: string, character_name: string, latest_save_id: string, level: int, depth: int, updated_at: string}>
+ */
+function character_entries_public_meta(array $entries): array
+{
+  $byCharacter = [];
+  foreach ($entries as $entry) {
+    $characterId = (string) ($entry['character_id'] ?? '');
+    if ($characterId === '') {
+      continue;
+    }
+    $existing = $byCharacter[$characterId] ?? null;
+    if (
+      !is_array($existing) ||
+      strcmp((string) ($entry['updated_at'] ?? ''), (string) ($existing['updated_at'] ?? '')) > 0
+    ) {
+      $byCharacter[$characterId] = [
+        'character_id' => $characterId,
+        'character_name' => (string) ($entry['character_name'] ?? 'Adventurer'),
+        'latest_save_id' => (string) ($entry['id'] ?? ''),
+        'level' => (int) ($entry['level'] ?? 1),
+        'depth' => (int) ($entry['depth'] ?? 0),
+        'updated_at' => (string) ($entry['updated_at'] ?? ''),
+      ];
+    }
+  }
+  $out = array_values($byCharacter);
+  usort(
+    $out,
+    static function (array $a, array $b): int {
+      return strcmp((string) ($b['updated_at'] ?? ''), (string) ($a['updated_at'] ?? ''));
+    }
+  );
+  return $out;
+}
+
+function character_state_signature(array $entry, string $secret): string
+{
+  $parts = [
+    (string) ($entry['id'] ?? ''),
+    (string) ($entry['name'] ?? ''),
+    (string) ($entry['payload'] ?? ''),
+    (string) ($entry['updated_at'] ?? ''),
+  ];
+  return hash_hmac('sha256', implode('|', $parts), $secret);
+}
+
+/**
+ * @return array{id: string, name: string, payload: string, updated_at: string, sig: string}|null
+ */
+function normalize_character_state_entry(array $entry, string $secret): ?array
+{
+  $id = normalize_character_profile_id((string) ($entry['id'] ?? ''));
+  if ($id === '') {
+    return null;
+  }
+  $payload = trim((string) ($entry['payload'] ?? ''));
+  if ($payload === '' || strlen($payload) > CHARACTER_STATE_PAYLOAD_MAX_LEN) {
+    return null;
+  }
+  $name = trim_save_name((string) ($entry['name'] ?? ''));
+  if ($name === '') {
+    $name = 'Adventurer';
+  }
+  $updatedAt = trim((string) ($entry['updated_at'] ?? ''));
+  if ($updatedAt === '') {
+    $updatedAt = date('c');
+  }
+  $normalized = [
+    'id' => $id,
+    'name' => $name,
+    'payload' => $payload,
+    'updated_at' => $updatedAt,
+    'sig' => '',
+  ];
+  $providedSig = trim((string) ($entry['sig'] ?? ''));
+  if ($secret !== '') {
+    $expected = character_state_signature($normalized, $secret);
+    if ($providedSig === '' || !hash_equals($expected, $providedSig)) {
+      return null;
+    }
+    $normalized['sig'] = $expected;
+  } else {
+    $normalized['sig'] = hash('sha256', implode('|', [$id, $payload, $updatedAt]));
+  }
+  return $normalized;
+}
+
+/**
+ * @return array<string, array{id: string, name: string, payload: string, updated_at: string, sig: string}>
+ */
+function load_user_character_states(string $email, string $secret): array
+{
+  $file = null;
+  $bestMtime = -1;
+  foreach (user_character_state_file_path_candidates($email) as $candidate) {
+    if (!is_file($candidate)) {
+      continue;
+    }
+    $mtime = (int) (@filemtime($candidate) ?: 0);
+    if ($file === null || $mtime > $bestMtime) {
+      $file = $candidate;
+      $bestMtime = $mtime;
+    }
+  }
+  if ($file === null) {
+    return [];
+  }
+  $raw = file_get_contents($file);
+  if (!is_string($raw) || trim($raw) === '') {
+    return [];
+  }
+  $decoded = json_decode($raw, true);
+  if (!is_array($decoded)) {
+    return [];
+  }
+  $entriesRaw = $decoded['characters'] ?? [];
+  if (!is_array($entriesRaw)) {
+    return [];
+  }
+  $out = [];
+  foreach ($entriesRaw as $entry) {
+    if (!is_array($entry)) {
+      continue;
+    }
+    $normalized = normalize_character_state_entry($entry, $secret);
+    if ($normalized === null) {
+      continue;
+    }
+    $out[(string) $normalized['id']] = $normalized;
+  }
+  return $out;
+}
+
+/**
+ * @param array<string, array{id: string, name: string, payload: string, updated_at: string, sig: string}> $entriesById
+ */
+function persist_user_character_states(string $email, array $entriesById, string $secret): bool
+{
+  if (!ensure_save_storage_root()) {
+    return false;
+  }
+  $entries = array_values($entriesById);
+  usort(
+    $entries,
+    static function (array $a, array $b): int {
+      return strcmp((string) ($b['updated_at'] ?? ''), (string) ($a['updated_at'] ?? ''));
+    }
+  );
+  $normalizedEntries = [];
+  foreach ($entries as $entry) {
+    $next = $entry;
+    if ($secret !== '') {
+      $next['sig'] = character_state_signature($next, $secret);
+    } else {
+      $next['sig'] = hash('sha256', implode('|', [$next['id'], $next['payload'], $next['updated_at']]));
+    }
+    $normalizedEntries[] = $next;
+  }
+  $payload = [
+    'version' => 1,
+    'characters' => $normalizedEntries,
+  ];
+  $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+  if (!is_string($json)) {
+    return false;
+  }
+  $file = user_character_state_file_path($email);
+  $written = file_put_contents($file, $json . PHP_EOL, LOCK_EX) !== false;
+  if ($written) {
+    @chmod($file, 0600);
+  }
+  return $written;
+}
+
+/**
+ * @param array<string, array{id: string, name: string, payload: string, updated_at: string, sig: string}> $entriesById
+ * @return array<int, array{id: string, name: string, updated_at: string}>
+ */
+function character_states_public_meta(array $entriesById): array
+{
+  $out = [];
+  foreach ($entriesById as $entry) {
+    $out[] = [
+      'id' => (string) ($entry['id'] ?? ''),
+      'name' => (string) ($entry['name'] ?? 'Adventurer'),
+      'updated_at' => (string) ($entry['updated_at'] ?? ''),
+    ];
+  }
+  usort(
+    $out,
+    static function (array $a, array $b): int {
+      return strcmp((string) ($b['updated_at'] ?? ''), (string) ($a['updated_at'] ?? ''));
+    }
+  );
   return $out;
 }
 
@@ -1805,8 +2125,25 @@ if ($apiMode === 'savegames') {
   }
 
   $entries = load_user_saves($userEmail, $saveSecret);
+  $characterStates = load_user_character_states($userEmail, $saveSecret);
 
   if ($method === 'GET') {
+    $characterIdQuery = normalize_character_profile_id((string) ($_GET['character'] ?? ''));
+    if ($characterIdQuery !== '') {
+      $characterEntry = $characterStates[$characterIdQuery] ?? null;
+      if (!is_array($characterEntry)) {
+        json_response(['ok' => false, 'error' => 'Character state not found.'], 404);
+      }
+      json_response([
+        'ok' => true,
+        'character' => [
+          'id' => (string) $characterEntry['id'],
+          'name' => (string) ($characterEntry['name'] ?? 'Adventurer'),
+          'payload' => (string) $characterEntry['payload'],
+          'updated_at' => (string) ($characterEntry['updated_at'] ?? ''),
+        ],
+      ]);
+    }
     $loadId = trim((string) ($_GET['load'] ?? ''));
     if ($loadId !== '') {
       $found = null;
@@ -1823,6 +2160,8 @@ if ($apiMode === 'savegames') {
         'ok' => true,
         'save' => [
           'id' => (string) $found['id'],
+          'character_id' => (string) ($found['character_id'] ?? ''),
+          'character_name' => (string) ($found['character_name'] ?? ''),
           'name' => (string) $found['name'],
           'payload' => (string) $found['payload'],
           'level' => (int) $found['level'],
@@ -1837,6 +2176,8 @@ if ($apiMode === 'savegames') {
       'ok' => true,
       'max_saves' => MAX_SERVER_SAVES,
       'name_max_len' => SAVE_NAME_MAX_LEN,
+      'characters' => character_entries_public_meta($entries),
+      'character_states' => character_states_public_meta($characterStates),
       'saves' => save_entries_public_meta($entries),
     ]);
   }
@@ -1856,6 +2197,43 @@ if ($apiMode === 'savegames') {
   }
 
   $action = trim((string) ($body['action'] ?? ''));
+  if ($action === 'character_sync') {
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    if ($characterId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character id.'], 400);
+    }
+    $characterPayload = trim((string) ($body['payload'] ?? ''));
+    if ($characterPayload === '') {
+      json_response(['ok' => false, 'error' => 'Missing character payload.'], 400);
+    }
+    if (strlen($characterPayload) > CHARACTER_STATE_PAYLOAD_MAX_LEN) {
+      json_response(['ok' => false, 'error' => 'Character payload is too large.'], 413);
+    }
+    $characterName = trim_save_name((string) ($body['name'] ?? ''));
+    if ($characterName === '') {
+      $characterName = 'Adventurer';
+    }
+    $updatedAt = date('c');
+    $characterStates[$characterId] = [
+      'id' => $characterId,
+      'name' => $characterName,
+      'payload' => $characterPayload,
+      'updated_at' => $updatedAt,
+      'sig' => '',
+    ];
+    if (!persist_user_character_states($userEmail, $characterStates, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist character state.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'character' => [
+        'id' => $characterId,
+        'name' => $characterName,
+        'updated_at' => $updatedAt,
+      ],
+      'character_states' => character_states_public_meta($characterStates),
+    ]);
+  }
   if ($action === 'delete') {
     $targetId = trim((string) ($body['id'] ?? ''));
     if ($targetId === '') {
@@ -1882,6 +2260,8 @@ if ($apiMode === 'savegames') {
       'message' => 'Save deleted.',
       'max_saves' => MAX_SERVER_SAVES,
       'name_max_len' => SAVE_NAME_MAX_LEN,
+      'characters' => character_entries_public_meta($nextEntries),
+      'character_states' => character_states_public_meta($characterStates),
       'saves' => save_entries_public_meta($nextEntries),
     ]);
   }
@@ -1905,6 +2285,15 @@ if ($apiMode === 'savegames') {
   if ($name === '') {
     $name = default_save_name($level, $depth);
   }
+  $characterMeta = extract_character_meta_from_save_payload($payload);
+  $characterId = (string) ($characterMeta['character_id'] ?? '');
+  $characterName = trim_save_name((string) ($characterMeta['character_name'] ?? ''));
+  if ($characterId === '') {
+    $characterId = 'legacy_' . substr(hash('sha256', $payload), 0, 16);
+  }
+  if ($characterName === '') {
+    $characterName = 'Adventurer';
+  }
 
   $overwriteId = trim((string) ($body['overwrite_id'] ?? ''));
   $nowIso = date('c');
@@ -1916,6 +2305,8 @@ if ($apiMode === 'savegames') {
         continue;
       }
       $entries[$idx]['name'] = $name;
+      $entries[$idx]['character_id'] = $characterId;
+      $entries[$idx]['character_name'] = $characterName;
       $entries[$idx]['payload'] = $payload;
       $entries[$idx]['level'] = $level;
       $entries[$idx]['depth'] = $depth;
@@ -1934,12 +2325,16 @@ if ($apiMode === 'savegames') {
         'code' => 'SAVE_LIMIT_REACHED',
         'max_saves' => MAX_SERVER_SAVES,
         'name_max_len' => SAVE_NAME_MAX_LEN,
+        'characters' => character_entries_public_meta($entries),
+        'character_states' => character_states_public_meta($characterStates),
         'saves' => save_entries_public_meta($entries),
       ], 409);
     }
     $id = bin2hex(random_bytes(16));
     $updatedEntry = [
       'id' => $id,
+      'character_id' => $characterId,
+      'character_name' => $characterName,
       'name' => $name,
       'payload' => $payload,
       'level' => $level,
@@ -1980,6 +2375,8 @@ if ($apiMode === 'savegames') {
     'save' => $savedMeta,
     'max_saves' => MAX_SERVER_SAVES,
     'name_max_len' => SAVE_NAME_MAX_LEN,
+    'characters' => character_entries_public_meta($entries),
+    'character_states' => character_states_public_meta($characterStates),
     'saves' => save_entries_public_meta($entries),
   ]);
 }
