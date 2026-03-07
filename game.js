@@ -6041,21 +6041,25 @@ function renderCharacterCreateBody() {
   } else if (step === "stats") {
     characterOverlayBodyEl.innerHTML =
       statusHtml +
-      `<div class="charStepLead">Step 4/5: Allocate Stat Points</div>` +
-      `<div class="charCreatorGrid">` +
+      `<div class="charStepLead">Step 4/5: Allocate Attribute Points</div>` +
+      `<div class="charPointsBanner${remaining === 0 ? " ready" : ""}">` +
+      `<span class="charPointsBannerLabel">Points Remaining</span>` +
+      `<strong class="charPointsBannerValue">${remaining}</strong>` +
+      `<span class="charPointsBannerMeta">Spent ${spent}/${budget}</span>` +
+      `</div>` +
+      `<div class="charCreatorGrid charCreatorGridStatsMeta">` +
       `<div class="charCreatorField"><label>Species</label><input type="text" value="${escapeHtmlText(species.name)}" disabled /></div>` +
       `<div class="charCreatorField"><label>Class</label><input type="text" value="${escapeHtmlText(klass.name)}" disabled /></div>` +
       `<div class="charCreatorField"><label>Point Budget</label><input type="text" value="${spent}/${budget}" disabled /></div>` +
-      `<div class="charCreatorField"><label>Points Remaining</label><input type="text" value="${remaining}" disabled /></div>` +
       `</div>` +
       `<div class="charStatsWrap">` +
       `<div class="charStatsHeader">Distribute points (max ${CHARACTER_CREATION_MAX_STAT} per stat)</div>` +
       `${CHARACTER_STAT_KEYS.map((key) => {
-        const label = key.toUpperCase();
+        const label = characterStatLabelLong(key);
         const val = Math.max(0, Math.floor(draft.stats[key] ?? 0));
         return `<div class="charStatRow" data-stat="${key}">` +
-          `<div class="charStatLabel">${label}</div>` +
-          `<div class="charStatValue">${val}</div>` +
+          `<div class="charStatLabelWrap"><div class="charStatLabel">${label}</div><div class="charStatKey">${characterStatLabelShort(key)}</div></div>` +
+          `<div class="charStatValueBox"><span class="charStatValue">${val}</span></div>` +
           `<button class="charStatBtn" data-op="minus" data-stat="${key}" type="button">-</button>` +
           `<button class="charStatBtn" data-op="plus" data-stat="${key}" type="button">+</button>` +
         `</div>`;
@@ -7359,6 +7363,14 @@ function characterStatLabelShort(key) {
   if (key === "dex") return "DEX";
   if (key === "int") return "INT";
   if (key === "agi") return "AGI";
+  return key.toUpperCase();
+}
+function characterStatLabelLong(key) {
+  if (key === "vit") return "Vitality";
+  if (key === "str") return "Strength";
+  if (key === "dex") return "Dexterity";
+  if (key === "int") return "Intellect";
+  if (key === "agi") return "Agility";
   return key.toUpperCase();
 }
 function characterUnspentStatPoints(state) {

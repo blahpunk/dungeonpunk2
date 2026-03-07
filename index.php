@@ -2712,6 +2712,9 @@ if (!is_string($monsterEditorJson)) {
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 10px;
       }
+      .charCreatorGridStatsMeta {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
       .charWelcome {
         border: 1px solid #2b3956;
         border-radius: 10px;
@@ -2731,9 +2734,49 @@ if (!is_string($monsterEditorJson)) {
         margin-bottom: 0;
       }
       .charStepLead {
-        font-size: 13px;
+        font-size: 15px;
         color: #bfd0ea;
         margin-bottom: 8px;
+        font-weight: 700;
+      }
+      .charPointsBanner {
+        margin: 0 0 10px 0;
+        border: 1px solid #466084;
+        border-radius: 10px;
+        padding: 10px 12px;
+        background: linear-gradient(180deg, rgba(24, 39, 63, 0.95) 0%, rgba(13, 21, 35, 0.95) 100%);
+        display: grid;
+        grid-template-columns: auto auto 1fr;
+        gap: 8px 12px;
+        align-items: center;
+      }
+      .charPointsBanner.ready {
+        border-color: #468c6e;
+        background: linear-gradient(180deg, rgba(17, 45, 35, 0.94) 0%, rgba(10, 25, 20, 0.94) 100%);
+      }
+      .charPointsBannerLabel {
+        color: #d8e6ff;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+      .charPointsBannerValue {
+        color: #ffe29a;
+        font-size: 34px;
+        line-height: 1;
+        font-weight: 900;
+        text-shadow: 0 0 12px rgba(245, 197, 66, 0.35);
+      }
+      .charPointsBanner.ready .charPointsBannerValue {
+        color: #9ef0c7;
+        text-shadow: 0 0 12px rgba(74, 210, 142, 0.35);
+      }
+      .charPointsBannerMeta {
+        justify-self: end;
+        font-size: 13px;
+        color: #b5c8e7;
+        font-weight: 600;
       }
       .charChoiceGrid {
         display: grid;
@@ -2877,37 +2920,66 @@ if (!is_string($monsterEditorJson)) {
       }
       .charStatsWrap {
         margin-top: 12px;
-        border: 1px solid #2b3956;
+        border: 1px solid #39527a;
         border-radius: 10px;
-        padding: 10px;
-        background: rgba(12, 18, 30, 0.9);
+        padding: 12px;
+        background: linear-gradient(180deg, rgba(16, 24, 39, 0.95) 0%, rgba(10, 16, 27, 0.95) 100%);
       }
       .charStatsHeader {
-        font-size: 13px;
+        font-size: 14px;
+        font-weight: 700;
         color: #d7e3f8;
-        margin-bottom: 8px;
+        margin-bottom: 10px;
       }
       .charStatRow {
         display: grid;
-        grid-template-columns: 110px auto 44px 44px;
-        gap: 6px;
+        grid-template-columns: minmax(0, 1.2fr) 110px 54px 54px;
+        gap: 10px;
         align-items: center;
-        margin-bottom: 6px;
+        margin-bottom: 10px;
       }
       .charStatRow:last-child {
         margin-bottom: 0;
       }
+      .charStatLabelWrap {
+        min-width: 0;
+        display: grid;
+        gap: 2px;
+      }
       .charStatLabel {
-        font-size: 12px;
+        font-size: 17px;
+        font-weight: 800;
         color: #d2e0f8;
+        line-height: 1.05;
+      }
+      .charStatKey {
+        font-size: 11px;
+        color: #8fa9ce;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .charStatValueBox {
+        height: 52px;
+        border: 1px solid #385177;
+        border-radius: 10px;
+        background: rgba(8, 14, 24, 0.86);
+        display: grid;
+        place-items: center;
       }
       .charStatValue {
-        font-size: 13px;
-        font-weight: 700;
+        font-size: 32px;
+        line-height: 1;
+        font-weight: 900;
+        color: #f0f6ff;
       }
       .charStatBtn {
-        padding: 4px 0;
+        height: 52px;
+        padding: 0;
         min-width: 0;
+        border-radius: 10px;
+        font-size: 30px;
+        font-weight: 900;
+        line-height: 1;
       }
       .charNote {
         margin-top: 8px;
@@ -2971,11 +3043,36 @@ if (!is_string($monsterEditorJson)) {
         .charChoiceGrid {
           grid-template-columns: 1fr;
         }
+        .charPointsBanner {
+          grid-template-columns: 1fr auto;
+          gap: 6px 10px;
+        }
+        .charPointsBannerMeta {
+          grid-column: 1 / -1;
+          justify-self: start;
+        }
+        .charPointsBannerValue {
+          font-size: 30px;
+        }
         .charDerivedGrid {
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         .charStatRow {
-          grid-template-columns: 88px auto 40px 40px;
+          grid-template-columns: minmax(0, 1fr) 84px 52px 52px;
+          gap: 8px;
+        }
+        .charStatLabel {
+          font-size: 15px;
+        }
+        .charStatValueBox {
+          height: 46px;
+        }
+        .charStatValue {
+          font-size: 24px;
+        }
+        .charStatBtn {
+          height: 46px;
+          font-size: 26px;
         }
         .charChoiceCard.classChoiceCard {
           grid-template-columns: 74px minmax(0, 1fr);
