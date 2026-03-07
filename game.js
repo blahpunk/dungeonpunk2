@@ -3657,6 +3657,135 @@ const WEAPON_ATTACK_PROFILES = {
     hands: 1,
   },
 };
+const UNARMED_ATTACK_PROFILE = {
+  kind: "melee",
+  flavor: "unarmed",
+  range: 1,
+  minRange: 1,
+  requiresLOS: false,
+  cannotFireAdjacent: false,
+  damageMod: 1,
+  accuracyMod: 0,
+  critChanceMod: 0,
+  defIgnorePct: 0,
+  closeRangeDamageMult: 1,
+  maxRangeFalloffPct: 0,
+  hands: 0,
+};
+const CLASS_NATIVE_ATTACKS = {
+  ranger: {
+    kind: "ranged",
+    flavor: "ballistic",
+    range: 5,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.82,
+    accuracyMod: 8,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.72,
+    maxRangeFalloffPct: 0.1,
+  },
+  alchemist: {
+    kind: "ranged",
+    flavor: "alchemical",
+    range: 4,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.78,
+    accuracyMod: 4,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.72,
+    maxRangeFalloffPct: 0.08,
+  },
+  calibrator: {
+    kind: "ranged",
+    flavor: "tech",
+    range: 5,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.8,
+    accuracyMod: 10,
+    critChanceMod: 4,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.72,
+    maxRangeFalloffPct: 0.1,
+  },
+  overclock_unit: {
+    kind: "ranged",
+    flavor: "tech",
+    range: 4,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.84,
+    accuracyMod: 2,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.74,
+    maxRangeFalloffPct: 0.08,
+  },
+  void_savant: {
+    kind: "ranged",
+    flavor: "void",
+    range: 5,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.86,
+    accuracyMod: 4,
+    critChanceMod: 0,
+    defIgnorePct: 0.06,
+    closeRangeDamageMult: 0.72,
+    maxRangeFalloffPct: 0.1,
+  },
+  echo_sniper: {
+    kind: "ranged",
+    flavor: "void",
+    range: 7,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.8,
+    accuracyMod: 12,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.6,
+    maxRangeFalloffPct: 0.16,
+  },
+  psion: {
+    kind: "ranged",
+    flavor: "psionic",
+    range: 4,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.82,
+    accuracyMod: 6,
+    critChanceMod: 0,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.74,
+    maxRangeFalloffPct: 0.08,
+  },
+  mindpiercer: {
+    kind: "ranged",
+    flavor: "psionic",
+    range: 5,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod: 0.8,
+    accuracyMod: 6,
+    critChanceMod: 5,
+    defIgnorePct: 0,
+    closeRangeDamageMult: 0.72,
+    maxRangeFalloffPct: 0.1,
+  },
+};
 const WEAPON_MATERIAL_ATK = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.atkBonus]));
 const ARMOR_MATERIAL_DEF = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.defBonus]));
 const ARMOR_SLOT_DEF = {
@@ -3684,10 +3813,62 @@ function weaponKindFromItemType(type) {
   if (parts.length < 3) return null;
   return parts[parts.length - 1] ?? null;
 }
+function normalizeAttackProfile(profile, fallbackProfile = UNARMED_ATTACK_PROFILE) {
+  const src = (profile && typeof profile === "object") ? profile : fallbackProfile;
+  const fallback = (fallbackProfile && typeof fallbackProfile === "object") ? fallbackProfile : UNARMED_ATTACK_PROFILE;
+  const kind = src.kind === "ranged" ? "ranged" : "melee";
+  const minRange = Math.max(1, Math.floor(Number(src.minRange ?? fallback.minRange ?? 1) || 1));
+  const range = Math.max(minRange, Math.floor(Number(src.range ?? fallback.range ?? minRange) || minRange));
+  const flavorRaw = String(src.flavor ?? (kind === "ranged" ? "ballistic" : "melee")).trim().toLowerCase();
+  return {
+    kind,
+    flavor: flavorRaw || (kind === "ranged" ? "ballistic" : "melee"),
+    range,
+    minRange,
+    requiresLOS: kind === "ranged" ? !!src.requiresLOS : false,
+    cannotFireAdjacent: kind === "ranged" ? !!src.cannotFireAdjacent : false,
+    damageMod: Math.max(0.1, Number(src.damageMod ?? fallback.damageMod ?? 1)),
+    accuracyMod: Math.round(Number(src.accuracyMod ?? fallback.accuracyMod ?? 0) || 0),
+    critChanceMod: Math.round(Number(src.critChanceMod ?? fallback.critChanceMod ?? 0) || 0),
+    defIgnorePct: clamp(Number(src.defIgnorePct ?? fallback.defIgnorePct ?? 0), 0, 0.9),
+    closeRangeDamageMult: clamp(Number(src.closeRangeDamageMult ?? fallback.closeRangeDamageMult ?? 1), 0.2, 1),
+    maxRangeFalloffPct: clamp(Number(src.maxRangeFalloffPct ?? fallback.maxRangeFalloffPct ?? 0), 0, 0.8),
+    hands: Math.max(0, Math.floor(Number(src.hands ?? fallback.hands ?? 0) || 0)),
+  };
+}
 function weaponAttackProfileForType(type) {
   const kind = weaponKindFromItemType(type);
   const profile = kind ? WEAPON_ATTACK_PROFILES[kind] : null;
-  return profile ?? WEAPON_ATTACK_PROFILES.sword;
+  return normalizeAttackProfile(profile ?? UNARMED_ATTACK_PROFILE, UNARMED_ATTACK_PROFILE);
+}
+function classNativeAttackProfile(classId) {
+  const cid = normalizeCharacterClassId(classId);
+  const profile = CLASS_NATIVE_ATTACKS[cid];
+  return profile ? normalizeAttackProfile(profile, UNARMED_ATTACK_PROFILE) : null;
+}
+function resolvePlayerAttackProfile(state) {
+  const weaponTypeId = state?.player?.equip?.weapon ?? null;
+  const weaponProfile = weaponTypeId ? WEAPONS[weaponTypeId]?.attackProfile ?? null : null;
+  if (weaponProfile) {
+    return {
+      ...normalizeAttackProfile(weaponProfile, UNARMED_ATTACK_PROFILE),
+      source: "weapon",
+      weaponType: weaponTypeId,
+    };
+  }
+  const classId = state?.player?.classId ?? state?.character?.classId ?? DEFAULT_CHARACTER_CLASS_ID;
+  const nativeProfile = classNativeAttackProfile(classId);
+  if (nativeProfile) {
+    return {
+      ...nativeProfile,
+      source: "class_native",
+      classId: normalizeCharacterClassId(classId),
+    };
+  }
+  return {
+    ...normalizeAttackProfile(UNARMED_ATTACK_PROFILE, UNARMED_ATTACK_PROFILE),
+    source: "unarmed",
+  };
 }
 
 const ITEM_TYPES = {
@@ -3717,7 +3898,7 @@ for (const material of WEAPON_MATERIALS) {
     WEAPONS[id] = {
       atkBonus: WEAPON_KIND_ATK[kind] + WEAPON_MATERIAL_ATK[material],
       kind,
-      attackProfile: { ...(WEAPON_ATTACK_PROFILES[kind] ?? WEAPON_ATTACK_PROFILES.sword) },
+      attackProfile: normalizeAttackProfile(WEAPON_ATTACK_PROFILES[kind] ?? UNARMED_ATTACK_PROFILE, UNARMED_ATTACK_PROFILE),
     };
   }
 }
@@ -6610,8 +6791,7 @@ function monsterThreatScore(state, monster) {
 }
 
 function playerWeaponAttackProfile(state) {
-  const weaponTypeId = state?.player?.equip?.weapon ?? null;
-  return weaponAttackProfileForType(weaponTypeId);
+  return resolvePlayerAttackProfile(state);
 }
 
 function hasAdjacentMonster(state, occupancy = null) {
@@ -7320,6 +7500,7 @@ function recalcDerivedStats(state) {
   const armorEffect = (species.armorEffect ?? 1) * (classDef.armorEffect ?? 1);
   const energyMult = Math.max(0.1, (species.energyMult ?? 1) * (classDef.energyMult ?? 1));
   const energyFlat = Math.floor((species.energyFlat ?? 0) + (classDef.energyFlat ?? 0));
+  const resolvedAttackProfile = resolvePlayerAttackProfile(state);
   const newMaxHp = Math.max(1, maxHpForLevel(level, profile));
   const prevMaxHp = Math.max(1, Math.floor(p.maxHp ?? newMaxHp));
   const hpRatio = clamp((p.hp ?? newMaxHp) / prevMaxHp, 0, 1);
@@ -7328,8 +7509,9 @@ function recalcDerivedStats(state) {
 
   p.baseAtk = baseAtk;
   p.baseDef = baseDef;
-  p.weaponKind = weapon?.kind ?? "sword";
-  p.weaponAttackProfile = weapon?.attackProfile ? { ...weapon.attackProfile } : { ...WEAPON_ATTACK_PROFILES.sword };
+  p.weaponKind = weapon?.kind
+    ?? (resolvedAttackProfile?.source === "class_native" ? `native_${resolvedAttackProfile.flavor ?? "ranged"}` : "unarmed");
+  p.weaponAttackProfile = { ...resolvedAttackProfile };
   p.weaponRange = Math.max(1, Math.floor(p.weaponAttackProfile?.range ?? 1));
   p.weaponMinRange = Math.max(1, Math.floor(p.weaponAttackProfile?.minRange ?? 1));
   p.weaponIsRanged = (p.weaponAttackProfile?.kind ?? "melee") === "ranged";
