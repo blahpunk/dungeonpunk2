@@ -3566,19 +3566,281 @@ const MATERIAL_DEPTH_WINDOWS = {
 const MATERIAL_BY_ID = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m]));
 const MATERIAL_COLOR_BY_ID = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.color]));
 const WEAPON_MATERIALS = METAL_TIERS.map((m) => m.id);
-const WEAPON_KINDS = ["dagger", "sword", "axe", "shortbow", "longbow", "crossbow"];
 const ARMOR_MATERIALS = METAL_TIERS.map((m) => m.id);
 const ARMOR_SLOTS = ["head", "chest", "legs"];
 const SCRAPPER_LOW_TIER_MAX_INDEX = Math.max(0, METAL_TIERS.findIndex((tier) => tier.id === "steel"));
-
-const WEAPON_KIND_LABEL = {
-  dagger: "Dagger",
-  sword: "Sword",
-  axe: "Axe",
-  shortbow: "Shortbow",
-  longbow: "Longbow",
-  crossbow: "Crossbow",
-};
+const SPECIES_BODY_MODEL = Object.freeze({
+  human: "humanoid",
+  automaton: "automaton",
+  hollowed: "phaseborn",
+  skulker: "humanoid",
+  grey: "humanoid",
+  insectoid: "insectoid",
+});
+const SPECIES_EQUIP_RULES = Object.freeze({
+  human: {
+    preferredWeaponFamilies: ["dagger", "sword", "axe", "shortbow", "longbow", "crossbow", "wand", "staff", "focus"],
+    blockedWeaponFamilies: [],
+    preferredArmorFamilies: ["plate", "leather", "robe"],
+    blockedArmorFamilies: [],
+  },
+  automaton: {
+    preferredWeaponFamilies: ["sword", "axe", "emitter", "carbine", "launcher"],
+    blockedWeaponFamilies: ["shortbow", "longbow", "crossbow", "gland_caster", "stinger_rig"],
+    preferredArmorFamilies: ["chassis"],
+    blockedArmorFamilies: ["chitin", "robe", "veil"],
+  },
+  hollowed: {
+    preferredWeaponFamilies: ["dagger", "sword", "focus", "staff", "void_lens", "wand", "shortbow", "longbow"],
+    blockedWeaponFamilies: [],
+    preferredArmorFamilies: ["veil", "leather"],
+    blockedArmorFamilies: [],
+  },
+  skulker: {
+    preferredWeaponFamilies: ["dagger", "crossbow", "shortbow", "carbine", "alchemical_kit"],
+    blockedWeaponFamilies: [],
+    preferredArmorFamilies: ["leather"],
+    blockedArmorFamilies: ["plate", "chassis", "chitin"],
+  },
+  grey: {
+    preferredWeaponFamilies: ["wand", "focus", "staff", "psi_lens", "void_lens"],
+    blockedWeaponFamilies: ["axe", "launcher", "stinger_rig"],
+    preferredArmorFamilies: ["robe"],
+    blockedArmorFamilies: ["plate", "chitin"],
+  },
+  insectoid: {
+    preferredWeaponFamilies: ["gland_caster", "stinger_rig", "dagger"],
+    blockedWeaponFamilies: ["shortbow", "longbow", "crossbow", "launcher"],
+    preferredArmorFamilies: ["chitin"],
+    blockedArmorFamilies: ["plate", "chassis"],
+  },
+});
+const SPECIES_DEFAULT_ARMOR_FAMILY = Object.freeze({
+  human: "plate",
+  automaton: "chassis",
+  hollowed: "veil",
+  skulker: "leather",
+  grey: "robe",
+  insectoid: "chitin",
+});
+const CLASS_ARMOR_FAMILY_OVERRIDE = Object.freeze({
+  riftstalker: "leather",
+  echo_sniper: "leather",
+  shadowrunner: "leather",
+  scrapper: "leather",
+  trapwright: "leather",
+});
+const WEAPON_FAMILY_DEFS = Object.freeze({
+  dagger: {
+    label: "Dagger",
+    behavior: "replacer",
+    tags: ["melee", "finesse"],
+    atk: 90,
+    description: "Fast melee sidearm with stable handling.",
+    attackProfile: { kind: "melee", range: 1, minRange: 1, requiresLOS: false, cannotFireAdjacent: false, damageMod: 1, accuracyMod: 1, critChanceMod: 2, defIgnorePct: 0.04, hands: 1 },
+  },
+  sword: {
+    label: "Sword",
+    behavior: "replacer",
+    tags: ["melee", "martial"],
+    atk: 150,
+    description: "Balanced martial blade.",
+    attackProfile: { kind: "melee", range: 1, minRange: 1, requiresLOS: false, cannotFireAdjacent: false, damageMod: 1.02, accuracyMod: 0, critChanceMod: 1, defIgnorePct: 0.02, hands: 1 },
+  },
+  axe: {
+    label: "Axe",
+    behavior: "replacer",
+    tags: ["melee", "heavy"],
+    atk: 210,
+    description: "Heavy melee breaker with penetration.",
+    attackProfile: { kind: "melee", range: 1, minRange: 1, requiresLOS: false, cannotFireAdjacent: false, damageMod: 1.08, accuracyMod: -2, critChanceMod: 0, defIgnorePct: 0.08, hands: 1 },
+  },
+  shortbow: {
+    label: "Shortbow",
+    behavior: "replacer",
+    tags: ["ballistic", "ranged"],
+    atk: 105,
+    description: "Mobile ranged bow for close-to-mid skirmishing.",
+    attackProfile: { kind: "ranged", range: 7, minRange: 1, requiresLOS: true, cannotFireAdjacent: false, damageMod: 0.84, accuracyMod: 2, critChanceMod: 3, defIgnorePct: 0, closeRangeDamageMult: 0.88, maxRangeFalloffPct: 0.12, hands: 2 },
+  },
+  longbow: {
+    label: "Longbow",
+    behavior: "replacer",
+    tags: ["ballistic", "ranged"],
+    atk: 135,
+    description: "Long-range ballistic bow with better penetration.",
+    attackProfile: { kind: "ranged", range: 8, minRange: 1, requiresLOS: true, cannotFireAdjacent: false, damageMod: 0.96, accuracyMod: 0, critChanceMod: 0, defIgnorePct: 0.05, closeRangeDamageMult: 0.74, maxRangeFalloffPct: 0.10, hands: 2 },
+  },
+  crossbow: {
+    label: "Crossbow",
+    behavior: "replacer",
+    tags: ["ballistic", "ranged", "piercing"],
+    atk: 165,
+    description: "Bolt launcher with strong armor penetration.",
+    attackProfile: { kind: "ranged", range: 6, minRange: 1, requiresLOS: true, cannotFireAdjacent: false, damageMod: 1.04, accuracyMod: -3, critChanceMod: -1, defIgnorePct: 0.09, closeRangeDamageMult: 0.62, maxRangeFalloffPct: 0.14, hands: 1 },
+  },
+  wand: {
+    label: "Wand",
+    behavior: "amplifier",
+    tags: ["arcane", "psionic", "ranged"],
+    atk: 110,
+    description: "Arcane conductor that amplifies native casting precision.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.08, accuracyBonus: 4, critBonus: 2, defIgnoreBonusPct: 0.02 },
+  },
+  staff: {
+    label: "Staff",
+    behavior: "amplifier",
+    tags: ["arcane", "void", "support"],
+    atk: 130,
+    description: "Two-hand channeling focus for powerful native techniques.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.12, accuracyBonus: 2, critBonus: 0, defIgnoreBonusPct: 0.03 },
+  },
+  focus: {
+    label: "Focus",
+    behavior: "amplifier",
+    tags: ["arcane", "psionic", "precision"],
+    atk: 120,
+    description: "Psionic focus that increases native attack quality.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.1, accuracyBonus: 6, critBonus: 4, defIgnoreBonusPct: 0.02 },
+  },
+  psi_lens: {
+    label: "Psi Lens",
+    behavior: "amplifier",
+    tags: ["psionic", "precision", "support"],
+    atk: 125,
+    description: "Grey-optimized neural lens for psionic shot shaping.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.1, accuracyBonus: 5, critBonus: 3, defIgnoreBonusPct: 0.03 },
+  },
+  emitter: {
+    label: "Emitter",
+    behavior: "amplifier",
+    tags: ["tech", "ranged"],
+    atk: 125,
+    description: "Tech emitter that boosts native discharge attacks.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.1, accuracyBonus: 3, critBonus: 1, defIgnoreBonusPct: 0.04 },
+  },
+  carbine: {
+    label: "Carbine",
+    behavior: "amplifier",
+    tags: ["tech", "ballistic", "ranged"],
+    atk: 145,
+    description: "Compact kinetic-tech hybrid for amplified native fire.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.14, accuracyBonus: 2, critBonus: 2, defIgnoreBonusPct: 0.04 },
+  },
+  launcher: {
+    label: "Launcher",
+    behavior: "replacer",
+    tags: ["tech", "ranged", "heavy"],
+    atk: 190,
+    description: "Dedicated heavy launcher replacing native attacks.",
+    attackProfile: { kind: "ranged", range: 6, minRange: 1, requiresLOS: true, cannotFireAdjacent: false, damageMod: 1.12, accuracyMod: -4, critChanceMod: 0, defIgnorePct: 0.08, closeRangeDamageMult: 0.68, maxRangeFalloffPct: 0.14, hands: 2 },
+  },
+  gland_caster: {
+    label: "Gland-Caster",
+    behavior: "amplifier",
+    tags: ["bio", "toxin", "ranged"],
+    atk: 120,
+    description: "Bio-organic ranged gland that amplifies toxin native attacks.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.1, accuracyBonus: 4, critBonus: 0, defIgnoreBonusPct: 0.03 },
+  },
+  stinger_rig: {
+    label: "Stinger-Rig",
+    behavior: "amplifier",
+    tags: ["bio", "toxin", "tempo"],
+    atk: 135,
+    description: "Insectoid rig that improves native venom tempo.",
+    amplifierProfile: { rangeBonus: 0, damageMult: 1.13, accuracyBonus: 2, critBonus: 2, defIgnoreBonusPct: 0.03 },
+  },
+  void_lens: {
+    label: "Void Lens",
+    behavior: "amplifier",
+    tags: ["void", "anomaly", "ranged"],
+    atk: 140,
+    description: "Anomalous lens increasing void-native range and efficiency.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.14, accuracyBonus: 3, critBonus: 1, defIgnoreBonusPct: 0.05 },
+  },
+  alchemical_kit: {
+    label: "Alchemical Kit",
+    behavior: "amplifier",
+    tags: ["alchemical", "support"],
+    atk: 100,
+    description: "Portable reagent pack amplifying native alchemical attacks.",
+    amplifierProfile: { rangeBonus: 1, damageMult: 1.08, accuracyBonus: 3, critBonus: 0, defIgnoreBonusPct: 0.01 },
+  },
+});
+const ARMOR_FAMILY_DEFS = Object.freeze({
+  plate: {
+    label: "Plate",
+    slotNames: { head: ["Helm"], chest: ["Chestplate"], legs: ["Greaves"] },
+    defMult: 1.22,
+    evaBonus: -4,
+    energyBonus: 0,
+    tags: ["armor", "martial", "heavy"],
+    description: "Highest mitigation with reduced mobility.",
+  },
+  leather: {
+    label: "Leather",
+    slotNames: { head: ["Hood", "Coif"], chest: ["Jerkin", "Coat"], legs: ["Leathers", "Treads"] },
+    defMult: 0.96,
+    evaBonus: 2,
+    energyBonus: 0,
+    tags: ["armor", "balanced", "agile"],
+    description: "Balanced protection with mobility.",
+  },
+  robe: {
+    label: "Robe",
+    slotNames: { head: ["Circlet", "Cowl"], chest: ["Robe", "Mantle"], legs: ["Hem", "Wrapped Leggings"] },
+    defMult: 0.78,
+    evaBonus: 1,
+    energyBonus: 40,
+    tags: ["armor", "arcane", "utility"],
+    description: "Low armor but high utility and energy support.",
+  },
+  chassis: {
+    label: "Chassis",
+    slotNames: { head: ["Sensor Crown", "Head Unit"], chest: ["Core Plating"], legs: ["Servo Struts"] },
+    defMult: 1.14,
+    evaBonus: -1,
+    energyBonus: 18,
+    tags: ["armor", "tech", "stability"],
+    description: "Automaton plating tuned for stability and systems load.",
+  },
+  chitin: {
+    label: "Chitin",
+    slotNames: { head: ["Carapace Crest"], chest: ["Thorax Shell"], legs: ["Lower Carapace"] },
+    defMult: 1.08,
+    evaBonus: 0,
+    energyBonus: 10,
+    tags: ["armor", "bio", "tempo"],
+    description: "Bio-hard shell with resilient tempo bonuses.",
+  },
+  veil: {
+    label: "Veil",
+    slotNames: { head: ["Veil Halo"], chest: ["Phase Shroud"], legs: ["Rift Wraps"] },
+    defMult: 0.86,
+    evaBonus: 3,
+    energyBonus: 24,
+    tags: ["armor", "void", "anomaly", "utility"],
+    description: "Anomalous defense favoring evasion and utility.",
+  },
+});
+const WEAPON_KINDS = Object.freeze(Object.keys(WEAPON_FAMILY_DEFS));
+const WEAPON_KIND_LABEL = Object.freeze(Object.fromEntries(
+  WEAPON_KINDS.map((id) => [id, WEAPON_FAMILY_DEFS[id]?.label ?? titleFromId(id)])
+));
+const WEAPON_KIND_ATK = Object.freeze(Object.fromEntries(
+  WEAPON_KINDS.map((id) => [id, Math.max(1, Math.floor(WEAPON_FAMILY_DEFS[id]?.atk ?? 100))])
+));
+const WEAPON_ATTACK_PROFILES = Object.freeze(Object.fromEntries(
+  WEAPON_KINDS
+    .filter((id) => WEAPON_FAMILY_DEFS[id]?.behavior === "replacer")
+    .map((id) => [id, WEAPON_FAMILY_DEFS[id].attackProfile])
+));
+const AMPLIFIER_FAMILY_PROFILES = Object.freeze(Object.fromEntries(
+  WEAPON_KINDS
+    .filter((id) => WEAPON_FAMILY_DEFS[id]?.behavior === "amplifier")
+    .map((id) => [id, WEAPON_FAMILY_DEFS[id].amplifierProfile])
+));
 const BOW_DISPLAY_NAME_BY_MATERIAL = {
   wood: {
     shortbow: "Oak Initiate Bow",
@@ -3671,95 +3933,8 @@ const BOW_DISPLAY_NAME_BY_MATERIAL = {
     crossbow: "Event Horizon Arbalest",
   },
 };
-const WEAPON_KIND_ATK = {
-  dagger: 90,
-  sword: 150,
-  axe: 210,
-  shortbow: 105,
-  longbow: 135,
-  crossbow: 165,
-};
-const WEAPON_ATTACK_PROFILES = {
-  dagger: {
-    kind: "melee",
-    range: 1,
-    minRange: 1,
-    requiresLOS: false,
-    cannotFireAdjacent: false,
-    damageMod: 1,
-    accuracyMod: 0,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    hands: 1,
-  },
-  sword: {
-    kind: "melee",
-    range: 1,
-    minRange: 1,
-    requiresLOS: false,
-    cannotFireAdjacent: false,
-    damageMod: 1,
-    accuracyMod: 0,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    hands: 1,
-  },
-  axe: {
-    kind: "melee",
-    range: 1,
-    minRange: 1,
-    requiresLOS: false,
-    cannotFireAdjacent: false,
-    damageMod: 1,
-    accuracyMod: -1,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    hands: 1,
-  },
-  shortbow: {
-    kind: "ranged",
-    range: 7,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.80,
-    accuracyMod: 2,
-    critChanceMod: 3,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.88,
-    maxRangeFalloffPct: 0.12,
-    hands: 2,
-  },
-  longbow: {
-    kind: "ranged",
-    range: 8,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.92,
-    accuracyMod: 0,
-    critChanceMod: 0,
-    defIgnorePct: 0.05,
-    closeRangeDamageMult: 0.75,
-    maxRangeFalloffPct: 0.10,
-    hands: 2,
-  },
-  crossbow: {
-    kind: "ranged",
-    range: 6,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 1.04,
-    accuracyMod: -3,
-    critChanceMod: -1,
-    defIgnorePct: 0.09,
-    closeRangeDamageMult: 0.62,
-    maxRangeFalloffPct: 0.14,
-    hands: 1,
-  },
-};
 const UNARMED_ATTACK_PROFILE = {
+  attackName: "Unarmed Strike",
   kind: "melee",
   flavor: "unarmed",
   range: 1,
@@ -3774,134 +3949,86 @@ const UNARMED_ATTACK_PROFILE = {
   maxRangeFalloffPct: 0,
   hands: 0,
 };
+function nativeMelee(attackName, flavor = "melee", damageMod = 0.82, accuracyMod = 2, critChanceMod = 0, defIgnorePct = 0) {
+  return {
+    attackName,
+    kind: "melee",
+    flavor,
+    range: 1,
+    minRange: 1,
+    requiresLOS: false,
+    cannotFireAdjacent: false,
+    damageMod,
+    accuracyMod,
+    critChanceMod,
+    defIgnorePct,
+    closeRangeDamageMult: 1,
+    maxRangeFalloffPct: 0,
+  };
+}
+function nativeRanged(attackName, flavor, range = 5, damageMod = 0.82, accuracyMod = 4, critChanceMod = 0, defIgnorePct = 0.02) {
+  return {
+    attackName,
+    kind: "ranged",
+    flavor,
+    range,
+    minRange: 1,
+    requiresLOS: true,
+    cannotFireAdjacent: false,
+    damageMod,
+    accuracyMod,
+    critChanceMod,
+    defIgnorePct,
+    closeRangeDamageMult: 0.74,
+    maxRangeFalloffPct: 0.10,
+  };
+}
 const CLASS_NATIVE_ATTACKS = {
-  ranger: {
-    kind: "ranged",
-    flavor: "ballistic",
-    range: 5,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.82,
-    accuracyMod: 8,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.72,
-    maxRangeFalloffPct: 0.1,
-  },
-  alchemist: {
-    kind: "ranged",
-    flavor: "alchemical",
-    range: 4,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.78,
-    accuracyMod: 4,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.72,
-    maxRangeFalloffPct: 0.08,
-  },
-  calibrator: {
-    kind: "ranged",
-    flavor: "tech",
-    range: 5,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.8,
-    accuracyMod: 10,
-    critChanceMod: 4,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.72,
-    maxRangeFalloffPct: 0.1,
-  },
-  overclock_unit: {
-    kind: "ranged",
-    flavor: "tech",
-    range: 4,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.84,
-    accuracyMod: 2,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.74,
-    maxRangeFalloffPct: 0.08,
-  },
-  void_savant: {
-    kind: "ranged",
-    flavor: "void",
-    range: 5,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.86,
-    accuracyMod: 4,
-    critChanceMod: 0,
-    defIgnorePct: 0.06,
-    closeRangeDamageMult: 0.72,
-    maxRangeFalloffPct: 0.1,
-  },
-  echo_sniper: {
-    kind: "ranged",
-    flavor: "void",
-    range: 7,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.8,
-    accuracyMod: 12,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.6,
-    maxRangeFalloffPct: 0.16,
-  },
-  psion: {
-    kind: "ranged",
-    flavor: "psionic",
-    range: 4,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.82,
-    accuracyMod: 6,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.74,
-    maxRangeFalloffPct: 0.08,
-  },
-  mindpiercer: {
-    kind: "ranged",
-    flavor: "psionic",
-    range: 5,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.8,
-    accuracyMod: 6,
-    critChanceMod: 5,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.72,
-    maxRangeFalloffPct: 0.1,
-  },
-  spitter: {
-    kind: "ranged",
-    flavor: "toxin",
-    range: 5,
-    minRange: 1,
-    requiresLOS: true,
-    cannotFireAdjacent: false,
-    damageMod: 0.8,
-    accuracyMod: 8,
-    critChanceMod: 0,
-    defIgnorePct: 0,
-    closeRangeDamageMult: 0.72,
-    maxRangeFalloffPct: 0.1,
-  },
+  vanguard: nativeMelee("Combat Shove", "melee", 0.84, 2, 0, 0.02),
+  bulwark: nativeMelee("Guard Bash", "melee", 0.83, 1, 0, 0.04),
+  rogue: nativeMelee("Knife-Hand Thrust", "melee", 0.8, 5, 4, 0.06),
+  ranger: nativeRanged("Improvised Shot", "ballistic", 5, 0.82, 8, 0, 0),
+  operative: nativeRanged("Snap Shot", "ballistic", 4, 0.8, 6, 2, 0.02),
+  alchemist: nativeRanged("Volatile Flask", "alchemical", 4, 0.8, 4, 0, 0),
+
+  sentinel: nativeMelee("Impact Arm", "melee", 0.85, 1, 0, 0.03),
+  execution_frame: nativeMelee("Piston Smash", "melee", 0.9, -1, 0, 0.08),
+  calibrator: nativeRanged("Pulse Shot", "tech", 5, 0.82, 10, 4, 0.02),
+  overclock_unit: nativeRanged("Burst Discharge", "tech", 4, 0.84, 2, 0, 0.01),
+  fabricator: nativeRanged("Cutter Beam", "tech", 4, 0.79, 5, 0, 0.03),
+  nullblade: nativeMelee("Null Edge", "void", 0.86, 2, 2, 0.08),
+
+  veilblade: nativeMelee("Phase Slash", "melee", 0.83, 3, 2, 0.05),
+  shadeguard: nativeMelee("Void Brace", "void", 0.84, 1, 0, 0.05),
+  riftstalker: nativeMelee("Rift Lunge", "melee", 0.86, 3, 2, 0.06),
+  echo_sniper: nativeRanged("Echo Shard", "void", 7, 0.8, 12, 0, 0),
+  void_savant: nativeRanged("Void Bolt", "void", 5, 0.86, 4, 0, 0.06),
+  warden_gap: nativeRanged("Gap Pulse", "support_anomaly", 5, 0.8, 6, 0, 0.03),
+
+  tunnel_striker: nativeMelee("Hook Jab", "melee", 0.84, 2, 1, 0.03),
+  slipblade: nativeMelee("Skitter Slash", "melee", 0.82, 4, 3, 0.04),
+  burrowguard: nativeMelee("Burrow Slam", "melee", 0.86, 0, 0, 0.05),
+  shadowrunner: nativeRanged("Scrap Dart", "ballistic", 4, 0.8, 5, 2, 0.01),
+  scrapper: nativeRanged("Junk Toss", "ballistic", 4, 0.82, 2, 0, 0.02),
+  trapwright: nativeRanged("Shrapnel Snap", "ballistic", 4, 0.81, 4, 1, 0.03),
+
+  psion: nativeRanged("Psi Bolt", "psionic", 4, 0.82, 6, 0, 0),
+  mindpiercer: nativeRanged("Neural Spike", "psionic", 5, 0.8, 6, 5, 0),
+  surveyor: nativeRanged("Scan Lance", "psionic", 5, 0.79, 8, 1, 0.02),
+  telekinetic: nativeRanged("Force Shard", "psionic", 5, 0.82, 4, 0, 0.03),
+  neural_anchor: nativeRanged("Anchor Pulse", "psionic", 4, 0.8, 5, 0, 0.02),
+  observer_prime: nativeRanged("Observation Ray", "psionic", 5, 0.8, 6, 1, 0.02),
+
+  hive_warrior: nativeMelee("Talon Rake", "melee", 0.85, 2, 1, 0.03),
+  spitter: nativeRanged("Toxic Spit", "toxin", 5, 0.8, 8, 0, 0),
+  chitin_guard: nativeMelee("Horn Slam", "melee", 0.86, 0, 0, 0.04),
+  skydarter: nativeMelee("Dart Pounce", "melee", 0.83, 4, 2, 0.04),
+  broodmind: nativeRanged("Hive Pulse", "bio", 4, 0.79, 6, 0, 0.02),
+  venomblade: nativeMelee("Venom Slash", "toxin", 0.84, 3, 3, 0.05),
 };
+const NATIVE_ATTACK_LABEL_BY_CLASS = Object.freeze(
+  Object.fromEntries(Object.entries(CLASS_NATIVE_ATTACKS).map(([classId, profile]) => [classId, profile.attackName ?? "Native Attack"]))
+);
 const WEAPON_MATERIAL_ATK = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.atkBonus]));
 const ARMOR_MATERIAL_DEF = Object.fromEntries(METAL_TIERS.map((m) => [m.id, m.defBonus]));
 const ARMOR_SLOT_DEF = {
@@ -3909,25 +4036,242 @@ const ARMOR_SLOT_DEF = {
   chest: 130,
   legs: 90,
 };
-
+const ITEM_TEMPLATES = {};
+const ITEM_TEMPLATE_ALIAS = {};
+let itemInstanceSerial = 0;
 function capWord(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function titleFromId(s) { return String(s ?? "").split("_").map(capWord).join(" "); }
 function materialLabel(material) { return MATERIAL_BY_ID[material]?.name ?? titleFromId(material); }
+function normalizeWeaponFamilyId(value) {
+  return String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+}
+function normalizeArmorFamilyId(value) {
+  return String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+}
+function bodyModelForSpecies(speciesId) {
+  const sid = normalizeCharacterSpeciesId(speciesId);
+  return SPECIES_BODY_MODEL[sid] ?? "humanoid";
+}
+function speciesEquipRule(speciesId) {
+  const sid = normalizeCharacterSpeciesId(speciesId);
+  return SPECIES_EQUIP_RULES[sid] ?? SPECIES_EQUIP_RULES.human;
+}
+function armorFamilyForCharacter(speciesId, classId = null) {
+  const sid = normalizeCharacterSpeciesId(speciesId);
+  const cid = normalizeCharacterClassId(classId ?? defaultClassIdForSpecies(sid), sid);
+  return normalizeArmorFamilyId(CLASS_ARMOR_FAMILY_OVERRIDE[cid] ?? SPECIES_DEFAULT_ARMOR_FAMILY[sid] ?? "plate");
+}
+function speciesPreferredWeaponUsers(family) {
+  const fam = normalizeWeaponFamilyId(family);
+  const out = [];
+  for (const sid of Object.keys(SPECIES_DEFS)) {
+    if ((speciesEquipRule(sid).preferredWeaponFamilies ?? []).includes(fam)) out.push(sid);
+  }
+  return out;
+}
+function speciesBlockedWeaponUsers(family) {
+  const fam = normalizeWeaponFamilyId(family);
+  const out = [];
+  for (const sid of Object.keys(SPECIES_DEFS)) {
+    if ((speciesEquipRule(sid).blockedWeaponFamilies ?? []).includes(fam)) out.push(sid);
+  }
+  return out;
+}
+function speciesPreferredArmorUsers(family) {
+  const fam = normalizeArmorFamilyId(family);
+  const out = [];
+  for (const sid of Object.keys(SPECIES_DEFS)) {
+    if ((speciesEquipRule(sid).preferredArmorFamilies ?? []).includes(fam)) out.push(sid);
+  }
+  return out;
+}
+function speciesBlockedArmorUsers(family) {
+  const fam = normalizeArmorFamilyId(family);
+  const out = [];
+  for (const sid of Object.keys(SPECIES_DEFS)) {
+    if ((speciesEquipRule(sid).blockedArmorFamilies ?? []).includes(fam)) out.push(sid);
+  }
+  return out;
+}
 function weaponDisplayName(material, kind) {
-  const mappedBowName = BOW_DISPLAY_NAME_BY_MATERIAL[material]?.[kind];
+  const familyId = normalizeWeaponFamilyId(kind);
+  const familyLabel = WEAPON_KIND_LABEL[familyId] ?? titleFromId(familyId);
+  const mappedBowName = BOW_DISPLAY_NAME_BY_MATERIAL[material]?.[familyId];
   if (mappedBowName) {
     if (/bow/i.test(mappedBowName)) return mappedBowName;
-    return `${mappedBowName} (${WEAPON_KIND_LABEL[kind]})`;
+    return `${mappedBowName} (${familyLabel})`;
   }
-  return `${materialLabel(material)} ${WEAPON_KIND_LABEL[kind]}`;
+  return `${materialLabel(material)} ${familyLabel}`;
 }
-function weaponType(material, kind) { return `weapon_${material}_${kind}`; }
-function armorType(material, slot) { return `armor_${material}_${slot}`; }
-function weaponKindFromItemType(type) {
-  if (!type || typeof type !== "string" || !type.startsWith("weapon_")) return null;
+function armorSlotNameForFamily(family, slot, material = "") {
+  const familyId = normalizeArmorFamilyId(family);
+  const slotId = String(slot ?? "").trim().toLowerCase();
+  const names = ARMOR_FAMILY_DEFS[familyId]?.slotNames?.[slotId] ?? [titleFromId(slotId)];
+  if (!Array.isArray(names) || names.length <= 0) return titleFromId(slotId);
+  const materialIndex = Math.max(0, METAL_TIERS.findIndex((tier) => tier.id === material));
+  return names[materialIndex % names.length];
+}
+function weaponType(material, kind) {
+  const mat = String(material ?? "").trim().toLowerCase();
+  const fam = normalizeWeaponFamilyId(kind);
+  return `weapon_${mat}_${fam}`;
+}
+function armorType(familyOrMaterial, materialOrSlot, maybeSlot = null) {
+  if (maybeSlot === null || maybeSlot === undefined) {
+    const legacyMaterial = String(familyOrMaterial ?? "").trim().toLowerCase();
+    const legacySlot = String(materialOrSlot ?? "").trim().toLowerCase();
+    return `armor_plate_${legacyMaterial}_${legacySlot}`;
+  }
+  const family = normalizeArmorFamilyId(familyOrMaterial);
+  const material = String(materialOrSlot ?? "").trim().toLowerCase();
+  const slot = String(maybeSlot ?? "").trim().toLowerCase();
+  return `armor_${family}_${material}_${slot}`;
+}
+function parseArmorTypeParts(type) {
+  if (!type || typeof type !== "string" || !type.startsWith("armor_")) return null;
   const parts = type.split("_");
   if (parts.length < 3) return null;
-  return parts[parts.length - 1] ?? null;
+  const slot = parts[parts.length - 1];
+  if (!ARMOR_SLOTS.includes(slot)) return null;
+  const middle = parts.slice(1, -1);
+  const legacyMaterial = middle.join("_");
+  if (MATERIAL_BY_ID[legacyMaterial]) {
+    return { family: null, material: legacyMaterial, slot, legacy: true };
+  }
+  for (let i = 1; i < middle.length; i++) {
+    const family = middle.slice(0, i).join("_");
+    const material = middle.slice(i).join("_");
+    if (!MATERIAL_BY_ID[material]) continue;
+    return { family: normalizeArmorFamilyId(family), material, slot, legacy: false };
+  }
+  return null;
+}
+function normalizeWeaponTypeId(type) {
+  if (!type || typeof type !== "string" || !type.startsWith("weapon_")) return type;
+  const body = type.slice("weapon_".length);
+  const mats = [...WEAPON_MATERIALS].sort((a, b) => b.length - a.length);
+  for (const material of mats) {
+    const prefix = `${material}_`;
+    if (!body.startsWith(prefix)) continue;
+    const family = normalizeWeaponFamilyId(body.slice(prefix.length));
+    const normalized = weaponType(material, family);
+    return normalized;
+  }
+  return type;
+}
+function resolveLegacyArmorType(type, speciesId = DEFAULT_CHARACTER_SPECIES_ID, classId = DEFAULT_CHARACTER_CLASS_ID) {
+  const parsed = parseArmorTypeParts(type);
+  if (!parsed?.material || !parsed?.slot) return type;
+  const familyRaw = parsed.family ?? armorFamilyForCharacter(speciesId, classId);
+  const family = ARMOR_FAMILY_DEFS[familyRaw] ? familyRaw : "plate";
+  return armorType(family, parsed.material, parsed.slot);
+}
+function itemTemplateForType(type) {
+  const normalized = normalizeItemType(type);
+  const templateId = ITEM_TEMPLATE_ALIAS[normalized] ?? normalized;
+  return ITEM_TEMPLATES[templateId] ?? null;
+}
+function itemTemplateIdForType(type) {
+  return itemTemplateForType(type)?.id ?? null;
+}
+function createItemInstance(type, ownerType = "world", ownerId = null, position = null) {
+  const normalizedType = normalizeItemType(type);
+  const templateId = itemTemplateIdForType(normalizedType) ?? normalizedType;
+  const nowIso = new Date().toISOString();
+  itemInstanceSerial += 1;
+  const serial = itemInstanceSerial.toString(36).padStart(4, "0");
+  const id = `itm_${Date.now().toString(36)}_${serial}`;
+  return {
+    id,
+    templateId,
+    type: normalizedType,
+    seed: `${Math.floor(Math.random() * 1e9)}`,
+    affixes: [],
+    ownerType,
+    ownerId,
+    position: position && Number.isFinite(position.x) && Number.isFinite(position.y) && Number.isFinite(position.z)
+      ? { x: Math.floor(position.x), y: Math.floor(position.y), z: Math.floor(position.z) }
+      : undefined,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+}
+function isSpeciesPreferredForItemType(type, speciesId) {
+  const template = itemTemplateForType(type);
+  if (!template) return false;
+  const sid = normalizeCharacterSpeciesId(speciesId);
+  return (template.speciesAffinity ?? []).includes(sid);
+}
+function equipValidationForItemType(type, speciesId, classId = DEFAULT_CHARACTER_CLASS_ID) {
+  const template = itemTemplateForType(type);
+  if (!template) return { ok: false, reason: "Unknown item template." };
+  const sid = normalizeCharacterSpeciesId(speciesId);
+  const cid = normalizeCharacterClassId(classId, sid);
+  const rules = template.equipRules ?? {};
+  const bodyModel = bodyModelForSpecies(sid);
+  if (Array.isArray(rules.allowedSpecies) && rules.allowedSpecies.length > 0 && !rules.allowedSpecies.includes(sid)) {
+    return { ok: false, reason: `${characterSpeciesDef(sid).name} cannot equip this family.` };
+  }
+  if (Array.isArray(rules.blockedSpecies) && rules.blockedSpecies.includes(sid)) {
+    return { ok: false, reason: `${characterSpeciesDef(sid).name} is blocked from this family.` };
+  }
+  const requiredBodyModel = String(rules.bodyModel ?? "universal").trim().toLowerCase();
+  if (requiredBodyModel && requiredBodyModel !== "universal" && requiredBodyModel !== bodyModel) {
+    return { ok: false, reason: `Requires ${titleFromId(requiredBodyModel)} body model.` };
+  }
+  if (Array.isArray(template.classAffinity) && template.classAffinity.length > 0 && template.classAffinity.includes(cid)) {
+    return { ok: true, favored: true, reason: "" };
+  }
+  return { ok: true, favored: isSpeciesPreferredForItemType(type, sid), reason: "" };
+}
+function canPlayerEquipItemType(state, type) {
+  const sid = state?.player?.speciesId ?? state?.character?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID;
+  const cid = state?.player?.classId ?? state?.character?.classId ?? defaultClassIdForSpecies(sid);
+  return equipValidationForItemType(type, sid, cid);
+}
+function itemUsageMetaForType(type) {
+  const template = itemTemplateForType(type);
+  if (!template) return null;
+  const favoredSpecies = (template.speciesAffinity ?? []).map((sid) => characterSpeciesDef(sid).name);
+  const blockedSpecies = (template.equipRules?.blockedSpecies ?? []).map((sid) => characterSpeciesDef(sid).name);
+  const allowedSpecies = (template.equipRules?.allowedSpecies ?? []).map((sid) => characterSpeciesDef(sid).name);
+  const usableBy = allowedSpecies.length > 0
+    ? allowedSpecies
+    : Object.values(SPECIES_DEFS)
+      .map((entry) => entry.id)
+      .filter((sid) => !blockedSpecies.includes(characterSpeciesDef(sid).name))
+      .map((sid) => characterSpeciesDef(sid).name);
+  return {
+    family: template.family,
+    behavior: template.behavior ?? "replacer",
+    archetypeTags: template.archetypeTags ?? [],
+    favoredBy: favoredSpecies,
+    usableBy,
+  };
+}
+function registerItemTemplate(template, aliases = []) {
+  if (!template?.id) return;
+  ITEM_TEMPLATES[template.id] = template;
+  ITEM_TEMPLATE_ALIAS[template.id] = template.id;
+  for (const alias of aliases ?? []) {
+    if (!alias || typeof alias !== "string") continue;
+    ITEM_TEMPLATE_ALIAS[alias] = template.id;
+  }
+}
+function weaponKindFromItemType(type) {
+  const template = itemTemplateForType(type);
+  if (template?.category === "weapon") return normalizeWeaponFamilyId(template.family);
+  const normalized = normalizeWeaponTypeId(type);
+  if (!normalized || typeof normalized !== "string" || !normalized.startsWith("weapon_")) return null;
+  const body = normalized.slice("weapon_".length);
+  const mats = [...WEAPON_MATERIALS].sort((a, b) => b.length - a.length);
+  for (const material of mats) {
+    const prefix = `${material}_`;
+    if (!body.startsWith(prefix)) continue;
+    const family = normalizeWeaponFamilyId(body.slice(prefix.length));
+    return family || null;
+  }
+  return null;
 }
 function normalizeAttackProfile(profile, fallbackProfile = UNARMED_ATTACK_PROFILE) {
   const src = (profile && typeof profile === "object") ? profile : fallbackProfile;
@@ -3942,6 +4286,7 @@ function normalizeAttackProfile(profile, fallbackProfile = UNARMED_ATTACK_PROFIL
   return {
     kind,
     flavor: flavorRaw || (kind === "ranged" ? "ballistic" : "melee"),
+    attackName: String(src.attackName ?? fallback.attackName ?? "Attack"),
     range,
     minRange,
     requiresLOS: kind === "ranged" ? !!src.requiresLOS : false,
@@ -3955,10 +4300,30 @@ function normalizeAttackProfile(profile, fallbackProfile = UNARMED_ATTACK_PROFIL
     hands: Math.max(0, Math.floor(Number(src.hands ?? fallback.hands ?? 0) || 0)),
   };
 }
+function applyAmplifierToAttackProfile(nativeProfile, amplifierProfile, amplifierName = "") {
+  const base = normalizeAttackProfile(nativeProfile, UNARMED_ATTACK_PROFILE);
+  const amp = (amplifierProfile && typeof amplifierProfile === "object") ? amplifierProfile : {};
+  const out = {
+    ...base,
+    attackName: amplifierName ? `${base.attackName} (Amplified)` : base.attackName,
+    range: Math.max(base.minRange, Math.floor(base.range + (Number(amp.rangeBonus ?? 0) || 0))),
+    damageMod: Math.max(0.1, Number(base.damageMod ?? 1) * Math.max(0.1, Number(amp.damageMult ?? 1))),
+    accuracyMod: Math.round((Number(base.accuracyMod ?? 0) || 0) + (Number(amp.accuracyBonus ?? 0) || 0)),
+    critChanceMod: Math.round((Number(base.critChanceMod ?? 0) || 0) + (Number(amp.critBonus ?? 0) || 0)),
+    defIgnorePct: clamp((Number(base.defIgnorePct ?? 0) || 0) + (Number(amp.defIgnoreBonusPct ?? 0) || 0), 0, 0.9),
+    closeRangeDamageMult: clamp(Number(base.closeRangeDamageMult ?? 1) * Math.max(0.25, Number(amp.closeRangeMult ?? 1)), 0.2, 1),
+    maxRangeFalloffPct: clamp(Number(base.maxRangeFalloffPct ?? 0) * Math.max(0.2, Number(amp.falloffMult ?? 1)), 0, 0.8),
+  };
+  return out;
+}
 function weaponAttackProfileForType(type) {
-  const kind = weaponKindFromItemType(type);
-  const profile = kind ? WEAPON_ATTACK_PROFILES[kind] : null;
-  return normalizeAttackProfile(profile ?? UNARMED_ATTACK_PROFILE, UNARMED_ATTACK_PROFILE);
+  const template = itemTemplateForType(type);
+  if (template?.category !== "weapon") return null;
+  const behavior = String(template.behavior ?? "replacer");
+  if (behavior !== "replacer") return null;
+  const family = normalizeWeaponFamilyId(template.family);
+  const profile = WEAPON_ATTACK_PROFILES[family] ?? null;
+  return profile ? normalizeAttackProfile(profile, UNARMED_ATTACK_PROFILE) : null;
 }
 function classNativeAttackProfile(classId) {
   const cid = normalizeCharacterClassId(classId);
@@ -3967,16 +4332,34 @@ function classNativeAttackProfile(classId) {
 }
 function resolvePlayerAttackProfile(state) {
   const weaponTypeId = state?.player?.equip?.weapon ?? null;
-  const weaponProfile = weaponTypeId ? WEAPONS[weaponTypeId]?.attackProfile ?? null : null;
-  if (weaponProfile) {
-    return {
-      ...normalizeAttackProfile(weaponProfile, UNARMED_ATTACK_PROFILE),
-      source: "weapon",
-      weaponType: weaponTypeId,
-    };
-  }
   const classId = state?.player?.classId ?? state?.character?.classId ?? DEFAULT_CHARACTER_CLASS_ID;
   const nativeProfile = classNativeAttackProfile(classId);
+  const weaponTemplate = weaponTypeId ? itemTemplateForType(weaponTypeId) : null;
+  const equipValidation = weaponTypeId ? canPlayerEquipItemType(state, weaponTypeId) : { ok: true };
+  if (weaponTemplate?.category === "weapon" && equipValidation.ok) {
+    const behavior = String(weaponTemplate.behavior ?? "replacer");
+    if (behavior === "replacer") {
+      const weaponProfile = WEAPONS[weaponTypeId]?.attackProfile ?? null;
+      if (weaponProfile) {
+        return {
+          ...normalizeAttackProfile(weaponProfile, UNARMED_ATTACK_PROFILE),
+          source: "replacer",
+          weaponType: weaponTypeId,
+          family: normalizeWeaponFamilyId(weaponTemplate.family),
+        };
+      }
+    }
+    if (behavior === "amplifier" && nativeProfile) {
+      const amplifier = WEAPONS[weaponTypeId]?.amplifierProfile ?? AMPLIFIER_FAMILY_PROFILES[normalizeWeaponFamilyId(weaponTemplate.family)] ?? null;
+      return {
+        ...applyAmplifierToAttackProfile(nativeProfile, amplifier, ITEM_TYPES[weaponTypeId]?.name ?? ""),
+        source: "amplified_native",
+        weaponType: weaponTypeId,
+        family: normalizeWeaponFamilyId(weaponTemplate.family),
+        classId: normalizeCharacterClassId(classId),
+      };
+    }
+  }
   if (nativeProfile) {
     return {
       ...nativeProfile,
@@ -4011,24 +4394,95 @@ const ITEM_TYPES = {
 
 const WEAPONS = {};
 for (const material of WEAPON_MATERIALS) {
-  for (const kind of WEAPON_KINDS) {
-    const id = weaponType(material, kind);
-    ITEM_TYPES[id] = { name: weaponDisplayName(material, kind) };
+  for (const family of WEAPON_KINDS) {
+    const id = weaponType(material, family);
+    const familyDef = WEAPON_FAMILY_DEFS[family] ?? WEAPON_FAMILY_DEFS.dagger;
+    const tags = [...(familyDef.tags ?? [])];
+    const behavior = String(familyDef.behavior ?? "replacer");
+    ITEM_TYPES[id] = { name: weaponDisplayName(material, family) };
+    const attackProfile = behavior === "replacer"
+      ? normalizeAttackProfile(WEAPON_ATTACK_PROFILES[family] ?? UNARMED_ATTACK_PROFILE, UNARMED_ATTACK_PROFILE)
+      : null;
+    const amplifierProfile = behavior === "amplifier"
+      ? { ...(AMPLIFIER_FAMILY_PROFILES[family] ?? {}) }
+      : null;
     WEAPONS[id] = {
-      atkBonus: WEAPON_KIND_ATK[kind] + WEAPON_MATERIAL_ATK[material],
-      kind,
-      attackProfile: normalizeAttackProfile(WEAPON_ATTACK_PROFILES[kind] ?? UNARMED_ATTACK_PROFILE, UNARMED_ATTACK_PROFILE),
+      atkBonus: WEAPON_KIND_ATK[family] + WEAPON_MATERIAL_ATK[material],
+      kind: family,
+      family,
+      behavior,
+      attackProfile,
+      amplifierProfile,
     };
+    registerItemTemplate({
+      id,
+      category: "weapon",
+      family,
+      slot: "weapon",
+      materialTierId: material,
+      archetypeTags: tags,
+      speciesAffinity: speciesPreferredWeaponUsers(family),
+      classAffinity: [],
+      equipRules: {
+        blockedSpecies: speciesBlockedWeaponUsers(family),
+        bodyModel: "universal",
+      },
+      behavior,
+      attackProfileId: behavior === "replacer" ? family : undefined,
+      amplifierProfileId: behavior === "amplifier" ? family : undefined,
+      statBudget: {
+        atkBonus: WEAPON_KIND_ATK[family] + WEAPON_MATERIAL_ATK[material],
+        defBonus: 0,
+        critBonus: Math.round(Number(familyDef.attackProfile?.critChanceMod ?? familyDef.amplifierProfile?.critBonus ?? 0)),
+        defIgnorePct: clamp(Number(familyDef.attackProfile?.defIgnorePct ?? familyDef.amplifierProfile?.defIgnoreBonusPct ?? 0), 0, 0.9),
+      },
+      value: 0,
+      rarityWeight: Math.max(1, Math.round(MATERIAL_DEPTH_WINDOWS[material]?.peakWeight ?? 1)),
+      spriteProfileId: id,
+      description: familyDef.description ?? "",
+    });
   }
 }
 
 const ARMOR_PIECES = {};
 for (const material of ARMOR_MATERIALS) {
-  for (const slot of ARMOR_SLOTS) {
-    const id = armorType(material, slot);
-    const slotLabel = slot === "head" ? "Helmet" : (slot === "chest" ? "Chestplate" : "Platelegs");
-    ITEM_TYPES[id] = { name: `${materialLabel(material)} ${slotLabel}` };
-    ARMOR_PIECES[id] = { slot, defBonus: ARMOR_MATERIAL_DEF[material] + ARMOR_SLOT_DEF[slot] };
+  for (const family of Object.keys(ARMOR_FAMILY_DEFS)) {
+    const familyDef = ARMOR_FAMILY_DEFS[family];
+    for (const slot of ARMOR_SLOTS) {
+      const id = armorType(family, material, slot);
+      const slotName = armorSlotNameForFamily(family, slot, material);
+      const defBase = ARMOR_MATERIAL_DEF[material] + ARMOR_SLOT_DEF[slot];
+      const defBonus = Math.max(1, Math.round(defBase * Math.max(0.2, Number(familyDef.defMult ?? 1))));
+      const evaBonus = Math.round(Number(familyDef.evaBonus ?? 0));
+      const energyBonus = Math.round(Number(familyDef.energyBonus ?? 0));
+      ITEM_TYPES[id] = { name: `${materialLabel(material)} ${slotName}` };
+      ARMOR_PIECES[id] = { slot, family, defBonus, evaBonus, energyBonus };
+      registerItemTemplate({
+        id,
+        category: "armor",
+        family,
+        slot,
+        materialTierId: material,
+        archetypeTags: [...(familyDef.tags ?? ["armor"])],
+        speciesAffinity: speciesPreferredArmorUsers(family),
+        classAffinity: [],
+        equipRules: {
+          blockedSpecies: speciesBlockedArmorUsers(family),
+          bodyModel: "universal",
+        },
+        behavior: "replacer",
+        statBudget: {
+          atkBonus: 0,
+          defBonus,
+          evaBonus,
+          energyBonus,
+        },
+        value: 0,
+        rarityWeight: Math.max(1, Math.round(MATERIAL_DEPTH_WINDOWS[material]?.peakWeight ?? 1)),
+        spriteProfileId: id,
+        description: familyDef.description ?? "",
+      });
+    }
   }
 }
 
@@ -4039,18 +4493,34 @@ const LEGACY_ITEM_MAP = {
   weapon_mace: weaponType("iron", "axe"),
   weapon_greatsword: weaponType("steel", "sword"),
   weapon_runeblade: weaponType("steel", "axe"),
-  armor_leather: armorType("wood", "chest"),
-  armor_leather_chest: armorType("wood", "chest"),
-  armor_leather_legs: armorType("wood", "legs"),
-  armor_chain: armorType("iron", "chest"),
-  armor_plate: armorType("steel", "chest"),
+  armor_leather: armorType("leather", "wood", "chest"),
+  armor_leather_chest: armorType("leather", "wood", "chest"),
+  armor_leather_legs: armorType("leather", "wood", "legs"),
+  armor_chain: armorType("plate", "iron", "chest"),
+  armor_plate: armorType("plate", "steel", "chest"),
   key_blue: KEY_INDIGO,
   key_purple: KEY_VIOLET,
   key_magenta: KEY_INDIGO,
 };
 
-function normalizeItemType(type) {
-  return LEGACY_ITEM_MAP[type] ?? type;
+function normalizeItemType(type, options = null) {
+  const raw = String(type ?? "").trim();
+  if (!raw) return "";
+  const mapped = LEGACY_ITEM_MAP[raw] ?? raw;
+  if (ITEM_TYPES[mapped]) return mapped;
+  if (mapped.startsWith("weapon_")) {
+    const normalizedWeapon = normalizeWeaponTypeId(mapped);
+    if (ITEM_TYPES[normalizedWeapon]) return normalizedWeapon;
+    return normalizedWeapon;
+  }
+  if (mapped.startsWith("armor_")) {
+    const sid = normalizeCharacterSpeciesId(options?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID);
+    const cid = normalizeCharacterClassId(options?.classId ?? defaultClassIdForSpecies(sid), sid);
+    const normalizedArmor = resolveLegacyArmorType(mapped, sid, cid);
+    if (ITEM_TYPES[normalizedArmor]) return normalizedArmor;
+    return normalizedArmor;
+  }
+  return mapped;
 }
 
 function weightedPick(rng, entries) {
@@ -4115,35 +4585,181 @@ function armorMaterialWeightsForDepth(z) {
   return materialWeightsForDepth(z);
 }
 
-function weaponForDepth(z, rng = Math.random) {
-  const material = weightedPick(rng, weaponMaterialWeightsForDepth(z));
-  const kind = weightedPick(rng, [
-    { id: "dagger", w: 20 },
-    { id: "sword", w: 28 },
-    { id: "axe", w: 22 },
-    { id: "shortbow", w: 14 },
-    { id: "longbow", w: 10 },
-    { id: "crossbow", w: 6 },
-  ]);
-  return weaponType(material, kind);
+const BIOME_FAMILY_WEIGHTS = Object.freeze({
+  carved_stone: {
+    sword: 20, axe: 16, dagger: 12, crossbow: 10, longbow: 8,
+    plate: 18, leather: 8, robe: 4, wand: 4, focus: 4,
+  },
+  ancient_brick: {
+    sword: 20, axe: 14, dagger: 12, crossbow: 10, longbow: 8,
+    plate: 18, leather: 8, robe: 6, focus: 6,
+  },
+  basalt_keep: {
+    sword: 18, axe: 16, dagger: 10, crossbow: 8, longbow: 6,
+    plate: 20, leather: 8, chassis: 6, launcher: 6, wand: 4,
+  },
+  industrial_rustpunk: {
+    emitter: 20, carbine: 16, launcher: 8, chassis: 22,
+    sword: 8, axe: 8, focus: 4, plate: 4, leather: 4,
+  },
+  organic_cavern: {
+    gland_caster: 18, stinger_rig: 14, chitin: 24, toxin: 8,
+    dagger: 8, leather: 8, shortbow: 4, focus: 4, robe: 4,
+  },
+  corrupted_biome: {
+    void_lens: 20, focus: 18, staff: 10, veil: 18,
+    sword: 10, dagger: 8, robe: 8, wand: 8, psi_lens: 4,
+  },
+  default: {
+    dagger: 14, sword: 18, axe: 14, shortbow: 10, longbow: 8, crossbow: 8,
+    wand: 8, staff: 8, focus: 8, emitter: 7, carbine: 7, launcher: 5,
+    gland_caster: 6, stinger_rig: 6, void_lens: 6, psi_lens: 6, alchemical_kit: 6,
+    plate: 10, leather: 10, robe: 8, chassis: 8, chitin: 8, veil: 8,
+  },
+});
+const SOURCE_FAMILY_MULT = Object.freeze({
+  floor: { default: 1 },
+  chest: { plate: 1.14, leather: 1.08, robe: 1.08, focus: 1.08, wand: 1.06, emitter: 1.06, default: 1 },
+  monster: { dagger: 1.08, sword: 1.08, leather: 1.08, default: 1 },
+  shrine_cache: { focus: 1.32, staff: 1.24, wand: 1.22, psi_lens: 1.18, void_lens: 1.18, robe: 1.18, veil: 1.12, default: 1 },
+  shop: { sword: 1.1, shortbow: 1.1, wand: 1.1, emitter: 1.1, leather: 1.08, plate: 1.08, chassis: 1.08, default: 1 },
+  event_reward: { default: 1.2 },
+});
+const MONSTER_TYPE_FACTION = Object.freeze({
+  ancient_automaton: "automaton",
+  iron_warden: "automaton",
+  crocubot: "automaton",
+  deepcore_ballista_sentinel: "automaton",
+  nullmetal_assassin: "hollowed",
+  wraith: "hollowed",
+  rift_hound: "hollowed",
+  singularity_hunter: "hollowed",
+  bone_herald: "hollowed",
+  skeleton: "undead",
+  basilisk: "beast",
+  giant_spider: "beast",
+  spore_crawler: "insectoid",
+  slime_green: "slime",
+  slime_yellow: "slime",
+  slime_orange: "slime",
+  slime_red: "slime",
+  slime_violet: "slime",
+  slime_indigo: "slime",
+  goblin: "humanoid",
+  hobgoblin: "humanoid",
+  rogue: "humanoid",
+  archer: "humanoid",
+  cave_skirmisher: "humanoid",
+  ruin_archer: "humanoid",
+  storm_sniper: "humanoid",
+  dire_wolf: "beast",
+  cave_troll: "beast",
+  rat: "beast",
+});
+const FACTION_FAMILY_MULT = Object.freeze({
+  automaton: { emitter: 1.3, carbine: 1.25, launcher: 1.12, chassis: 1.3, sword: 1.06, axe: 1.06, default: 1 },
+  hollowed: { void_lens: 1.3, focus: 1.2, staff: 1.1, veil: 1.25, dagger: 1.08, sword: 1.08, default: 1 },
+  insectoid: { gland_caster: 1.28, stinger_rig: 1.22, chitin: 1.3, dagger: 1.06, default: 1 },
+  humanoid: { sword: 1.12, dagger: 1.1, crossbow: 1.08, longbow: 1.08, plate: 1.08, leather: 1.08, default: 1 },
+  undead: { sword: 1.08, axe: 1.08, crossbow: 1.05, plate: 1.1, veil: 1.08, default: 1 },
+  beast: { leather: 1.08, chitin: 1.08, dagger: 1.05, default: 1 },
+  slime: { focus: 1.06, staff: 1.06, robe: 1.06, void_lens: 1.05, default: 1 },
+});
+function normalizeLootSource(source) {
+  const src = String(source ?? "").trim().toLowerCase();
+  if (src === "monster" || src === "chest" || src === "shrine_cache" || src === "shop" || src === "event_reward") return src;
+  return "floor";
+}
+function biomeIdForDepth(state, depth) {
+  const z = Math.max(0, Math.floor(depth ?? 0));
+  const seed = state?.world?.seedStr ?? "";
+  const style = themeForDepth(z, seed)?.styleVariant ?? "default";
+  return BIOME_FAMILY_WEIGHTS[style] ? style : "default";
+}
+function monsterFactionForType(type) {
+  const tid = normalizeMonsterTypeId(type);
+  if (MONSTER_TYPE_FACTION[tid]) return MONSTER_TYPE_FACTION[tid];
+  if (VOID_ALIGNED_MONSTER_IDS.has(tid)) return "hollowed";
+  return "";
+}
+function familyEntriesForLootContext({ state = null, depth = 0, source = "floor", biomeId = "", factionId = "", category = "" } = {}) {
+  const biome = BIOME_FAMILY_WEIGHTS[biomeId] ? biomeId : biomeIdForDepth(state, depth);
+  const base = BIOME_FAMILY_WEIGHTS[biome] ?? BIOME_FAMILY_WEIGHTS.default;
+  const sourceMods = SOURCE_FAMILY_MULT[normalizeLootSource(source)] ?? SOURCE_FAMILY_MULT.floor;
+  const factionMods = factionId ? (FACTION_FAMILY_MULT[factionId] ?? { default: 1 }) : { default: 1 };
+  const out = [];
+  for (const [familyIdRaw, weightRaw] of Object.entries(base)) {
+    const familyId = String(familyIdRaw ?? "").trim().toLowerCase();
+    if (!familyId || familyId === "default") continue;
+    const isWeapon = !!WEAPON_FAMILY_DEFS[familyId];
+    const isArmor = !!ARMOR_FAMILY_DEFS[familyId];
+    if (!isWeapon && !isArmor) continue;
+    if (category === "weapon" && !isWeapon) continue;
+    if (category === "armor" && !isArmor) continue;
+    const wBase = Math.max(0, Number(weightRaw ?? 0));
+    if (wBase <= 0) continue;
+    const sourceMult = Math.max(0.05, Number(sourceMods[familyId] ?? sourceMods.default ?? 1));
+    const factionMult = Math.max(0.05, Number(factionMods[familyId] ?? factionMods.default ?? 1));
+    const w = wBase * sourceMult * factionMult;
+    if (w <= 0) continue;
+    out.push({ id: familyId, w });
+  }
+  if (out.length > 0) return out;
+  const fallbackPool = category === "armor"
+    ? Object.keys(ARMOR_FAMILY_DEFS).map((id) => ({ id, w: 1 }))
+    : category === "weapon"
+      ? Object.keys(WEAPON_FAMILY_DEFS).map((id) => ({ id, w: 1 }))
+      : [
+        ...Object.keys(WEAPON_FAMILY_DEFS).map((id) => ({ id, w: 1 })),
+        ...Object.keys(ARMOR_FAMILY_DEFS).map((id) => ({ id, w: 1 })),
+      ];
+  return fallbackPool;
+}
+function equipmentTypeForDepth(z, rng = Math.random, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const depth = Math.max(0, Math.floor(z ?? 0));
+  const source = normalizeLootSource(opts.source ?? "floor");
+  const biomeId = String(opts.biomeId ?? "").trim().toLowerCase();
+  const factionId = String(opts.factionId ?? "").trim().toLowerCase();
+  const categoryHint = opts.category === "weapon" || opts.category === "armor" ? opts.category : "";
+  const material = weightedPick(rng, materialWeightsForDepth(depth));
+  const families = familyEntriesForLootContext({
+    state: opts.state ?? null,
+    depth,
+    source,
+    biomeId,
+    factionId,
+    category: categoryHint,
+  });
+  let familyId = weightedPick(rng, families);
+  const isWeapon = !!WEAPON_FAMILY_DEFS[familyId];
+  const isArmor = !!ARMOR_FAMILY_DEFS[familyId];
+  if (!isWeapon && !isArmor) {
+    familyId = categoryHint === "armor" ? "plate" : "sword";
+  }
+  if (ARMOR_FAMILY_DEFS[familyId]) {
+    const slot = weightedPick(rng, [
+      { id: "head", w: 20 },
+      { id: "chest", w: 45 },
+      { id: "legs", w: 35 },
+    ]);
+    return armorType(familyId, material, slot);
+  }
+  return weaponType(material, familyId);
+}
+function weaponForDepth(z, rng = Math.random, options = null) {
+  return equipmentTypeForDepth(z, rng, { ...(options ?? {}), category: "weapon" });
 }
 
-function armorForDepth(z, rng = Math.random) {
-  const material = weightedPick(rng, armorMaterialWeightsForDepth(z));
-  const slot = weightedPick(rng, [
-    { id: "head", w: 20 },
-    { id: "chest", w: 45 },
-    { id: "legs", w: 35 },
-  ]);
-  return armorType(material, slot);
+function armorForDepth(z, rng = Math.random, options = null) {
+  return equipmentTypeForDepth(z, rng, { ...(options ?? {}), category: "armor" });
 }
 
 function itemMarketValue(type) {
   if (type === "potion") return 60;
   if (type === "gold") return 1;
-  const materialId = type?.startsWith("weapon_") || type?.startsWith("armor_")
-    ? type.split("_").slice(1, -1).join("_")
-    : null;
+  const template = itemTemplateForType(type);
+  const materialId = template?.materialTierId ?? materialIdFromItemType(type);
   const tierIndex = materialId ? METAL_TIERS.findIndex((tier) => tier.id === materialId) : -1;
   // Keep early tiers accessible while making late-tier metals meaningfully expensive.
   const tierFactor = tierIndex >= 0 ? (0.85 + tierIndex * 0.12) : 1;
@@ -4152,8 +4768,10 @@ function itemMarketValue(type) {
     return Math.max(20, Math.floor((34 + atk * 0.48) * tierFactor));
   }
   if (type?.startsWith("armor_")) {
-    const def = ARMOR_PIECES[type]?.defBonus ?? 0;
-    return Math.max(20, Math.floor((30 + def * 0.52) * tierFactor));
+    const piece = ARMOR_PIECES[type] ?? null;
+    const def = piece?.defBonus ?? 0;
+    const utility = Math.max(0, Math.floor((piece?.energyBonus ?? 0) * 0.35 + (piece?.evaBonus ?? 0) * 18));
+    return Math.max(20, Math.floor((30 + (def + utility) * 0.52) * tierFactor));
   }
   return 20;
 }
@@ -4182,41 +4800,8 @@ function shopRefreshIntervalMsForLevel(levelRaw) {
   return sec * 1000;
 }
 
-function shopTierIndexForLevel(levelRaw) {
-  const level = Math.max(1, Math.floor(levelRaw ?? 1));
-  return clamp(Math.floor((level - 1) / 2), 0, METAL_TIERS.length - 1);
-}
-
 function randomPotionStockAmount(rng = Math.random) {
   return randInt(rng, 8, 15);
-}
-
-function buildShopGearPoolByTier() {
-  const byTier = new Map();
-  for (let tierIdx = 0; tierIdx < METAL_TIERS.length; tierIdx++) {
-    const material = METAL_TIERS[tierIdx]?.id;
-    if (!material) continue;
-    const types = [];
-    for (const kind of WEAPON_KINDS) types.push(weaponType(material, kind));
-    for (const slot of ARMOR_SLOTS) types.push(armorType(material, slot));
-    byTier.set(tierIdx, types);
-  }
-  return byTier;
-}
-
-function drawUniqueFromPool(rng, pool, count, taken = new Set()) {
-  if (!Array.isArray(pool) || pool.length <= 0 || count <= 0) return [];
-  const available = pool.filter((type) => type && !taken.has(type));
-  if (!available.length) return [];
-  const out = [];
-  while (available.length && out.length < count) {
-    const pick = randInt(rng, 0, available.length - 1);
-    const type = available.splice(pick, 1)[0];
-    if (!type || taken.has(type)) continue;
-    taken.add(type);
-    out.push(type);
-  }
-  return out;
 }
 
 function targetShopCountsForLevel(levelRaw) {
@@ -4227,53 +4812,37 @@ function targetShopCountsForLevel(levelRaw) {
 }
 
 function buildShopGearTypesForLevel(levelRaw, rng = Math.random) {
-  const playerTier = shopTierIndexForLevel(levelRaw);
-  const poolByTier = buildShopGearPoolByTier();
+  const level = Math.max(1, Math.floor(levelRaw ?? 1));
+  const depthBase = Math.max(0, level - 1);
   const { gear: gearTarget } = targetShopCountsForLevel(levelRaw);
   const taken = new Set();
   const out = [];
-
-  const takeFromTierDelta = (minDelta, maxDelta, wanted) => {
-    const bucket = [];
-    for (let d = minDelta; d <= maxDelta; d++) {
-      const idx = playerTier + d;
-      if (idx < 0 || idx >= METAL_TIERS.length) continue;
-      bucket.push(...(poolByTier.get(idx) ?? []));
+  let attempts = 0;
+  while (out.length < gearTarget && attempts < gearTarget * 24) {
+    attempts += 1;
+    const depthRoll = clamp(depthBase + randInt(rng, -1, 4), 0, 160);
+    const category = rng() < 0.58 ? "weapon" : "armor";
+    const type = equipmentTypeForDepth(depthRoll, rng, {
+      source: "shop",
+      category,
+    });
+    if (!type || taken.has(type)) continue;
+    taken.add(type);
+    out.push(type);
+  }
+  if (out.length < gearTarget) {
+    const fallbackTypes = [
+      ...Object.keys(WEAPONS),
+      ...Object.keys(ARMOR_PIECES),
+    ];
+    while (out.length < gearTarget && fallbackTypes.length > 0) {
+      const idx = randInt(rng, 0, fallbackTypes.length - 1);
+      const type = fallbackTypes.splice(idx, 1)[0];
+      if (!type || taken.has(type)) continue;
+      taken.add(type);
+      out.push(type);
     }
-    const picked = drawUniqueFromPool(rng, bucket, wanted, taken);
-    out.push(...picked);
-    return picked.length;
-  };
-
-  // 2-3 items one tier higher.
-  const oneTierWanted = randInt(rng, 2, 3);
-  takeFromTierDelta(1, 1, oneTierWanted);
-
-  // Sometimes 1-2 items 2-3 tiers higher.
-  const twoThreeRoll = rng();
-  const twoThreeWanted = twoThreeRoll < 0.16 ? 2 : (twoThreeRoll < 0.44 ? 1 : 0);
-  takeFromTierDelta(2, 3, twoThreeWanted);
-
-  // Very rarely one 4-tier item.
-  if (rng() < 0.05) takeFromTierDelta(4, 4, 1);
-
-  // Once in a blue moon one 5-tier item.
-  if (rng() < 0.01) takeFromTierDelta(5, 5, 1);
-
-  // Mostly around player tier or lower.
-  if (out.length < gearTarget) {
-    const corePool = [];
-    for (let idx = 0; idx <= playerTier; idx++) corePool.push(...(poolByTier.get(idx) ?? []));
-    out.push(...drawUniqueFromPool(rng, corePool, gearTarget - out.length, taken));
   }
-
-  // Fallback fill (if near top tiers and constrained).
-  if (out.length < gearTarget) {
-    const anyPool = [];
-    for (let idx = 0; idx < METAL_TIERS.length; idx++) anyPool.push(...(poolByTier.get(idx) ?? []));
-    out.push(...drawUniqueFromPool(rng, anyPool, gearTarget - out.length, taken));
-  }
-
   return out.slice(0, gearTarget);
 }
 
@@ -4296,29 +4865,12 @@ function ensurePotionStockEntry(stock, depth, rng = Math.random) {
 function shopCatalogForDepth(depth) {
   const d = Math.max(0, depth);
   const items = [{ type: "potion", w: Math.max(6, 14 - Math.floor(d / 16)) }];
-
-  const weaponMats = weaponMaterialWeightsForDepth(d);
-  for (const mat of weaponMats) {
-    for (const kind of WEAPON_KINDS) {
-      const mul = kind === "sword" ? 1.1 : (kind === "axe" ? 1.0 : 0.95);
-      items.push({
-        type: weaponType(mat.id, kind),
-        w: Math.max(1, Math.round(mat.w * mul)),
-      });
-    }
+  for (let i = 0; i < 18; i++) {
+    const rollDepth = clamp(d + randInt(Math.random, -1, 3), 0, 160);
+    const type = equipmentTypeForDepth(rollDepth, Math.random, { source: "shop" });
+    if (!type) continue;
+    items.push({ type, w: Math.max(1, Math.round(itemMarketValue(type) / 40)) });
   }
-
-  const armorMats = armorMaterialWeightsForDepth(d);
-  for (const mat of armorMats) {
-    for (const slot of ARMOR_SLOTS) {
-      const mul = slot === "chest" ? 1 : 0.92;
-      items.push({
-        type: armorType(mat.id, slot),
-        w: Math.max(1, Math.round(mat.w * mul)),
-      });
-    }
-  }
-
   return items;
 }
 
@@ -4480,7 +5032,7 @@ function renderShopOverlay(state) {
       appendGlyphPreview({ g: "?", c: "#9fb2cf" });
       return;
     }
-    const spriteId = SPRITE_SOURCES[type] ? type : null;
+    const spriteId = itemSpriteId({ type });
     const spriteImg = spriteId ? getSpriteIfReady(spriteId) : null;
     const spriteSrc = spriteImg?.src ?? (spriteId ? SPRITE_SOURCES[spriteId] : null);
     if (spriteSrc) {
@@ -4535,12 +5087,28 @@ function renderShopOverlay(state) {
 
   const selectedName = ITEM_TYPES[selected.type]?.name ?? selected.type;
   renderShopItemPreview(selected.type);
+  const template = itemTemplateForType(selected.type);
+  const usageMeta = itemUsageMetaForType(selected.type);
+  const equipValidation = (selected.type.startsWith("weapon_") || selected.type.startsWith("armor_"))
+    ? canPlayerEquipItemType(state, selected.type)
+    : { ok: true, reason: "" };
   const atk = WEAPONS[selected.type]?.atkBonus ?? 0;
   const def = ARMOR_PIECES[selected.type]?.defBonus ?? 0;
   const weaponProfile = selected.type?.startsWith("weapon_") ? weaponAttackProfileForType(selected.type) : null;
+  const amplifierProfile = WEAPONS[selected.type]?.amplifierProfile ?? null;
   const details = [];
   if (atk > 0) details.push(`ATK Bonus: +${atk}`);
   if (def > 0) details.push(`DEF Bonus: +${def}`);
+  if ((ARMOR_PIECES[selected.type]?.evaBonus ?? 0) !== 0) details.push(`EVA Bonus: ${ARMOR_PIECES[selected.type].evaBonus > 0 ? "+" : ""}${ARMOR_PIECES[selected.type].evaBonus}`);
+  if ((ARMOR_PIECES[selected.type]?.energyBonus ?? 0) > 0) details.push(`Energy Bonus: +${ARMOR_PIECES[selected.type].energyBonus}`);
+  if (usageMeta) {
+    details.push(`Family: ${titleFromId(usageMeta.family)}`);
+    if (template?.materialTierId) details.push(`Tier: ${materialLabel(template.materialTierId)}`);
+    if ((usageMeta.archetypeTags ?? []).length > 0) details.push(`Tags: ${(usageMeta.archetypeTags ?? []).map((tag) => titleFromId(tag)).join(", ")}`);
+    details.push(`Behavior: ${usageMeta.behavior === "amplifier" ? "Amplifier" : "Replacer"}`);
+    if ((usageMeta.favoredBy ?? []).length > 0) details.push(`Favored by: ${(usageMeta.favoredBy ?? []).join(", ")}`);
+    if ((usageMeta.usableBy ?? []).length > 0) details.push(`Usable by: ${(usageMeta.usableBy ?? []).join(", ")}`);
+  }
   if (weaponProfile) {
     if ((weaponProfile.kind ?? "melee") === "ranged") {
       details.push(`Range: ${Math.max(1, Math.floor(weaponProfile.minRange ?? 1))}-${Math.max(1, Math.floor(weaponProfile.range ?? 1))}`);
@@ -4553,9 +5121,18 @@ function renderShopOverlay(state) {
     } else {
       details.push("Type: Melee");
     }
+  } else if (amplifierProfile) {
+    details.push("Mode: Amplifies class-native attacks");
+    const r = Math.floor(Number(amplifierProfile.rangeBonus ?? 0));
+    if (r !== 0) details.push(`Native range: +${r}`);
+    const dmgPct = Math.round((Number(amplifierProfile.damageMult ?? 1) - 1) * 100);
+    if (dmgPct !== 0) details.push(`Native damage: ${dmgPct > 0 ? "+" : ""}${dmgPct}%`);
+    if (Number(amplifierProfile.accuracyBonus ?? 0) !== 0) details.push(`Native accuracy: ${Number(amplifierProfile.accuracyBonus) > 0 ? "+" : ""}${Math.round(Number(amplifierProfile.accuracyBonus))}`);
+    if (Number(amplifierProfile.critBonus ?? 0) !== 0) details.push(`Native crit: ${Number(amplifierProfile.critBonus) > 0 ? "+" : ""}${Math.round(Number(amplifierProfile.critBonus))}`);
   }
   if (!atk && !def && selected.type === "potion") details.push("Consumable healing item.");
   if (!atk && !def && selected.type !== "potion") details.push("Utility item.");
+  if (!equipValidation.ok && equipValidation.reason) details.push(`Cannot equip now: ${equipValidation.reason}`);
   if (isBuyMode) details.push(`Stock: ${Math.max(1, selected.amount ?? 1)}`);
   if (!isBuyMode) details.push(`Inventory: ${selected.amount}`);
   details.push(`Value: ${itemMarketValue(selected.type)}g`);
@@ -5035,7 +5612,9 @@ function chunkBaseSpawns(worldSeed, chunk) {
     if (!c) break;
     const roll = rng();
     // Potions are common; equipment appears regularly; keys are occasional.
-    const equipmentType = rng() < 0.6 ? weaponForDepth(z, rng) : armorForDepth(z, rng);
+    const equipmentType = rng() < 0.6
+      ? weaponForDepth(z, rng, { source: "floor" })
+      : armorForDepth(z, rng, { source: "floor" });
     const type = roll < 0.45 ? "potion" : roll < 0.66 ? "gold" : roll < 0.94 ? equipmentType : keyTypeForDepth(z, rng);
     const id = `i|${z}|${cx},${cy}|${i}`;
     const amount = type === "gold" ? randInt(rng, 4, 22) + clamp(z, 0, 30) : 1;
@@ -5232,8 +5811,12 @@ function buildCharacterCarryoverSnapshot(state) {
     level: Math.max(1, Math.floor(p.level ?? 1)),
     xp: Math.max(0, Math.floor(p.xp ?? 0)),
     gold: Math.max(0, Math.floor(p.gold ?? 0)),
-    inv: normalizeInventoryEntries(state.inv ?? []),
-    equip: normalizeEquip(p.equip ?? {}),
+    inv: normalizeInventoryEntries(state.inv ?? [], {
+      speciesId: profile.speciesId,
+      classId: profile.classId,
+      ownerId: profile.id,
+    }),
+    equip: normalizeEquip(p.equip ?? {}, { speciesId: profile.speciesId, classId: profile.classId }),
     maxHp: Math.max(1, Math.floor(p.maxHp ?? maxHpForLevel(Math.max(1, Math.floor(p.level ?? 1)), profile))),
   };
 }
@@ -5770,8 +6353,12 @@ function exportCharacterSnapshot(state) {
       hp: Math.max(0, Math.floor(p.hp ?? 0)),
       maxHp: Math.max(1, Math.floor(p.maxHp ?? 1)),
       gold: Math.max(0, Math.floor(p.gold ?? 0)),
-      inv: normalizeInventoryEntries(src.inv ?? []),
-      equip: normalizeEquip(p.equip ?? {}),
+      inv: normalizeInventoryEntries(src.inv ?? [], {
+        speciesId: profile.speciesId,
+        classId: profile.classId,
+        ownerId: profile.id,
+      }),
+      equip: normalizeEquip(p.equip ?? {}, { speciesId: profile.speciesId, classId: profile.classId }),
       classId: normalizeCharacterClassId(p.classId ?? profile.classId, profile.speciesId),
       speciesId: normalizeCharacterSpeciesId(p.speciesId ?? profile.speciesId),
     },
@@ -5809,18 +6396,28 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
     const data = await saveApiRequest("GET", null, `character=${encodeURIComponent(id)}`);
     const decoded = decodeCharacterSnapshotPayload(data?.character?.payload ?? "");
     if (!decoded) return null;
+    const profile = normalizeCharacterProfile(decoded.character ?? null);
+    const speciesId = normalizeCharacterSpeciesId(decoded?.player?.speciesId ?? profile.speciesId);
+    const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
     return {
-      character: normalizeCharacterProfile(decoded.character ?? null),
+      character: profile,
       player: {
         level: Math.max(1, Math.floor(decoded?.player?.level ?? 1)),
         xp: Math.max(0, Math.floor(decoded?.player?.xp ?? 0)),
         hp: Math.max(0, Math.floor(decoded?.player?.hp ?? 0)),
         maxHp: Math.max(1, Math.floor(decoded?.player?.maxHp ?? 1)),
         gold: Math.max(0, Math.floor(decoded?.player?.gold ?? 0)),
-        inv: normalizeInventoryEntries(decoded?.player?.inv ?? []),
-        equip: normalizeEquip(decoded?.player?.equip ?? {}),
-        classId: normalizeCharacterClassId(decoded?.player?.classId, decoded?.character?.speciesId),
-        speciesId: normalizeCharacterSpeciesId(decoded?.player?.speciesId),
+        inv: normalizeInventoryEntries(decoded?.player?.inv ?? [], {
+          speciesId,
+          classId,
+          ownerId: profile.id,
+        }),
+        equip: normalizeEquip(decoded?.player?.equip ?? {}, {
+          speciesId,
+          classId,
+        }),
+        classId,
+        speciesId,
       },
     };
   } catch {
@@ -5840,18 +6437,28 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
   if (!raw) return null;
   const decoded = decodeCharacterSnapshotPayload(raw);
   if (!decoded) return null;
+  const profile = normalizeCharacterProfile(decoded.character ?? null);
+  const speciesId = normalizeCharacterSpeciesId(decoded?.player?.speciesId ?? profile.speciesId);
+  const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
   return {
-    character: normalizeCharacterProfile(decoded.character ?? null),
+    character: profile,
     player: {
       level: Math.max(1, Math.floor(decoded?.player?.level ?? 1)),
       xp: Math.max(0, Math.floor(decoded?.player?.xp ?? 0)),
       hp: Math.max(0, Math.floor(decoded?.player?.hp ?? 0)),
       maxHp: Math.max(1, Math.floor(decoded?.player?.maxHp ?? 1)),
       gold: Math.max(0, Math.floor(decoded?.player?.gold ?? 0)),
-      inv: normalizeInventoryEntries(decoded?.player?.inv ?? []),
-      equip: normalizeEquip(decoded?.player?.equip ?? {}),
-      classId: normalizeCharacterClassId(decoded?.player?.classId, decoded?.character?.speciesId),
-      speciesId: normalizeCharacterSpeciesId(decoded?.player?.speciesId),
+      inv: normalizeInventoryEntries(decoded?.player?.inv ?? [], {
+        speciesId,
+        classId,
+        ownerId: profile.id,
+      }),
+      equip: normalizeEquip(decoded?.player?.equip ?? {}, {
+        speciesId,
+        classId,
+      }),
+      classId,
+      speciesId,
     },
   };
 }
@@ -5914,7 +6521,7 @@ function applyCharacterSnapshot(state, snapshot) {
   p.level = Math.max(1, Math.floor(snapPlayer.level ?? p.level ?? 1));
   p.xp = Math.max(0, Math.floor(snapPlayer.xp ?? p.xp ?? 0));
   p.gold = Math.max(0, Math.floor(snapPlayer.gold ?? p.gold ?? 0));
-  p.equip = normalizeEquip(snapPlayer.equip ?? p.equip ?? {});
+  p.equip = normalizeEquip(snapPlayer.equip ?? p.equip ?? {}, { speciesId: profile.speciesId, classId: profile.classId });
   p.effects = [];
   p.classId = normalizeCharacterClassId(snapPlayer.classId ?? profile.classId, profile.speciesId);
   p.speciesId = normalizeCharacterSpeciesId(snapPlayer.speciesId ?? profile.speciesId);
@@ -5923,7 +6530,11 @@ function applyCharacterSnapshot(state, snapshot) {
   p.overclockUntilMs = 0;
   p.attackAfterMove = false;
   p.dead = false;
-  state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? []);
+  state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
+    speciesId: profile.speciesId,
+    classId: profile.classId,
+    ownerId: profile.id,
+  });
 
   const snapMaxHp = Math.max(1, Math.floor(snapPlayer.maxHp ?? p.maxHp ?? 1));
   const snapHp = Math.max(0, Math.floor(snapPlayer.hp ?? p.hp ?? snapMaxHp));
@@ -5965,8 +6576,15 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
         level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
         xp: Math.max(0, Math.floor(snapshot?.player?.xp ?? 0)),
         gold: Math.max(0, Math.floor(snapshot?.player?.gold ?? 0)),
-        inv: normalizeInventoryEntries(snapshot?.player?.inv ?? []),
-        equip: normalizeEquip(snapshot?.player?.equip ?? {}),
+        inv: normalizeInventoryEntries(snapshot?.player?.inv ?? [], {
+          speciesId: profile.speciesId,
+          classId: profile.classId,
+          ownerId: profile.id,
+        }),
+        equip: normalizeEquip(snapshot?.player?.equip ?? {}, {
+          speciesId: profile.speciesId,
+          classId: profile.classId,
+        }),
         maxHp: Math.max(1, Math.floor(snapshot?.player?.maxHp ?? maxHpForLevel(1, profile))),
       };
       game = makeNewGame(randomSeedString(), { carryover });
@@ -6658,6 +7276,8 @@ function characterCreationDerivedPreview(draft) {
 function starterCarryoverForClass(classId) {
   const cid = normalizeCharacterClassId(classId);
   const classDef = characterClassDef(cid);
+  const speciesId = normalizeCharacterSpeciesId(classDef?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID);
+  const defaultArmorFamily = armorFamilyForCharacter(speciesId, cid);
   const nativeAttack = classNativeAttackProfile(cid);
   const startsUnarmed = (nativeAttack?.kind ?? "melee") === "ranged";
   const out = {
@@ -6667,7 +7287,7 @@ function starterCarryoverForClass(classId) {
   };
   if (!startsUnarmed) out.equip.weapon = "weapon_wood_dagger";
   if ((classDef?.hpMult ?? 1) >= 1.12 || (classDef?.armorEffect ?? 1) >= 1.1) {
-    out.equip.head = "armor_wood_head";
+    out.equip.head = armorType(defaultArmorFamily, "wood", "head");
   }
   let starterPotions = 0;
   if ((classDef?.potionCapBonus ?? 0) > 0) starterPotions += 1;
@@ -8041,8 +8661,7 @@ function updateAttackContextButtons(state, occupancy = null, primaryAction = nul
 
 function isStackable(type) {
   return type === "potion" ||
-    type.startsWith("key_") ||
-    type.startsWith("weapon_") || type.startsWith("armor_");
+    type.startsWith("key_");
 }
 function potionCapacityForState(state) {
   const classId = state?.player?.classId ?? state?.character?.classId ?? DEFAULT_CHARACTER_CLASS_ID;
@@ -8050,6 +8669,12 @@ function potionCapacityForState(state) {
   return Math.max(1, BASE_POTION_CAPACITY + Math.max(0, Math.floor(classDef.potionCapBonus ?? 0)));
 }
 function invAdd(state, type, amount = 1) {
+  const normalizedType = normalizeItemType(type, {
+    speciesId: state?.player?.speciesId ?? state?.character?.speciesId,
+    classId: state?.player?.classId ?? state?.character?.classId,
+  });
+  const templateId = itemTemplateIdForType(normalizedType) ?? normalizedType;
+  type = normalizedType;
   if (type === "potion") {
     const cap = potionCapacityForState(state);
     const cur = invCount(state, "potion");
@@ -8058,10 +8683,17 @@ function invAdd(state, type, amount = 1) {
   }
   if (isStackable(type)) {
     const idx = state.inv.findIndex((x) => x.type === type);
-    if (idx >= 0) state.inv[idx].amount += amount;
-    else state.inv.push({ type, amount });
+    if (idx >= 0) {
+      state.inv[idx].amount += amount;
+      if (!state.inv[idx].templateId) state.inv[idx].templateId = templateId;
+    } else {
+      state.inv.push({ type, amount, templateId });
+    }
   } else {
-    for (let i = 0; i < amount; i++) state.inv.push({ type, amount: 1 });
+    for (let i = 0; i < amount; i++) {
+      const instance = createItemInstance(type, "player", state?.character?.id ?? null);
+      state.inv.push({ type, amount: 1, templateId, instanceId: instance.id });
+    }
   }
 }
 function invConsume(state, type, amount = 1) {
@@ -8319,8 +8951,17 @@ function recalcDerivedStats(state) {
   const effSpeedMult = state.player.effects
     .filter((e) => Number.isFinite(e?.speedMult))
     .reduce((m, e) => m * Math.max(0.2, Number(e.speedMult ?? 1)), 1);
-  const weaponAtk = weapon?.atkBonus ?? 0;
+  const speciesRule = speciesEquipRule(profile?.speciesId ?? p.speciesId);
+  const equippedWeaponFamily = normalizeWeaponFamilyId(weapon?.family ?? weaponKindFromItemType(equip.weapon) ?? "");
+  const weaponAffinityMult = equippedWeaponFamily && (speciesRule.preferredWeaponFamilies ?? []).includes(equippedWeaponFamily) ? 1.06 : 1;
+  const weaponAtk = Math.max(0, Math.round((weapon?.atkBonus ?? 0) * weaponAffinityMult));
   const armorRaw = (headArmor?.defBonus ?? 0) + (chestArmor?.defBonus ?? 0) + (legsArmor?.defBonus ?? 0);
+  const armorEvaBonus = (headArmor?.evaBonus ?? 0) + (chestArmor?.evaBonus ?? 0) + (legsArmor?.evaBonus ?? 0);
+  const armorEnergyBonus = (headArmor?.energyBonus ?? 0) + (chestArmor?.energyBonus ?? 0) + (legsArmor?.energyBonus ?? 0);
+  const armorPieces = [headArmor, chestArmor, legsArmor].filter(Boolean);
+  const preferredArmorFamilies = new Set(speciesRule.preferredArmorFamilies ?? []);
+  const preferredArmorCount = armorPieces.filter((piece) => preferredArmorFamilies.has(piece?.family ?? "")).length;
+  const armorAffinityMult = 1 + Math.min(0.12, preferredArmorCount * 0.04);
   const level = Math.max(1, Math.floor(p.level ?? 1));
   const levelScale = playerLevelScale(level);
   const offenseScale = 1 + (levelScale - 1) * playerOffenseLevelWeight(level);
@@ -8344,7 +8985,11 @@ function recalcDerivedStats(state) {
   p.baseAtk = baseAtk;
   p.baseDef = baseDef;
   p.weaponKind = weapon?.kind
-    ?? (resolvedAttackProfile?.source === "class_native" ? `native_${resolvedAttackProfile.flavor ?? "ranged"}` : "unarmed");
+    ?? ((resolvedAttackProfile?.source === "class_native" || resolvedAttackProfile?.source === "amplified_native")
+      ? `native_${resolvedAttackProfile.flavor ?? "ranged"}`
+      : "unarmed");
+  p.weaponFamily = equippedWeaponFamily || (resolvedAttackProfile?.source === "replacer" ? String(resolvedAttackProfile.family ?? "") : "");
+  p.weaponBehavior = weapon?.behavior ?? (resolvedAttackProfile?.source === "amplified_native" ? "amplifier" : "replacer");
   p.weaponAttackProfile = { ...resolvedAttackProfile };
   p.weaponRange = Math.max(1, Math.floor(p.weaponAttackProfile?.range ?? 1));
   p.weaponMinRange = Math.max(1, Math.floor(p.weaponAttackProfile?.minRange ?? 1));
@@ -8355,11 +9000,13 @@ function recalcDerivedStats(state) {
   p.atkBonus = weaponAtk + effAtk;
   p.atkLo = Math.max(1, Math.round(baseAtk * 0.86));
   p.atkHi = Math.max(p.atkLo, Math.round(baseAtk * 1.16));
-  p.defBonus = Math.max(0, Math.round((baseDef + armorRaw) * armorEffect));
+  p.defBonus = Math.max(0, Math.round((baseDef + armorRaw * armorAffinityMult) * armorEffect));
   p.acc = clamp(Math.round(baseAcc + (species.accFlat ?? 0) + (classDef.accFlat ?? 0) + effAcc), 10, 98);
-  p.eva = clamp(Math.round(baseEva + (species.evaFlat ?? 0) + (classDef.evaFlat ?? 0) + effEva), 0, 85);
+  p.eva = clamp(Math.round(baseEva + (species.evaFlat ?? 0) + (classDef.evaFlat ?? 0) + effEva + armorEvaBonus), 0, 85);
   p.spd = Number((baseSpd * (species.speedMult ?? 1) * (classDef.speedMult ?? 1) * effSpeedMult).toFixed(3));
-  p.energyMax = Math.max(1, Math.round(((30 + int * 10) * PLAYER_STAT_SCALE) * energyMult + energyFlat));
+  p.energyMax = Math.max(1, Math.round(((30 + int * 10) * PLAYER_STAT_SCALE) * energyMult + energyFlat + armorEnergyBonus));
+  p.armorAffinityMult = armorAffinityMult;
+  p.weaponAffinityMult = weaponAffinityMult;
   p.critChance = clamp(Math.round(2 + dex * 0.6 + (classDef.critFlat ?? 0)), 0, 45);
   p.critDamageMult = Math.max(1, Number(classDef.critDamageMult ?? 1.5));
   p.critDefIgnorePct = clamp(Number(classDef.critDefIgnorePct ?? 0), 0, 0.9);
@@ -8675,7 +9322,26 @@ function renderInventory(state) {
 
     const label = document.createElement("span");
     label.className = "invLabelText";
-    label.textContent = `${idx + 1}. ${nm}${isStackable(it.type) ? ` x${it.amount}` : ""}`;
+    const usageMeta = itemUsageMetaForType(it.type);
+    const equipValidation = (it.type.startsWith("weapon_") || it.type.startsWith("armor_"))
+      ? canPlayerEquipItemType(state, it.type)
+      : { ok: true, reason: "" };
+    const unusableBadge = equipValidation.ok ? "" : " [Unusable]";
+    label.textContent = `${idx + 1}. ${nm}${isStackable(it.type) ? ` x${it.amount}` : ""}${unusableBadge}`;
+    if (usageMeta) {
+      const template = itemTemplateForType(it.type);
+      const detailLines = [];
+      detailLines.push(`Family: ${titleFromId(usageMeta.family)}`);
+      detailLines.push(`Tier: ${materialLabel(template?.materialTierId ?? materialIdFromItemType(it.type) ?? "")}`);
+      if ((usageMeta.archetypeTags ?? []).length > 0) detailLines.push(`Tags: ${(usageMeta.archetypeTags ?? []).map((tag) => titleFromId(tag)).join(", ")}`);
+      detailLines.push(`Mode: ${usageMeta.behavior === "amplifier" ? "Amplifier" : "Replacer"}`);
+      if ((usageMeta.favoredBy ?? []).length > 0) detailLines.push(`Favored by: ${(usageMeta.favoredBy ?? []).join(", ")}`);
+      if ((usageMeta.usableBy ?? []).length > 0) detailLines.push(`Usable by: ${(usageMeta.usableBy ?? []).join(", ")}`);
+      if (!equipValidation.ok && equipValidation.reason) detailLines.push(`Cannot equip: ${equipValidation.reason}`);
+      btn.title = detailLines.join("\n");
+    } else {
+      btn.title = nm;
+    }
 
     row.appendChild(iconWrap);
     row.appendChild(label);
@@ -8892,8 +9558,15 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     player.maxHp = Math.max(1, Math.floor(carryover.maxHp ?? maxHpForLevel(player.level, characterProfile)));
     player.hp = player.maxHp;
     player.gold = Math.max(0, Math.floor(carryover.gold ?? 0));
-    player.equip = normalizeEquip(carryover.equip ?? player.equip);
-    state.inv = normalizeInventoryEntries(carryover.inv ?? []);
+    player.equip = normalizeEquip(carryover.equip ?? player.equip, {
+      speciesId: characterProfile.speciesId,
+      classId: characterProfile.classId,
+    });
+    state.inv = normalizeInventoryEntries(carryover.inv ?? [], {
+      speciesId: characterProfile.speciesId,
+      classId: characterProfile.classId,
+      ownerId: characterProfile.id,
+    });
   }
 
   const start = computeInitialDepth0Spawn(world);
@@ -8961,12 +9634,19 @@ function hydrateChunkEntities(state, z, cx, cy) {
 
     const wx = cx * CHUNK + it.lx;
     const wy = cy * CHUNK + it.ly;
+    const type = normalizeItemType(it.type);
+    const templateId = itemTemplateIdForType(type) ?? type;
+    const instanceId = String(it.instanceId ?? `base_${it.id}`);
 
     state.entities.set(it.id, {
       id: it.id,
       origin: "base",
       kind: "item",
-      type: it.type,
+      type,
+      templateId,
+      instanceId,
+      ownerType: "world",
+      ownerId: null,
       amount: it.amount ?? 1,
       x: wx, y: wy, z,
       locked: it.locked,
@@ -9305,8 +9985,8 @@ function respawnAreaItemType(depth, rng) {
   const roll = rng();
   if (roll < 0.30) return "potion";
   if (roll < 0.48) return "gold";
-  if (roll < 0.72) return weaponForDepth(depth, rng);
-  if (roll < 0.92) return armorForDepth(depth, rng);
+  if (roll < 0.72) return weaponForDepth(depth, rng, { source: "floor" });
+  if (roll < 0.92) return armorForDepth(depth, rng, { source: "floor" });
   return keyTypeForDepth(depth, rng);
 }
 
@@ -10234,8 +10914,26 @@ function tryCloseAdjacentDoor(state) {
 
 // ---------- Dynamic drops ----------
 function spawnDynamicItem(state, type, amount, x, y, z) {
-  const id = `dyn|${type}|${z}|${x},${y}|${Date.now()}|${Math.floor(Math.random() * 1e9)}`;
-  const ent = { id, origin: "dynamic", kind: "item", type, amount, x, y, z };
+  const normalizedType = normalizeItemType(type);
+  const templateId = itemTemplateIdForType(normalizedType) ?? normalizedType;
+  const instance = createItemInstance(normalizedType, "world", null, { x, y, z });
+  const id = `dyn|${instance.id}|${z}|${x},${y}`;
+  const ent = {
+    id,
+    origin: "dynamic",
+    kind: "item",
+    type: normalizedType,
+    templateId,
+    instanceId: instance.id,
+    ownerType: "world",
+    ownerId: null,
+    amount,
+    x,
+    y,
+    z,
+    createdAt: instance.createdAt,
+    updatedAt: instance.updatedAt,
+  };
   state.dynamic.set(id, ent);
   state.entities.set(id, ent);
 }
@@ -10276,7 +10974,9 @@ function dropEquipmentFromChest(state, chest = null) {
       bounds.minDepth,
       bounds.maxDepth
     );
-    const drop = Math.random() < 0.58 ? weaponForDepth(rollDepth, Math.random) : armorForDepth(rollDepth, Math.random);
+    const drop = Math.random() < 0.58
+      ? weaponForDepth(rollDepth, Math.random, { source: "chest", state })
+      : armorForDepth(rollDepth, Math.random, { source: "chest", state });
     invAdd(state, drop, 1);
     pushLog(state, `${isRewardChest ? "Reward" : "Found"}: ${ITEM_TYPES[drop].name}.`);
   }
@@ -10387,7 +11087,10 @@ function handleMonsterDefeat(state, monster, options = null) {
   if (maybeDropKeyFromMonster(state, monster)) droppedSpecial = true;
 
   if (monster.type === "skeleton" && Math.random() < 0.24) {
-    const drop = Math.random() < 0.5 ? weaponForDepth(state.player.z, Math.random) : armorForDepth(state.player.z);
+    const factionId = monsterFactionForType(monster?.type ?? "");
+    const drop = Math.random() < 0.5
+      ? weaponForDepth(state.player.z, Math.random, { source: "monster", state, factionId })
+      : armorForDepth(state.player.z, Math.random, { source: "monster", state, factionId });
     spawnDynamicItem(state, drop, 1, monster.x, monster.y, monster.z);
     pushLog(state, `It dropped ${ITEM_TYPES[drop].name}!`);
     droppedSpecial = true;
@@ -10446,7 +11149,8 @@ function playerAttack(state, monster) {
 
   const profileKind = weaponProfile?.kind ?? "melee";
   const nativeFlavor = String(weaponProfile?.flavor ?? "").trim().toLowerCase();
-  const isNativeToxinShot = profileKind === "ranged" && weaponProfile?.source === "class_native" && nativeFlavor === "toxin";
+  const isNativeAttackSource = weaponProfile?.source === "class_native" || weaponProfile?.source === "amplified_native";
+  const isNativeToxinShot = profileKind === "ranged" && isNativeAttackSource && nativeFlavor === "toxin";
   if (dmg > 0 && monster.hp > 0) {
     const rangedPoison = (classDef?.rangedPoisonOnHit && typeof classDef.rangedPoisonOnHit === "object")
       ? classDef.rangedPoisonOnHit
@@ -10456,7 +11160,7 @@ function playerAttack(state, monster) {
       const nativeOnly = !!rangedPoison.nativeOnly;
       const requiredFlavor = String(rangedPoison.requiredFlavor ?? "").trim().toLowerCase();
       const flavorMatch = !requiredFlavor || requiredFlavor === nativeFlavor;
-      if ((!nativeOnly || weaponProfile?.source === "class_native") && flavorMatch && Math.random() < chance) {
+      if ((!nativeOnly || isNativeAttackSource) && flavorMatch && Math.random() < chance) {
         const poisonDpt = Math.max(1, Math.round(dmg * Math.max(0.02, Number(rangedPoison.dmgPct ?? 0.1))));
         const turns = Math.max(1, Math.floor(Number(rangedPoison.turns ?? 2)));
         applyPoisonToMonster(
@@ -10494,9 +11198,18 @@ function playerAttack(state, monster) {
       }
     }
   }
-  const attackVerb = isNativeToxinShot
-    ? "You spit venom at"
-    : "You hit";
+  const attackName = String(weaponProfile?.attackName ?? "").trim();
+  const source = String(weaponProfile?.source ?? "");
+  let attackVerb = "You hit";
+  if (isNativeToxinShot) {
+    attackVerb = source === "amplified_native" ? "You unleash amplified venom at" : "You spit venom at";
+  } else if (source === "class_native" && attackName) {
+    attackVerb = `You use ${attackName} on`;
+  } else if (source === "amplified_native" && attackName) {
+    attackVerb = `You channel ${attackName} into`;
+  } else if (source === "replacer" && attackName) {
+    attackVerb = `You strike with ${attackName} at`;
+  }
   pushLog(state, `${attackVerb} the ${monsterDisplayName(monster, p.z)} for ${dmg}${attack.crit ? " (critical)" : ""}.`);
   if (classId === "telekinetic" && firstCombatStrike && monster.hp > 0 && tryKnockbackMonster(state, monster, p.x, p.y)) {
     pushLog(state, `Telekinetic force knocks the ${monsterDisplayName(monster, p.z)} back.`);
@@ -10697,6 +11410,11 @@ function useInventoryIndex(state, idx) {
   }
 
   if (it.type.startsWith("weapon_")) {
+    const validation = canPlayerEquipItemType(state, it.type);
+    if (!validation.ok) {
+      pushLog(state, validation.reason || "That weapon can't be equipped by this character.");
+      return;
+    }
     const prev = p.equip.weapon;
     p.equip.weapon = it.type;
     if (isStackable(it.type)) {
@@ -10718,6 +11436,11 @@ function useInventoryIndex(state, idx) {
     const piece = ARMOR_PIECES[it.type];
     if (!piece) {
       pushLog(state, "That armor can't be equipped.");
+      return;
+    }
+    const validation = canPlayerEquipItemType(state, it.type);
+    if (!validation.ok) {
+      pushLog(state, validation.reason || "That armor can't be equipped by this character.");
       return;
     }
     const slot = piece.slot;
@@ -11551,6 +12274,73 @@ const CHEST_LOCK_SPRITE_BY_KEY = {
   key_purple: "chest_purple",
   key_magenta: "chest_blue",
 };
+const WEAPON_SPRITE_FAMILY_FALLBACK = Object.freeze({
+  dagger: ["dagger", "sword", "axe"],
+  sword: ["sword", "axe", "dagger"],
+  axe: ["axe", "sword", "dagger"],
+  shortbow: ["dagger", "sword"],
+  longbow: ["sword", "dagger"],
+  crossbow: ["axe", "sword", "dagger"],
+  wand: ["dagger", "sword"],
+  staff: ["sword", "axe"],
+  focus: ["dagger", "sword"],
+  psi_lens: ["dagger", "sword"],
+  emitter: ["dagger", "sword"],
+  carbine: ["sword", "dagger"],
+  launcher: ["axe", "sword"],
+  gland_caster: ["dagger", "sword"],
+  stinger_rig: ["dagger", "axe"],
+  void_lens: ["dagger", "sword"],
+  alchemical_kit: ["dagger", "sword"],
+});
+const ITEM_SPRITE_MATERIAL_FALLBACK = Object.freeze(["iron", "bronze", "wood"]);
+function pushUniqueSpriteCandidate(list, value) {
+  if (!value || typeof value !== "string") return;
+  if (!list.includes(value)) list.push(value);
+}
+function spriteCandidatesForWeaponType(type) {
+  const out = [];
+  const materialId = materialIdFromItemType(type);
+  const familyId = normalizeWeaponFamilyId(weaponKindFromItemType(type) ?? "");
+  if (!familyId) return out;
+  const familyCandidates = WEAPON_SPRITE_FAMILY_FALLBACK[familyId] ?? ["dagger", "sword", "axe"];
+  const materialCandidates = [];
+  pushUniqueSpriteCandidate(materialCandidates, materialId);
+  for (const fallbackMat of ITEM_SPRITE_MATERIAL_FALLBACK) pushUniqueSpriteCandidate(materialCandidates, fallbackMat);
+  for (const mat of materialCandidates) {
+    for (const fam of familyCandidates) pushUniqueSpriteCandidate(out, weaponType(mat, fam));
+  }
+  return out;
+}
+function spriteCandidatesForArmorType(type) {
+  const out = [];
+  const parsed = parseArmorTypeParts(type);
+  if (!parsed?.slot) return out;
+  const slot = parsed.slot;
+  const family = normalizeArmorFamilyId(parsed.family ?? "");
+  pushUniqueSpriteCandidate(out, `armor_${parsed.material}_${slot}`);
+  if (family === "leather") pushUniqueSpriteCandidate(out, `armor_leather_${slot}`);
+  const materialCandidates = [];
+  pushUniqueSpriteCandidate(materialCandidates, parsed.material);
+  for (const fallbackMat of ITEM_SPRITE_MATERIAL_FALLBACK) pushUniqueSpriteCandidate(materialCandidates, fallbackMat);
+  for (const mat of materialCandidates) pushUniqueSpriteCandidate(out, `armor_${mat}_${slot}`);
+  pushUniqueSpriteCandidate(out, `armor_bronze_${slot}`);
+  return out;
+}
+function itemSpriteCandidates(type) {
+  const out = [];
+  const rawType = String(type ?? "").trim();
+  if (!rawType) return out;
+  const normalizedType = normalizeItemType(rawType);
+  pushUniqueSpriteCandidate(out, rawType);
+  pushUniqueSpriteCandidate(out, normalizedType);
+  if (normalizedType.startsWith("weapon_")) {
+    for (const candidate of spriteCandidatesForWeaponType(normalizedType)) pushUniqueSpriteCandidate(out, candidate);
+  } else if (normalizedType.startsWith("armor_")) {
+    for (const candidate of spriteCandidatesForArmorType(normalizedType)) pushUniqueSpriteCandidate(out, candidate);
+  }
+  return out;
+}
 function monsterSpriteId(type) {
   const normalizedType = normalizeMonsterTypeId(type);
   if (!normalizedType) return null;
@@ -11568,7 +12358,10 @@ function itemSpriteId(ent) {
     const lockSprite = isLocked ? (CHEST_LOCK_SPRITE_BY_KEY[keyType] ?? null) : null;
     if (lockSprite && SPRITE_SOURCES[lockSprite]) return lockSprite;
   }
-  if (SPRITE_SOURCES[type]) return type;
+  for (const spriteId of itemSpriteCandidates(type)) {
+    if (!spriteId || !SPRITE_SOURCES[spriteId]) continue;
+    return spriteId;
+  }
   return null;
 }
 function characterSpriteId(speciesId, classId) {
@@ -12112,10 +12905,21 @@ function tileSpriteId(state, wx, wy, wz, t) {
 }
 function materialIdFromItemType(type) {
   if (!type || typeof type !== "string") return null;
-  if (!type.startsWith("weapon_") && !type.startsWith("armor_")) return null;
-  const parts = type.split("_");
-  if (parts.length < 3) return null;
-  return parts.slice(1, -1).join("_");
+  const template = itemTemplateForType(type);
+  if (template?.materialTierId && MATERIAL_BY_ID[template.materialTierId]) return template.materialTierId;
+  if (type.startsWith("weapon_")) {
+    const body = String(type).slice("weapon_".length);
+    const mats = [...WEAPON_MATERIALS].sort((a, b) => b.length - a.length);
+    for (const mat of mats) {
+      const prefix = `${mat}_`;
+      if (body.startsWith(prefix)) return mat;
+    }
+    return null;
+  }
+  if (type.startsWith("armor_")) {
+    return parseArmorTypeParts(type)?.material ?? null;
+  }
+  return null;
 }
 const EMBERSTEEL_MIN_INDEX = Math.max(0, METAL_TIERS.findIndex((tier) => tier.id === "embersteel"));
 function weaponTierGlowColor(type) {
@@ -12243,9 +13047,9 @@ const SPRITE_UPLOAD_DIR_BY_CATEGORY = {
   actor: "actors",
 };
 const ARMOR_SLOT_LABELS = {
-  head: "Helmet",
-  chest: "Chestplate",
-  legs: "Platelegs",
+  head: "Head",
+  chest: "Chest",
+  legs: "Legs",
 };
 const SPRITE_CATEGORY_SORT = {
   monster: 1,
@@ -15079,7 +15883,7 @@ function exportSave(state) {
   const poisonClouds = ensurePoisonCloudState(state);
 
   const payload = {
-    v: 8,
+    v: 9,
     seed: state.world.seedStr,
     fog: fogEnabled,
     minimap: minimapEnabled,
@@ -15111,19 +15915,36 @@ function exportSave(state) {
   return btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
 }
 
-function normalizeInventoryEntries(items) {
+function normalizeInventoryEntries(items, options = null) {
   const out = [];
   for (const raw of items ?? []) {
     if (!raw || typeof raw !== "object") continue;
-    const type = normalizeItemType(raw.type);
+    const type = normalizeItemType(raw.type, options);
     if (!ITEM_TYPES[type]) continue;
     const amount = Math.max(1, Math.floor(raw.amount ?? 1));
-    out.push({ type, amount });
+    const templateId = itemTemplateIdForType(raw.templateId ?? type) ?? itemTemplateIdForType(type) ?? type;
+    if (isStackable(type)) {
+      out.push({ type, amount, templateId });
+      continue;
+    }
+    const explicitInstanceId = typeof raw.instanceId === "string" ? raw.instanceId.trim() : "";
+    const explicitInstanceIds = Array.isArray(raw.instanceIds)
+      ? raw.instanceIds.map((id) => String(id ?? "").trim()).filter(Boolean)
+      : [];
+    for (let i = 0; i < amount; i++) {
+      const chosenInstanceId = explicitInstanceIds[i] || (i === 0 ? explicitInstanceId : "");
+      out.push({
+        type,
+        amount: 1,
+        templateId,
+        instanceId: chosenInstanceId || createItemInstance(type, "player", options?.ownerId ?? null).id,
+      });
+    }
   }
   return out;
 }
 
-function normalizeDynamicEntries(items) {
+function normalizeDynamicEntries(items, options = null) {
   const out = [];
   for (const raw of items ?? []) {
     if (!raw || typeof raw !== "object") continue;
@@ -15156,9 +15977,31 @@ function normalizeDynamicEntries(items) {
       out.push(entry);
       continue;
     }
-    const type = normalizeItemType(raw.type);
+    const type = normalizeItemType(raw.type, options);
     if (!ITEM_TYPES[type]) continue;
-    out.push({ ...raw, kind: "item", type, amount: Math.max(1, Math.floor(raw.amount ?? 1)) });
+    const x = Math.floor(Number(raw.x));
+    const y = Math.floor(Number(raw.y));
+    const z = Math.floor(Number(raw.z));
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    const amount = Math.max(1, Math.floor(raw.amount ?? 1));
+    const templateId = itemTemplateIdForType(raw.templateId ?? type) ?? itemTemplateIdForType(type) ?? type;
+    const instanceIdRaw = String(raw.instanceId ?? "").trim();
+    const instanceId = instanceIdRaw || createItemInstance(type, "world", null, { x, y, z }).id;
+    const ownerType = String(raw.ownerType ?? "world").trim() || "world";
+    const ownerId = (raw.ownerId === null || raw.ownerId === undefined) ? null : String(raw.ownerId);
+    out.push({
+      ...raw,
+      kind: "item",
+      type,
+      x,
+      y,
+      z,
+      amount,
+      templateId,
+      instanceId,
+      ownerType,
+      ownerId,
+    });
   }
   return out;
 }
@@ -15192,20 +16035,27 @@ function normalizePoisonCloudState(raw) {
   return out;
 }
 
-function normalizeEquip(equip) {
+function normalizeEquip(equip, options = null) {
   const out = { weapon: null, head: null, chest: null, legs: null };
   const e = equip ?? {};
+  const sid = normalizeCharacterSpeciesId(options?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID);
+  const cid = normalizeCharacterClassId(options?.classId ?? defaultClassIdForSpecies(sid), sid);
 
-  const weapon = normalizeItemType(e.weapon ?? null);
-  if (weapon && WEAPONS[weapon]) out.weapon = weapon;
+  const weapon = normalizeItemType(e.weapon ?? null, { speciesId: sid, classId: cid });
+  if (weapon && WEAPONS[weapon]) {
+    const validation = equipValidationForItemType(weapon, sid, cid);
+    if (validation.ok) out.weapon = weapon;
+  }
 
   const candidates = [e.head, e.chest, e.legs, e.armor]
-    .map((x) => normalizeItemType(x))
+    .map((x) => normalizeItemType(x, { speciesId: sid, classId: cid }))
     .filter(Boolean);
 
   for (const type of candidates) {
     const piece = ARMOR_PIECES[type];
     if (!piece) continue;
+    const validation = equipValidationForItemType(type, sid, cid);
+    if (!validation.ok) continue;
     if (!out[piece.slot]) out[piece.slot] = type;
   }
 
@@ -15285,9 +16135,11 @@ function migrateV5toV6(payload) {
 
 function migrateV6toV7(payload) {
   payload.player = payload.player ?? {};
-  payload.player.equip = normalizeEquip(payload.player.equip ?? {});
-  payload.inv = normalizeInventoryEntries(payload.inv ?? []);
-  payload.dynamic = normalizeDynamicEntries(payload.dynamic ?? []);
+  const sid = normalizeCharacterSpeciesId(payload?.player?.speciesId ?? payload?.character?.speciesId);
+  const cid = normalizeCharacterClassId(payload?.player?.classId ?? payload?.character?.classId, sid);
+  payload.player.equip = normalizeEquip(payload.player.equip ?? {}, { speciesId: sid, classId: cid });
+  payload.inv = normalizeInventoryEntries(payload.inv ?? [], { speciesId: sid, classId: cid, ownerId: payload?.character?.id ?? null });
+  payload.dynamic = normalizeDynamicEntries(payload.dynamic ?? [], { speciesId: sid, classId: cid });
   payload.shop = payload.shop ?? null;
   payload.v = 7;
   return payload;
@@ -15305,6 +16157,31 @@ function migrateV7toV8(payload) {
   payload.v = 8;
   return payload;
 }
+function migrateV8toV9(payload) {
+  payload.player = payload.player ?? {};
+  payload.character = normalizeCharacterProfile(
+    payload.character ?? {
+      classId: payload?.player?.classId,
+      speciesId: payload?.player?.speciesId,
+    }
+  );
+  const sid = normalizeCharacterSpeciesId(payload?.player?.speciesId ?? payload.character.speciesId);
+  const cid = normalizeCharacterClassId(payload?.player?.classId ?? payload.character.classId, sid);
+  payload.player.classId = cid;
+  payload.player.speciesId = sid;
+  payload.player.equip = normalizeEquip(payload.player.equip ?? {}, { speciesId: sid, classId: cid });
+  payload.inv = normalizeInventoryEntries(payload.inv ?? [], {
+    speciesId: sid,
+    classId: cid,
+    ownerId: payload.character?.id ?? null,
+  });
+  payload.dynamic = normalizeDynamicEntries(payload.dynamic ?? [], {
+    speciesId: sid,
+    classId: cid,
+  });
+  payload.v = 9;
+  return payload;
+}
 
 function importSave(saveStr) {
   try {
@@ -15317,10 +16194,22 @@ function importSave(saveStr) {
     if (payload.v === 5) payload = migrateV5toV6(payload);
     if (payload.v === 6) payload = migrateV6toV7(payload);
     if (payload.v === 7) payload = migrateV7toV8(payload);
-    if (payload.v !== 8) return null;
+    if (payload.v === 8) payload = migrateV8toV9(payload);
+    if (payload.v !== 9) return null;
 
     const tileOverrides = new Map(payload.tileOv ?? []);
     const world = new World(payload.seed, tileOverrides);
+    const character = normalizeCharacterProfile(
+      payload.character ?? {
+        classId: payload?.player?.classId,
+        speciesId: payload?.player?.speciesId,
+      }
+    );
+    const normalizeOpts = {
+      speciesId: character.speciesId,
+      classId: character.classId,
+      ownerId: character.id,
+    };
 
     const state = {
       world,
@@ -15331,7 +16220,7 @@ function importSave(saveStr) {
       entities: new Map(),
       removedIds: new Set(payload.removed ?? []),
       entityOverrides: new Map(payload.entOv ?? []),
-      inv: normalizeInventoryEntries(payload.inv ?? []),
+      inv: normalizeInventoryEntries(payload.inv ?? [], normalizeOpts),
       dynamic: new Map(),
       turn: payload.turn ?? 0,
       visitedDoors: new Set(payload.visitedDoors ?? []),
@@ -15342,12 +16231,7 @@ function importSave(saveStr) {
       startSpawn: payload.startSpawn ?? null,
       lastLadderLanding: normalizeLadderLanding(payload.lastLadderLanding ?? null),
       shop: payload.shop ?? null,
-      character: normalizeCharacterProfile(
-        payload.character ?? {
-          classId: payload?.player?.classId,
-          speciesId: payload?.player?.speciesId,
-        }
-      ),
+      character,
       combat: {
         lastEventMs: Number.isFinite(payload?.combat?.lastEventMs) ? payload.combat.lastEventMs : 0,
         regenAnchorMs: Date.now(),
@@ -15370,12 +16254,15 @@ function importSave(saveStr) {
     fogEnabled = !!payload.fog;
     minimapEnabled = payload.minimap !== false;
 
-    for (const e of normalizeDynamicEntries(payload.dynamic ?? [])) state.dynamic.set(e.id, e);
+    for (const e of normalizeDynamicEntries(payload.dynamic ?? [], normalizeOpts)) state.dynamic.set(e.id, e);
 
     state.player.dead = !!state.player.dead;
     state.player.level = state.player.level ?? 1;
     state.player.xp = Math.max(0, Math.floor(state.player.xp ?? 0));
-    state.player.equip = normalizeEquip(state.player.equip ?? {});
+    state.player.equip = normalizeEquip(state.player.equip ?? {}, {
+      speciesId: state.character?.speciesId ?? state.player?.speciesId,
+      classId: state.character?.classId ?? state.player?.classId,
+    });
     state.player.effects = state.player.effects ?? [];
     state.player.maxHp = Math.max(1, Math.floor(state.player.maxHp ?? maxHpForLevel(state.player.level, state.character)));
     state.player.hp = clamp(Math.floor(state.player.hp ?? state.player.maxHp), 0, state.player.maxHp);
@@ -15389,9 +16276,9 @@ function importSave(saveStr) {
     if (state.shop && Array.isArray(state.shop.stock)) {
       state.shop.stock = state.shop.stock
         .map((s) => {
-          const type = normalizeItemType(s?.type);
+          const type = normalizeItemType(s?.type, normalizeOpts);
           const amountRaw = Math.max(1, Math.floor(s?.amount ?? 1));
-          const amount = type === "potion" ? Math.min(5, amountRaw) : 1;
+          const amount = isStackable(type) ? amountRaw : 1;
           return { type, price: Math.max(1, Math.floor(s?.price ?? 0)), amount };
         })
         .filter((s) => ITEM_TYPES[s.type]);
