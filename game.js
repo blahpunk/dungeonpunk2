@@ -103,6 +103,7 @@ const XP_DEPTH_KILL_SOFTCAP_BASE = 24;
 const XP_DEPTH_KILL_SOFTCAP_PER_DEPTH = 3;
 const XP_DEPTH_KILL_PENALTY_PER_EXTRA = 0.012;
 const XP_DEPTH_KILL_PENALTY_CAP = 0.55;
+const RANGED_ATTACK_RANGE_BONUS = 1;
 const STAIRS_DOWN_SPAWN_CHANCE = 0.48;
 const STAIRS_UP_SPAWN_CHANCE = 0.50;
 const EDGE_SHADE_PX = Math.max(2, Math.floor(TILE * 0.12));
@@ -1391,6 +1392,7 @@ const btnNewEl = document.getElementById("btnNew");
 const btnFogEl = document.getElementById("btnFog");
 const btnSaveGameEl = document.getElementById("btnExport");
 const btnLoadGameEl = document.getElementById("btnImport");
+const btnGuestNewCharacterEl = document.getElementById("btnGuestNewCharacter");
 const btnChooseCharacterEl = document.getElementById("btnChooseCharacter");
 const btnInfoEl = document.getElementById("btnInfo");
 const btnSpriteEditorEl = document.getElementById("btnSpriteEditor");
@@ -1434,6 +1436,14 @@ const newDungeonConfirmOverlayEl = document.getElementById("newDungeonConfirmOve
 const newDungeonConfirmSummaryEl = document.getElementById("newDungeonConfirmSummary");
 const newDungeonConfirmStartEl = document.getElementById("newDungeonConfirmStart");
 const newDungeonConfirmCancelEl = document.getElementById("newDungeonConfirmCancel");
+const guestNewCharacterOverlayEl = document.getElementById("guestNewCharacterOverlay");
+const guestNewCharacterCurrentCardEl = document.getElementById("guestNewCharacterCurrentCard");
+const guestNewCharacterConfirmEl = document.getElementById("guestNewCharacterConfirm");
+const guestNewCharacterCancelEl = document.getElementById("guestNewCharacterCancel");
+const guestLoginImportOverlayEl = document.getElementById("guestLoginImportOverlay");
+const guestLoginImportCharacterCardEl = document.getElementById("guestLoginImportCharacterCard");
+const guestLoginImportConfirmEl = document.getElementById("guestLoginImportConfirm");
+const guestLoginImportDeclineEl = document.getElementById("guestLoginImportDecline");
 const saveGameOverlayEl = document.getElementById("saveGameOverlay");
 const saveGameTitleEl = document.getElementById("saveGameTitle");
 const saveGameModeEl = document.getElementById("saveGameMode");
@@ -1575,6 +1585,8 @@ function syncBodyModalLock() {
     !!spriteEditorOverlayEl?.classList.contains("show") ||
     !!monsterEditorOverlayEl?.classList.contains("show") ||
     !!newDungeonConfirmOverlayEl?.classList.contains("show") ||
+    !!guestNewCharacterOverlayEl?.classList.contains("show") ||
+    !!guestLoginImportOverlayEl?.classList.contains("show") ||
     !!levelUpOverlayEl?.classList.contains("show");
   document.body?.classList.toggle("modal-open", hasModal);
 }
@@ -1640,6 +1652,8 @@ let mobileUiSig = "";
 let contextAuxSignature = "";
 let dpadCenterSignature = "";
 let newDungeonConfirmResolver = null;
+let guestNewCharacterResolver = null;
+let guestLoginImportResolver = null;
 let newDungeonResetPending = false;
 let bootLoadedFromLocalSave = false;
 let requiresCharacterCreation = false;
@@ -3482,7 +3496,8 @@ function monsterStatsForDepth(type, z) {
     acc,
     eva,
     spd,
-    range: Math.max(0, Math.floor(spec.range ?? 0)),
+    range: Math.max(0, Math.floor(spec.range ?? 0))
+      + (Number(spec.range ?? 0) > 0 ? RANGED_ATTACK_RANGE_BONUS : 0),
     cdTurns: Math.max(0, Math.floor(spec.cdTurns ?? 0)),
   };
 }
@@ -3919,7 +3934,10 @@ function normalizeAttackProfile(profile, fallbackProfile = UNARMED_ATTACK_PROFIL
   const fallback = (fallbackProfile && typeof fallbackProfile === "object") ? fallbackProfile : UNARMED_ATTACK_PROFILE;
   const kind = src.kind === "ranged" ? "ranged" : "melee";
   const minRange = Math.max(1, Math.floor(Number(src.minRange ?? fallback.minRange ?? 1) || 1));
-  const range = Math.max(minRange, Math.floor(Number(src.range ?? fallback.range ?? minRange) || minRange));
+  const baseRange = Math.max(minRange, Math.floor(Number(src.range ?? fallback.range ?? minRange) || minRange));
+  const range = kind === "ranged"
+    ? Math.max(minRange, baseRange + RANGED_ATTACK_RANGE_BONUS)
+    : baseRange;
   const flavorRaw = String(src.flavor ?? (kind === "ranged" ? "ballistic" : "melee")).trim().toLowerCase();
   return {
     kind,
@@ -5293,7 +5311,7 @@ function buildNewDungeonResetSummary(state) {
     `Bound progression kept: Level ${level} (${xp}/${xpNeeded} XP), Gold ${Math.max(0, Math.floor(p.gold ?? 0))}\n` +
     `Bound equipment/inventory kept: ${inv.length} stacks (${invTotal} total), ${equippedCount} equipped\n` +
     `Run progress reset: ${depthLabel}, ${exploredChunks} explored chunks, ${seenTiles} discovered tiles, turn ${turn}\n\n` +
-    "Starting a new dungeon keeps character progression and starts a fresh map."
+    "Starting a new dungeon keeps character progression/items and starts a fresh map. Save first if you want to keep this current dungeon instance."
   );
 }
 
@@ -5314,6 +5332,129 @@ function openNewDungeonConfirm(state) {
   setNewDungeonConfirmOpen(true);
   return new Promise((resolve) => {
     newDungeonConfirmResolver = resolve;
+  });
+}
+
+function buildGuestCharacterCardMarkup(state) {
+  const run = state && typeof state === "object" ? state : game;
+  const profile = ensureCharacterState(run);
+  const classLabel = characterClassDef(profile?.classId ?? "").name;
+  const speciesLabel = characterSpeciesDef(profile?.speciesId ?? "").name;
+  const spriteDisplay = resolveCharacterSpriteDisplay(profile?.speciesId ?? "", profile?.classId ?? "");
+  const visual = spriteDisplay.src
+    ? `<img class="charSlotSprite" src="${spriteDisplay.src}" alt="${escapeHtmlText(speciesLabel)} ${escapeHtmlText(classLabel)} sprite" />`
+    : `<div class="charSlotSpriteFallback">@</div>`;
+  const level = Math.max(1, Math.floor(run?.player?.level ?? 1));
+  const depth = Math.trunc(run?.player?.z ?? 0);
+  return (
+    `<div class="charSlotVisual">${visual}</div>` +
+    `<div class="charSlotInfo">` +
+      `<div class="charSlotTitle">${escapeHtmlText(profile?.name ?? DEFAULT_CHARACTER_NAME)}</div>` +
+      `<div class="charSlotMeta">Species: ${escapeHtmlText(speciesLabel)}  |  Class: ${escapeHtmlText(classLabel)}\n` +
+      `Level ${level}  |  Depth ${depth}</div>` +
+    `</div>`
+  );
+}
+
+function isGuestNewCharacterOverlayOpen() {
+  return !!guestNewCharacterOverlayEl?.classList.contains("show");
+}
+
+function setGuestNewCharacterOverlayOpen(open) {
+  if (!guestNewCharacterOverlayEl) return;
+  const show = !!open;
+  if (show) {
+    closeMobilePanels();
+    setDebugMenuOpen(false);
+  }
+  guestNewCharacterOverlayEl.classList.toggle("show", show);
+  guestNewCharacterOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
+  syncBodyModalLock();
+  if (show) guestNewCharacterConfirmEl?.focus();
+}
+
+function resolveGuestNewCharacterChoice(confirmed) {
+  const resolver = guestNewCharacterResolver;
+  guestNewCharacterResolver = null;
+  setGuestNewCharacterOverlayOpen(false);
+  if (resolver) resolver(!!confirmed);
+}
+
+function openGuestNewCharacterOverlay(state = null) {
+  if (guestNewCharacterResolver) return Promise.resolve(false);
+  if (!guestNewCharacterOverlayEl) return Promise.resolve(false);
+  if (guestNewCharacterCurrentCardEl) {
+    guestNewCharacterCurrentCardEl.innerHTML = buildGuestCharacterCardMarkup(state ?? game);
+  }
+  setGuestNewCharacterOverlayOpen(true);
+  return new Promise((resolve) => {
+    guestNewCharacterResolver = resolve;
+  });
+}
+
+async function openGuestNewCharacterCreationFlow() {
+  if (isAuthenticatedUser) {
+    await openCharacterSelectionOverlay({ purpose: "load_run" });
+    return true;
+  }
+  characterUi.loading = false;
+  characterUi.slots = await fetchCharacterSlotsFromLocal();
+  const activeId = getActiveCharacterSlotId();
+  const activeExists = !!(activeId && characterUi.slots.some((slot) => slot.id === activeId));
+  characterUi.selectedSaveId = activeExists ? activeId : (characterUi.slots[0]?.id || "");
+  characterUi.mode = "create";
+  characterUi.selectionPurpose = "load_run";
+  requiresCharacterCreation = true;
+  setCharacterOverlayStatus(
+    "Creating a new guest character overwrites this guest run. Log in first if you want to keep it.",
+    true
+  );
+  resetCharacterCreationDraft(null, { step: "welcome" });
+  setCharacterOverlayOpen(true);
+  renderCharacterOverlay();
+  return true;
+}
+
+async function handleGuestNewCharacterRequest() {
+  if (!game) return false;
+  const confirmed = await openGuestNewCharacterOverlay(game);
+  if (!confirmed) return false;
+  return openGuestNewCharacterCreationFlow();
+}
+
+function isGuestLoginImportOverlayOpen() {
+  return !!guestLoginImportOverlayEl?.classList.contains("show");
+}
+
+function setGuestLoginImportOverlayOpen(open) {
+  if (!guestLoginImportOverlayEl) return;
+  const show = !!open;
+  if (show) {
+    closeMobilePanels();
+    setDebugMenuOpen(false);
+  }
+  guestLoginImportOverlayEl.classList.toggle("show", show);
+  guestLoginImportOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
+  syncBodyModalLock();
+  if (show) guestLoginImportConfirmEl?.focus();
+}
+
+function resolveGuestLoginImportChoice(shouldImport) {
+  const resolver = guestLoginImportResolver;
+  guestLoginImportResolver = null;
+  setGuestLoginImportOverlayOpen(false);
+  if (resolver) resolver(!!shouldImport);
+}
+
+function openGuestLoginImportOverlay(state = null) {
+  if (guestLoginImportResolver) return Promise.resolve(false);
+  if (!guestLoginImportOverlayEl) return Promise.resolve(false);
+  if (guestLoginImportCharacterCardEl) {
+    guestLoginImportCharacterCardEl.innerHTML = buildGuestCharacterCardMarkup(state ?? game);
+  }
+  setGuestLoginImportOverlayOpen(true);
+  return new Promise((resolve) => {
+    guestLoginImportResolver = resolve;
   });
 }
 
@@ -6517,12 +6658,14 @@ function characterCreationDerivedPreview(draft) {
 function starterCarryoverForClass(classId) {
   const cid = normalizeCharacterClassId(classId);
   const classDef = characterClassDef(cid);
+  const nativeAttack = classNativeAttackProfile(cid);
+  const startsUnarmed = (nativeAttack?.kind ?? "melee") === "ranged";
   const out = {
     gold: 0,
     inv: [],
     equip: { weapon: null, head: null, chest: null, legs: null },
   };
-  out.equip.weapon = "weapon_wood_dagger";
+  if (!startsUnarmed) out.equip.weapon = "weapon_wood_dagger";
   if ((classDef?.hpMult ?? 1) >= 1.12 || (classDef?.armorEffect ?? 1) >= 1.1) {
     out.equip.head = "armor_wood_head";
   }
@@ -7195,16 +7338,58 @@ function clearPendingSaveAfterLoginHandoff() {
   try { localStorage.removeItem(SAVE_LOGIN_HANDOFF_KEY); } catch {}
 }
 
-function buildGuestImportPromptSummary(state) {
-  const profile = ensureCharacterState(state);
-  const className = characterClassDef(profile?.classId).name;
-  const speciesName = characterSpeciesDef(profile?.speciesId).name;
-  const level = Math.max(1, Math.floor(state?.player?.level ?? 1));
-  const depth = Math.trunc(state?.player?.z ?? 0);
-  return {
-    profile,
-    text: `"${profile?.name ?? DEFAULT_CHARACTER_NAME}" (${speciesName} ${className}, Lvl ${level}, Depth ${depth})`,
-  };
+function saveNameLooksLikeAutosave(name = "") {
+  return String(name ?? "").trim().toLowerCase().startsWith("autosave");
+}
+
+function mostRecentCharacterSlotIdFromSaveListResponse(listData = null) {
+  const data = (listData && typeof listData === "object") ? listData : {};
+  const states = Array.isArray(data.character_states) ? data.character_states : [];
+  for (const entry of states) {
+    const cid = normalizeCharacterProfileId(entry?.id ?? "");
+    const slotId = characterStateSlotId(cid);
+    if (slotId) return slotId;
+  }
+  const characters = Array.isArray(data.characters) ? data.characters : [];
+  for (const entry of characters) {
+    const cid = normalizeCharacterProfileId(entry?.character_id ?? "");
+    const slotId = characterStateSlotId(cid);
+    if (slotId) return slotId;
+  }
+  return "";
+}
+
+async function loadLatestAccountRunAfterGuestDecline() {
+  if (!isAuthenticatedUser) return false;
+  let data = null;
+  try {
+    data = await saveApiRequest("GET");
+  } catch {
+    return false;
+  }
+  const slotId = mostRecentCharacterSlotIdFromSaveListResponse(data);
+  if (slotId) setActiveCharacterSlotId(slotId);
+
+  const saves = Array.isArray(data?.saves) ? [...data.saves] : [];
+  saves.sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
+  const autosave = saves.find((save) => saveNameLooksLikeAutosave(save?.name ?? ""));
+  const chosenSave = autosave ?? saves[0] ?? null;
+
+  if (chosenSave?.id) {
+    const loaded = await loadSaveFromServer(String(chosenSave.id), {
+      showStatus: false,
+      closeOverlay: false,
+      forceEntrance: false,
+    });
+    if (loaded) return true;
+  }
+
+  if (slotId) {
+    clearSaveDirty();
+    const loadedCharacter = await loadRunFromCharacterSlot(slotId, { forceEntrance: false });
+    if (loadedCharacter) return true;
+  }
+  return false;
 }
 
 async function importGuestCharacterFromCurrentRun(options = null) {
@@ -7259,24 +7444,31 @@ async function importGuestCharacterFromCurrentRun(options = null) {
 async function maybeHandlePostLoginGuestImport() {
   if (!isAuthenticatedUser || !game) return;
   if (!hasPendingSaveAfterLoginHandoff()) return;
-  const summary = buildGuestImportPromptSummary(game);
-  const shouldImport = confirm(
-    `Import your guest character ${summary.text} into this account?\n\n` +
-    "Choose Cancel to skip import."
-  );
-  if (!shouldImport) {
-    clearPendingSaveAfterLoginHandoff();
-    return;
-  }
+  const shouldImport = await openGuestLoginImportOverlay(game);
+  clearPendingSaveAfterLoginHandoff();
   try {
-    const imported = await importGuestCharacterFromCurrentRun({ closeOverlay: true });
-    if (imported) {
-      pushLog(game, "Guest character imported. Use Save Game to store this dungeon run on the server.");
+    if (shouldImport) {
+      const imported = await importGuestCharacterFromCurrentRun({ closeOverlay: true });
+      if (imported) {
+        pushLog(game, "Guest character imported. Use Save Game to store this dungeon run on the server.");
+      } else {
+        pushLog(game, "Could not import guest character.");
+      }
+      return;
+    }
+
+    const loaded = await loadLatestAccountRunAfterGuestDecline();
+    if (loaded) {
+      requiresCharacterCreation = false;
+      setCharacterOverlayStatus("");
+      if (isCharacterOverlayOpen()) setCharacterOverlayOpen(false);
+      pushLog(game, "Loaded your latest account autosave.");
     } else {
-      pushLog(game, "Could not import guest character.");
+      if (isCharacterOverlayOpen()) renderCharacterOverlay();
+      pushLog(game, "Could not load an account autosave. Select or create a character to continue.");
     }
   } catch {
-    pushLog(game, "Could not import guest character.");
+    pushLog(game, shouldImport ? "Could not import guest character." : "Could not load an account autosave.");
   }
 }
 async function openCharacterSelectionOverlay(options = null) {
@@ -14564,6 +14756,8 @@ function applyEffectsAfterPlayerAction(state) {
 
 function takeTurn(state, didSpendTurn) {
   if (enforceCharacterCreationGate()) return;
+  if (isGuestNewCharacterOverlayOpen()) return;
+  if (isGuestLoginImportOverlayOpen()) return;
   if (isLevelUpOverlayOpen()) return;
   if (isCharacterOverlayOpen()) return;
   if (!didSpendTurn) return;
@@ -14610,6 +14804,16 @@ function shouldIgnoreGameHotkeys(e) {
 function onKey(state, e) {
   const k = e.key.toLowerCase();
   if (shouldIgnoreGameHotkeys(e)) return;
+  if (isGuestNewCharacterOverlayOpen()) {
+    e.preventDefault();
+    if (k === "escape") resolveGuestNewCharacterChoice(false);
+    return;
+  }
+  if (isGuestLoginImportOverlayOpen()) {
+    e.preventDefault();
+    if (k === "escape") resolveGuestLoginImportChoice(false);
+    return;
+  }
   if (enforceCharacterCreationGate()) {
     e.preventDefault();
     return;
@@ -15273,6 +15477,9 @@ btnSaveGameEl?.addEventListener("click", () => {
 btnLoadGameEl?.addEventListener("click", () => {
   void openSaveGameOverlay("load");
 });
+btnGuestNewCharacterEl?.addEventListener("click", () => {
+  void handleGuestNewCharacterRequest();
+});
 authBtnEl?.addEventListener("click", () => {
   if (isAuthenticatedUser) return;
   prepareGuestLoginHandoff(game);
@@ -15484,6 +15691,24 @@ newDungeonConfirmCancelEl?.addEventListener("click", () => {
 newDungeonConfirmOverlayEl?.addEventListener("click", (e) => {
   if (e.target === newDungeonConfirmOverlayEl) resolveNewDungeonConfirm(false);
 });
+guestNewCharacterConfirmEl?.addEventListener("click", () => {
+  resolveGuestNewCharacterChoice(true);
+});
+guestNewCharacterCancelEl?.addEventListener("click", () => {
+  resolveGuestNewCharacterChoice(false);
+});
+guestNewCharacterOverlayEl?.addEventListener("click", (e) => {
+  if (e.target === guestNewCharacterOverlayEl) resolveGuestNewCharacterChoice(false);
+});
+guestLoginImportConfirmEl?.addEventListener("click", () => {
+  resolveGuestLoginImportChoice(true);
+});
+guestLoginImportDeclineEl?.addEventListener("click", () => {
+  resolveGuestLoginImportChoice(false);
+});
+guestLoginImportOverlayEl?.addEventListener("click", (e) => {
+  if (e.target === guestLoginImportOverlayEl) resolveGuestLoginImportChoice(false);
+});
 btnDebugMenuEl?.addEventListener("click", (e) => {
   if (!canUseAdminControls()) return;
   e.stopPropagation();
@@ -15501,6 +15726,16 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (isGuestNewCharacterOverlayOpen()) {
+    e.preventDefault();
+    resolveGuestNewCharacterChoice(false);
+    return;
+  }
+  if (isGuestLoginImportOverlayOpen()) {
+    e.preventDefault();
+    resolveGuestLoginImportChoice(false);
+    return;
+  }
   if (isLevelUpOverlayOpen()) {
     e.preventDefault();
     closeLevelUpOverlay();

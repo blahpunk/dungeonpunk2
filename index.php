@@ -67,6 +67,43 @@ function current_request_url(): ?string
   return sprintf('%s://%s%s', $scheme, $host, $uri);
 }
 
+function auth_cookie_secrets(): array
+{
+  $current = trim((string) (getenv('SECURE_AUTH_SECRET') ?: getenv('FLASK_SECRET_KEY') ?: ''));
+  $previousRaw = trim((string) (getenv('SECURE_AUTH_PREVIOUS_SECRETS') ?: ''));
+
+  $secrets = [];
+  if ($current !== '') {
+    $secrets[] = $current;
+  }
+  if ($previousRaw !== '') {
+    foreach (explode(',', $previousRaw) as $part) {
+      $s = trim($part);
+      if ($s !== '') {
+        $secrets[] = $s;
+      }
+    }
+  }
+
+  return array_values(array_unique($secrets));
+}
+
+function is_valid_user_cookie_signature(string $cookieValue, string $providedSig): bool
+{
+  if ($cookieValue === '' || $providedSig === '') {
+    return false;
+  }
+
+  foreach (auth_cookie_secrets() as $secret) {
+    $expectedSig = hash_hmac('sha256', $cookieValue, $secret);
+    if (hash_equals($expectedSig, $providedSig)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function current_request_base_url(): ?string
 {
   $host = trim((string) ($_SERVER['HTTP_HOST'] ?? ''));
@@ -213,13 +250,9 @@ function get_authenticated_user(): ?array
     return read_local_auth_cookie();
   }
 
-  $secret = trim((string) (getenv('SECURE_AUTH_SECRET') ?: getenv('FLASK_SECRET_KEY') ?: ''));
-  if ($secret !== '') {
-    $providedSig = trim((string) ($_COOKIE['user_sig'] ?? ''));
-    $expectedSig = hash_hmac('sha256', $cookieValue, $secret);
-    if ($providedSig === '' || !hash_equals($expectedSig, $providedSig)) {
-      return null;
-    }
+  $providedSig = trim((string) ($_COOKIE['user_sig'] ?? ''));
+  if (!is_valid_user_cookie_signature($cookieValue, $providedSig)) {
+    return null;
   }
 
   $decoded = base64url_decode_str($cookieValue);
@@ -2879,6 +2912,98 @@ if (!is_string($monsterEditorJson)) {
         background: #25406f;
         border-color: #3f68a3;
       }
+      #guestLoginImportOverlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1775;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 12px;
+        background: rgba(0, 0, 0, 0.68);
+      }
+      #guestLoginImportOverlay.show {
+        display: flex;
+      }
+      #guestLoginImportCard {
+        width: min(640px, 94vw);
+        border: 1px solid var(--ui-border);
+        border-radius: 12px;
+        background: linear-gradient(180deg, rgba(15, 23, 35, 0.99) 0%, rgba(8, 12, 20, 0.99) 100%);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+        padding: 18px 16px;
+      }
+      #guestLoginImportTitle {
+        margin: 0 0 8px 0;
+        font-size: 22px;
+        font-weight: 800;
+        color: #ffffff;
+      }
+      #guestLoginImportButtons {
+        margin-top: 4px;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+      #guestLoginImportCharacterCard {
+        margin: 0 0 10px 0;
+      }
+      #guestLoginImportDecline {
+        background: #39283d;
+        border-color: #6a4671;
+      }
+      #guestLoginImportConfirm {
+        background: #25406f;
+        border-color: #3f68a3;
+      }
+      #guestNewCharacterOverlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1770;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 12px;
+        background: rgba(0, 0, 0, 0.68);
+      }
+      #guestNewCharacterOverlay.show {
+        display: flex;
+      }
+      #guestNewCharacterCard {
+        width: min(680px, 94vw);
+        border: 1px solid var(--ui-border);
+        border-radius: 12px;
+        background: linear-gradient(180deg, rgba(15, 23, 35, 0.99) 0%, rgba(8, 12, 20, 0.99) 100%);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+        padding: 18px 16px;
+      }
+      #guestNewCharacterTitle {
+        margin: 0 0 8px 0;
+        font-size: 22px;
+        font-weight: 800;
+        color: #ffffff;
+      }
+      #guestNewCharacterText {
+        margin: 0 0 10px 0;
+        font-size: 13px;
+        color: #c9d4e8;
+        line-height: 1.4;
+      }
+      #guestNewCharacterCurrentCard {
+        margin: 0 0 10px 0;
+      }
+      #guestNewCharacterButtons {
+        margin-top: 4px;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+      #guestNewCharacterConfirm {
+        background: #8d3a26;
+        border-color: #bf6247;
+      }
       #saveGameOverlay {
         position: fixed;
         inset: 0;
@@ -4842,6 +4967,8 @@ if (!is_string($monsterEditorJson)) {
         #spriteEditorOverlay,
         #monsterEditorOverlay,
         #newDungeonConfirmOverlay,
+        #guestNewCharacterOverlay,
+        #guestLoginImportOverlay,
         #levelUpOverlay {
           align-items: flex-start;
           overflow-y: auto;
@@ -4864,6 +4991,16 @@ if (!is_string($monsterEditorJson)) {
           max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
           overflow: auto;
         }
+        #guestLoginImportCard {
+          width: min(640px, calc(100vw - 20px));
+          max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
+          overflow: auto;
+        }
+        #guestNewCharacterCard {
+          width: min(680px, calc(100vw - 20px));
+          max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
+          overflow: auto;
+        }
         #shopBody,
         #saveGameList,
         #characterOverlayBody,
@@ -4880,6 +5017,8 @@ if (!is_string($monsterEditorJson)) {
         #saveGameFooter,
         #characterOverlayActions,
         #newDungeonConfirmButtons,
+        #guestNewCharacterButtons,
+        #guestLoginImportButtons,
         #levelUpFooter {
           position: sticky;
           bottom: 0;
@@ -5132,6 +5271,9 @@ if (!is_string($monsterEditorJson)) {
       <?php endif; ?>
       <button id="btnExport">Save Game</button>
       <button id="btnImport">Load Game</button>
+      <?php if ($user === null): ?>
+        <button id="btnGuestNewCharacter" type="button">New Character</button>
+      <?php endif; ?>
       <?php if ($user !== null): ?>
         <button id="btnChooseCharacter" type="button">Choose Character</button>
       <?php endif; ?>
@@ -5590,11 +5732,32 @@ if (!is_string($monsterEditorJson)) {
     <div id="newDungeonConfirmOverlay" aria-hidden="true">
       <div id="newDungeonConfirmCard" role="dialog" aria-modal="true" aria-labelledby="newDungeonConfirmTitle">
         <h2 id="newDungeonConfirmTitle">Start New Dungeon?</h2>
-        <p id="newDungeonConfirmText">This action resets dungeon progress, not character progression.</p>
+        <p id="newDungeonConfirmText">Starting a new dungeon keeps your character progression and items. Save first if you want to keep this current dungeon instance.</p>
         <div id="newDungeonConfirmSummary">Current run summary unavailable.</div>
         <div id="newDungeonConfirmButtons">
           <button id="newDungeonConfirmCancel" type="button">Cancel</button>
           <button id="newDungeonConfirmStart" type="button">Start New Dungeon</button>
+        </div>
+      </div>
+    </div>
+    <div id="guestLoginImportOverlay" aria-hidden="true">
+      <div id="guestLoginImportCard" role="dialog" aria-modal="true" aria-labelledby="guestLoginImportTitle">
+        <h2 id="guestLoginImportTitle">Import Guest Character and Run?</h2>
+        <div id="guestLoginImportCharacterCard" class="charSlotRow">Guest run summary unavailable.</div>
+        <div id="guestLoginImportButtons">
+          <button id="guestLoginImportDecline" type="button">No</button>
+          <button id="guestLoginImportConfirm" type="button">Yes</button>
+        </div>
+      </div>
+    </div>
+    <div id="guestNewCharacterOverlay" aria-hidden="true">
+      <div id="guestNewCharacterCard" role="dialog" aria-modal="true" aria-labelledby="guestNewCharacterTitle">
+        <h2 id="guestNewCharacterTitle">Start New Guest Character?</h2>
+        <p id="guestNewCharacterText">This will overwrite your current guest character and run. Log in first to save your current character and progress.</p>
+        <div id="guestNewCharacterCurrentCard" class="charSlotRow">Current character unavailable.</div>
+        <div id="guestNewCharacterButtons">
+          <button id="guestNewCharacterCancel" type="button">Cancel</button>
+          <button id="guestNewCharacterConfirm" type="button">Create New Character</button>
         </div>
       </div>
     </div>
