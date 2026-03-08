@@ -88,6 +88,20 @@
 - `Save migration`: implemented via `migrateV8toV9(...)`, plus normalized inventory/dynamic/equip migration paths.
 - `UI updates`: implemented for inventory/shop/equipment/combat log; includes unusable reasons and replacer/amplifier labeling.
 
-## Remaining architecture gap
-- Full shared-world `server-auth` item authority is **not fully implemented** in this codebase yet.
-- Current implementation adds per-item instance IDs, owner metadata, and canonical type/template handling, but item pickup/drop/equip authority is still primarily client-side in `game.js`.
+## Server authority status
+- Added revisioned, signed per-character item authority state on the backend (`index.php`, `api=savegames`):
+  - `GET item_character=<characterId>`
+  - `POST action=item_state_replace`
+  - `POST action=item_mutate`
+- Added optimistic-concurrency mutation validation:
+  - requires `expected_revision`
+  - rejects missing-instance removals
+  - rejects canonical type swaps for existing instances
+  - blocks unauthorized mint operations except explicit sync/spawn-style ops
+- Added client mutation pipeline in `game.js`:
+  - canonical item snapshot builder (inventory/equipment/dynamic items)
+  - diff-based mutation queue
+  - automatic bootstrap + resync on revision conflict
+
+## Residual gap
+- Base chunk-authored item entities are still hydrated client-side and not yet fully represented in server authority state; current authority focuses on dynamic world drops and player-held/equipped items.

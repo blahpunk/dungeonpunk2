@@ -1724,6 +1724,18 @@ const characterSyncRuntime = {
   syncing: false,
   lastSyncAt: 0,
 };
+const itemAuthorityRuntime = {
+  ready: false,
+  loading: false,
+  processing: false,
+  characterId: "",
+  revision: 0,
+  queue: [],
+  baselineAt: 0,
+  lastSnapshotMap: null,
+  lastSyncAt: 0,
+  lastError: "",
+};
 const spriteOverrideState = { overrides: {}, scales: {}, entries: [] };
 const monsterEditorState = { version: 1, monsters: {}, spawnRules: [], updatedAt: "" };
 let infoTierSignature = "";
@@ -6289,6 +6301,7 @@ function markSaveDirty(state, reason = "") {
   saveRuntime.dirty = true;
   saveRuntime.dirtyReason = String(reason || "state-change");
   saveRuntime.lastDirtyAt = Date.now();
+  syncItemAuthorityFromStateIfChanged(state, reason || "state-change");
   markCharacterStateDirty(state, reason || "state-change");
   if (saveRuntime.pendingAutosaveReason) {
     const autoReason = String(saveRuntime.pendingAutosaveReason);
@@ -6719,7 +6732,7 @@ async function saveApiRequest(method = "GET", body = null, query = "") {
   if (!resp.ok || !data?.ok) {
     const msg = data?.error ?? `Request failed (${resp.status})`;
     const err = new Error(msg);
-    err.response = data;
+    err.response = { ...(data && typeof data === "object" ? data : {}), status_code: resp.status };
     throw err;
   }
   return data;
@@ -14074,6 +14087,361 @@ async function monsterEditorApiRequest(method = "GET", body = null) {
   return data;
 }
 
+function itemAuthorityEnabledForState(state) {
+  if (!isAuthenticatedUser) return false;
+  if (!state || typeof state !== "object") return false;
+  const profile = ensureCharacterState(state);
+  const characterId = normalizeCharacterProfileId(profile?.id ?? "");
+  return !!characterId;
+}
+
+function itemAuthorityCharacterIdForState(state) {
+  const profile = ensureCharacterState(state);
+  return normalizeCharacterProfileId(profile?.id ?? "");
+}
+
+function resetItemAuthorityRuntime(characterId = "") {
+  itemAuthorityRuntime.ready = false;
+  itemAuthorityRuntime.loading = false;
+  itemAuthorityRuntime.processing = false;
+  itemAuthorityRuntime.characterId = characterId || "";
+  itemAuthorityRuntime.revision = 0;
+  itemAuthorityRuntime.queue = [];
+  itemAuthorityRuntime.baselineAt = 0;
+  itemAuthorityRuntime.lastSnapshotMap = null;
+  itemAuthorityRuntime.lastError = "";
+}
+
+function itemAuthorityRecordSignature(rec) {
+  if (!rec || typeof rec !== "object") return "";
+  return [
+    String(rec.instance_id ?? ""),
+    String(rec.type ?? ""),
+    String(rec.template_id ?? ""),
+    Math.max(1, Math.floor(Number(rec.amount ?? 1) || 1)),
+    String(rec.owner_type ?? ""),
+    String(rec.owner_id ?? ""),
+    String(rec.slot ?? ""),
+    Number.isFinite(rec.x) ? Math.floor(rec.x) : "",
+    Number.isFinite(rec.y) ? Math.floor(rec.y) : "",
+    Number.isFinite(rec.z) ? Math.floor(rec.z) : "",
+  ].join("|");
+}
+
+function buildItemAuthoritySnapshotMap(state) {
+  const out = new Map();
+  if (!state || typeof state !== "object") return out;
+  const character = ensureCharacterState(state);
+  const ownerId = normalizeCharacterProfileId(character?.id ?? "");
+  const addRecord = (recRaw) => {
+    if (!recRaw || typeof recRaw !== "object") return;
+    const instanceId = String(recRaw.instance_id ?? "").trim();
+    const type = String(recRaw.type ?? "").trim();
+    if (!instanceId || !type) return;
+    const ownerType = String(recRaw.owner_type ?? "").trim().toLowerCase();
+    if (!ownerType) return;
+    const rec = {
+      instance_id: instanceId,
+      type,
+      template_id: String(recRaw.template_id ?? "").trim(),
+      amount: Math.max(1, Math.floor(Number(recRaw.amount ?? 1) || 1)),
+      owner_type: ownerType,
+      owner_id: String(recRaw.owner_id ?? "").trim(),
+      slot: String(recRaw.slot ?? "").trim().toLowerCase(),
+      x: Number.isFinite(recRaw.x) ? Math.floor(Number(recRaw.x)) : null,
+      y: Number.isFinite(recRaw.y) ? Math.floor(Number(recRaw.y)) : null,
+      z: Number.isFinite(recRaw.z) ? Math.floor(Number(recRaw.z)) : null,
+      updated_at: String(recRaw.updated_at ?? "").trim() || new Date().toISOString(),
+    };
+    const prev = out.get(instanceId);
+    if (prev && prev.owner_type === rec.owner_type && prev.type === rec.type && isStackable(rec.type)) {
+      prev.amount = Math.max(1, Math.floor(Number(prev.amount ?? 1) || 1) + rec.amount);
+      prev.updated_at = rec.updated_at;
+      out.set(instanceId, prev);
+      return;
+    }
+    out.set(instanceId, rec);
+  };
+
+  const inv = Array.isArray(state.inv) ? state.inv : [];
+  for (let i = 0; i < inv.length; i++) {
+    const it = inv[i];
+    if (!it || typeof it !== "object") continue;
+    const type = normalizeItemType(it.type, {
+      speciesId: character?.speciesId,
+      classId: character?.classId,
+    });
+    if (!type || !ITEM_TYPES[type]) continue;
+    const templateId = itemTemplateIdForType(it.templateId ?? type) ?? itemTemplateIdForType(type) ?? type;
+    const amount = Math.max(1, Math.floor(Number(it.amount ?? 1) || 1));
+    const instanceId = isStackable(type)
+      ? `stack_inv_${type}`
+      : String(it.instanceId ?? "").trim() || `legacy_inv_${i}_${type}`;
+    addRecord({
+      instance_id: instanceId,
+      type,
+      template_id: templateId,
+      amount,
+      owner_type: "player",
+      owner_id: ownerId,
+      slot: "",
+      updated_at: it.updatedAt ?? it.createdAt ?? "",
+    });
+  }
+
+  const equip = state?.player?.equip ?? {};
+  for (const slot of ["weapon", "head", "chest", "legs"]) {
+    const type = normalizeItemType(equip?.[slot], {
+      speciesId: character?.speciesId,
+      classId: character?.classId,
+    });
+    if (!type || !ITEM_TYPES[type]) continue;
+    const templateId = itemTemplateIdForType(type) ?? type;
+    addRecord({
+      instance_id: `equip_${slot}_${type}`,
+      type,
+      template_id: templateId,
+      amount: 1,
+      owner_type: "equip",
+      owner_id: ownerId,
+      slot,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  const dynamicEntries = state?.dynamic instanceof Map
+    ? Array.from(state.dynamic.values())
+    : [];
+  for (const ent of dynamicEntries) {
+    if (!ent || ent.kind !== "item") continue;
+    const type = normalizeItemType(ent.type);
+    if (!type || !ITEM_TYPES[type]) continue;
+    if (type === "shopkeeper" || type === "shrine") continue;
+    const templateId = itemTemplateIdForType(ent.templateId ?? type) ?? itemTemplateIdForType(type) ?? type;
+    const instanceId = String(ent.instanceId ?? "").trim() || String(ent.id ?? "").trim();
+    if (!instanceId) continue;
+    addRecord({
+      instance_id: instanceId,
+      type,
+      template_id: templateId,
+      amount: Math.max(1, Math.floor(Number(ent.amount ?? 1) || 1)),
+      owner_type: String(ent.ownerType ?? "world").trim().toLowerCase() || "world",
+      owner_id: ent.ownerId === null || ent.ownerId === undefined ? "" : String(ent.ownerId),
+      slot: "",
+      x: Number(ent.x),
+      y: Number(ent.y),
+      z: Number(ent.z),
+      updated_at: ent.updatedAt ?? ent.createdAt ?? "",
+    });
+  }
+
+  return out;
+}
+
+function diffItemAuthoritySnapshotMaps(beforeMap, afterMap) {
+  const before = beforeMap instanceof Map ? beforeMap : new Map();
+  const after = afterMap instanceof Map ? afterMap : new Map();
+  const remove = [];
+  const upsert = [];
+  let hasMint = false;
+
+  for (const [instanceId] of before.entries()) {
+    if (after.has(instanceId)) continue;
+    remove.push(instanceId);
+  }
+  for (const [instanceId, rec] of after.entries()) {
+    const prev = before.get(instanceId);
+    if (!prev) {
+      hasMint = true;
+      upsert.push(rec);
+      continue;
+    }
+    if (itemAuthorityRecordSignature(prev) !== itemAuthorityRecordSignature(rec)) upsert.push(rec);
+  }
+  return {
+    remove,
+    upsert,
+    hasChanges: remove.length > 0 || upsert.length > 0,
+    hasMint,
+  };
+}
+
+async function ensureItemAuthoritySession(state) {
+  if (!itemAuthorityEnabledForState(state)) return false;
+  const characterId = itemAuthorityCharacterIdForState(state);
+  if (!characterId) return false;
+  if (itemAuthorityRuntime.characterId && itemAuthorityRuntime.characterId !== characterId) {
+    resetItemAuthorityRuntime(characterId);
+  } else if (!itemAuthorityRuntime.characterId) {
+    itemAuthorityRuntime.characterId = characterId;
+  }
+  if (itemAuthorityRuntime.ready && itemAuthorityRuntime.characterId === characterId) return true;
+  if (itemAuthorityRuntime.loading) return false;
+
+  itemAuthorityRuntime.loading = true;
+  try {
+    let currentRevision = 0;
+    try {
+      const data = await saveApiRequest("GET", null, `item_character=${encodeURIComponent(characterId)}`);
+      currentRevision = Math.max(0, Math.floor(Number(data?.item_state?.revision ?? 0) || 0));
+    } catch (err) {
+      const statusCode = Number(err?.response?.status_code ?? 0);
+      const errorText = String(err?.message ?? err?.response?.error ?? "");
+      const looksMissing = statusCode === 404 || /not found/i.test(errorText);
+      if (!looksMissing) throw err;
+      currentRevision = 0;
+    }
+
+    const localSnapshot = buildItemAuthoritySnapshotMap(state);
+    const items = Array.from(localSnapshot.values()).sort((a, b) => String(a.instance_id).localeCompare(String(b.instance_id)));
+    const profile = ensureCharacterState(state);
+    const replace = await saveApiRequest("POST", {
+      action: "item_state_replace",
+      character_id: characterId,
+      name: profile?.name ?? "Adventurer",
+      expected_revision: currentRevision,
+      items,
+    });
+    itemAuthorityRuntime.characterId = characterId;
+    itemAuthorityRuntime.revision = Math.max(0, Math.floor(Number(replace?.item_state?.revision ?? (currentRevision + 1)) || (currentRevision + 1)));
+    itemAuthorityRuntime.baselineAt = Date.now();
+    itemAuthorityRuntime.lastSnapshotMap = localSnapshot;
+    itemAuthorityRuntime.lastSyncAt = itemAuthorityRuntime.baselineAt;
+    itemAuthorityRuntime.ready = true;
+    itemAuthorityRuntime.lastError = "";
+    return true;
+  } catch (err) {
+    itemAuthorityRuntime.lastError = String(err?.message ?? "item-authority-bootstrap-failed");
+    return false;
+  } finally {
+    itemAuthorityRuntime.loading = false;
+  }
+}
+
+async function processItemAuthorityMutationQueue(state) {
+  if (!itemAuthorityEnabledForState(state)) return;
+  if (itemAuthorityRuntime.processing) return;
+  itemAuthorityRuntime.processing = true;
+  try {
+    while (itemAuthorityRuntime.queue.length > 0) {
+      const job = itemAuthorityRuntime.queue[0];
+      if (!job || typeof job !== "object") {
+        itemAuthorityRuntime.queue.shift();
+        continue;
+      }
+      if (Number.isFinite(itemAuthorityRuntime.baselineAt) && (Number(job.createdAt ?? 0) || 0) <= itemAuthorityRuntime.baselineAt) {
+        itemAuthorityRuntime.queue.shift();
+        continue;
+      }
+      const ready = await ensureItemAuthoritySession(state);
+      if (!ready) break;
+      if (job.characterId !== itemAuthorityRuntime.characterId) {
+        itemAuthorityRuntime.queue.shift();
+        continue;
+      }
+      try {
+        const data = await saveApiRequest("POST", {
+          action: "item_mutate",
+          character_id: job.characterId,
+          expected_revision: itemAuthorityRuntime.revision,
+          mutation: {
+            op: job.op || "state_sync",
+            remove: job.remove ?? [],
+            upsert: job.upsert ?? [],
+          },
+        });
+        itemAuthorityRuntime.revision = Math.max(
+          itemAuthorityRuntime.revision + 1,
+          Math.floor(Number(data?.item_state?.revision ?? (itemAuthorityRuntime.revision + 1)) || (itemAuthorityRuntime.revision + 1))
+        );
+        itemAuthorityRuntime.lastSnapshotMap = job.afterMap instanceof Map ? job.afterMap : buildItemAuthoritySnapshotMap(state);
+        itemAuthorityRuntime.lastSyncAt = Date.now();
+        itemAuthorityRuntime.lastError = "";
+        itemAuthorityRuntime.queue.shift();
+      } catch (err) {
+        const code = String(err?.response?.code ?? "");
+        const curRev = Number(err?.response?.current_revision ?? NaN);
+        if (code === "ITEM_STATE_REVISION_CONFLICT" && Number.isFinite(curRev)) {
+          itemAuthorityRuntime.ready = false;
+          itemAuthorityRuntime.revision = Math.max(0, Math.floor(curRev));
+          continue;
+        }
+        itemAuthorityRuntime.lastError = String(err?.message ?? "item-mutation-failed");
+        pushLog(state, `Item authority sync failed: ${itemAuthorityRuntime.lastError}`);
+        break;
+      }
+    }
+  } finally {
+    itemAuthorityRuntime.processing = false;
+  }
+}
+
+function queueItemAuthorityMutationFromDiff(state, op, beforeMap, afterMap) {
+  if (!itemAuthorityEnabledForState(state)) return;
+  const characterId = itemAuthorityCharacterIdForState(state);
+  if (!characterId) return;
+  if (itemAuthorityRuntime.characterId && itemAuthorityRuntime.characterId !== characterId) {
+    resetItemAuthorityRuntime(characterId);
+  } else if (!itemAuthorityRuntime.characterId) {
+    itemAuthorityRuntime.characterId = characterId;
+  }
+  const diff = diffItemAuthoritySnapshotMaps(beforeMap, afterMap);
+  if (!diff.hasChanges) return;
+  const requestedOp = String(op || "state_sync");
+  const mintCapableOps = new Set(["system_spawn", "inventory_add", "item_state_replace", "resync"]);
+  const resolvedOp = diff.hasMint && !mintCapableOps.has(requestedOp)
+    ? "inventory_add"
+    : requestedOp;
+  itemAuthorityRuntime.queue.push({
+    characterId,
+    op: resolvedOp,
+    remove: diff.remove,
+    upsert: diff.upsert,
+    afterMap,
+    createdAt: Date.now(),
+  });
+  void processItemAuthorityMutationQueue(state);
+}
+
+function recordItemAuthorityMutation(state, op, mutator) {
+  if (!itemAuthorityEnabledForState(state) || typeof mutator !== "function") return mutator();
+  const beforeMap = buildItemAuthoritySnapshotMap(state);
+  const out = mutator();
+  const afterMap = buildItemAuthoritySnapshotMap(state);
+  queueItemAuthorityMutationFromDiff(state, op, beforeMap, afterMap);
+  return out;
+}
+
+function itemAuthorityOpForReason(reason = "") {
+  const tag = String(reason ?? "").trim().toLowerCase();
+  if (!tag) return "state_sync";
+  if (tag.includes("equip")) return "equip";
+  if (tag.includes("drop")) return "drop";
+  if (tag.includes("shop")) return "shop";
+  if (tag.includes("use-potion")) return "consume";
+  if (tag.includes("pickup")) return "pickup";
+  if (tag.includes("turn")) return "state_sync";
+  return "state_sync";
+}
+
+function syncItemAuthorityFromStateIfChanged(state, reason = "") {
+  if (!itemAuthorityEnabledForState(state)) return;
+  const characterId = itemAuthorityCharacterIdForState(state);
+  if (itemAuthorityRuntime.characterId && itemAuthorityRuntime.characterId !== characterId) {
+    resetItemAuthorityRuntime(characterId);
+  } else if (!itemAuthorityRuntime.characterId) {
+    itemAuthorityRuntime.characterId = characterId;
+  }
+  const nextMap = buildItemAuthoritySnapshotMap(state);
+  const prevMap = itemAuthorityRuntime.lastSnapshotMap;
+  if (!(prevMap instanceof Map)) {
+    itemAuthorityRuntime.lastSnapshotMap = nextMap;
+    void ensureItemAuthoritySession(state);
+    return;
+  }
+  queueItemAuthorityMutationFromDiff(state, itemAuthorityOpForReason(reason), prevMap, nextMap);
+}
+
 async function refreshMonsterEditorFromServer(quiet = false) {
   if (!canUseAdminControls()) return false;
   setMonsterEditorLoading(true);
@@ -16309,6 +16677,7 @@ function saveNow(state) {
   const payload = exportSave(state);
   try { localStorage.setItem(SAVE_KEY, payload); } catch {}
   clearSaveDirty();
+  syncItemAuthorityFromStateIfChanged(state, "save-now");
 }
 
 function saveResumeSnapshot(state) {

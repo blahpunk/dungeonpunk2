@@ -32,6 +32,8 @@ const MAX_SERVER_SAVES = 5;
 const SAVE_NAME_MAX_LEN = 48;
 const SAVE_PAYLOAD_MAX_LEN = 2000000;
 const CHARACTER_STATE_PAYLOAD_MAX_LEN = 350000;
+const ITEM_AUTH_MAX_ITEMS_PER_CHARACTER = 60000;
+const ITEM_AUTH_MUTATION_MAX_DELTA = 6000;
 const SPRITE_UPLOAD_MAX_BYTES = 100000000;
 const MONSTER_EDITOR_PAYLOAD_MAX_BYTES = 1200000;
 const LOCAL_AUTH_COOKIE = 'bp_auth_user';
@@ -1201,6 +1203,11 @@ function user_character_state_file_path(string $email): string
   return save_storage_root() . DIRECTORY_SEPARATOR . safe_file_token($email) . '.characters.json';
 }
 
+function user_item_authority_file_path(string $email): string
+{
+  return save_storage_root() . DIRECTORY_SEPARATOR . safe_file_token($email) . '.items.json';
+}
+
 /**
  * @return array<int, string>
  */
@@ -1223,6 +1230,22 @@ function user_save_file_path_candidates(string $email): array
 function user_character_state_file_path_candidates(string $email): array
 {
   $token = safe_file_token($email) . '.characters.json';
+  $paths = [];
+  foreach (save_storage_root_candidates() as $root) {
+    $candidate = $root . DIRECTORY_SEPARATOR . $token;
+    if (!in_array($candidate, $paths, true)) {
+      $paths[] = $candidate;
+    }
+  }
+  return $paths;
+}
+
+/**
+ * @return array<int, string>
+ */
+function user_item_authority_file_path_candidates(string $email): array
+{
+  $token = safe_file_token($email) . '.items.json';
   $paths = [];
   foreach (save_storage_root_candidates() as $root) {
     $candidate = $root . DIRECTORY_SEPARATOR . $token;
@@ -1795,6 +1818,446 @@ function character_states_public_meta(array $entriesById): array
   return $out;
 }
 
+function normalize_item_authority_instance_id(string $value): string
+{
+  $id = trim($value);
+  if ($id === '' || !preg_match('/^[A-Za-z0-9:_|.-]{3,120}$/', $id)) {
+    return '';
+  }
+  return $id;
+}
+
+function normalize_item_authority_type_id(string $value): string
+{
+  $id = trim($value);
+  if ($id === '' || !preg_match('/^[a-z0-9_]{1,120}$/', $id)) {
+    return '';
+  }
+  return $id;
+}
+
+function normalize_item_authority_owner_type(string $value): string
+{
+  $type = strtolower(trim($value));
+  $allowed = ['world', 'player', 'equip', 'merchant', 'chest', 'corpse'];
+  if (!in_array($type, $allowed, true)) {
+    return '';
+  }
+  return $type;
+}
+
+function normalize_item_authority_slot(string $value): string
+{
+  $slot = strtolower(trim($value));
+  if ($slot === '') {
+    return '';
+  }
+  $allowed = ['weapon', 'head', 'chest', 'legs'];
+  if (!in_array($slot, $allowed, true)) {
+    return '';
+  }
+  return $slot;
+}
+
+/**
+ * @return array{
+ *   instance_id: string,
+ *   type: string,
+ *   template_id: string,
+ *   amount: int,
+ *   owner_type: string,
+ *   owner_id: string,
+ *   slot: string,
+ *   x: int|null,
+ *   y: int|null,
+ *   z: int|null,
+ *   updated_at: string
+ * }|null
+ */
+function normalize_item_authority_item_entry(array $entry): ?array
+{
+  $instanceId = normalize_item_authority_instance_id((string) ($entry['instance_id'] ?? ''));
+  $type = normalize_item_authority_type_id((string) ($entry['type'] ?? ''));
+  if ($instanceId === '' || $type === '') {
+    return null;
+  }
+
+  $templateId = normalize_item_authority_type_id((string) ($entry['template_id'] ?? ''));
+  $amount = max(1, min(999999, (int) ($entry['amount'] ?? 1)));
+  $ownerType = normalize_item_authority_owner_type((string) ($entry['owner_type'] ?? ''));
+  if ($ownerType === '') {
+    return null;
+  }
+  $ownerIdRaw = trim((string) ($entry['owner_id'] ?? ''));
+  $ownerId = function_exists('mb_substr')
+    ? mb_substr($ownerIdRaw, 0, 120)
+    : substr($ownerIdRaw, 0, 120);
+  $slot = normalize_item_authority_slot((string) ($entry['slot'] ?? ''));
+  $x = array_key_exists('x', $entry) ? (int) $entry['x'] : null;
+  $y = array_key_exists('y', $entry) ? (int) $entry['y'] : null;
+  $z = array_key_exists('z', $entry) ? (int) $entry['z'] : null;
+  if ($x !== null) {
+    $x = max(-2000000, min(2000000, $x));
+  }
+  if ($y !== null) {
+    $y = max(-2000000, min(2000000, $y));
+  }
+  if ($z !== null) {
+    $z = max(-2000000, min(2000000, $z));
+  }
+  $updatedAt = trim((string) ($entry['updated_at'] ?? ''));
+  if ($updatedAt === '') {
+    $updatedAt = date('c');
+  }
+
+  return [
+    'instance_id' => $instanceId,
+    'type' => $type,
+    'template_id' => $templateId,
+    'amount' => $amount,
+    'owner_type' => $ownerType,
+    'owner_id' => $ownerId,
+    'slot' => $slot,
+    'x' => $x,
+    'y' => $y,
+    'z' => $z,
+    'updated_at' => $updatedAt,
+  ];
+}
+
+/**
+ * @param array<string, array{
+ *   instance_id: string,
+ *   type: string,
+ *   template_id: string,
+ *   amount: int,
+ *   owner_type: string,
+ *   owner_id: string,
+ *   slot: string,
+ *   x: int|null,
+ *   y: int|null,
+ *   z: int|null,
+ *   updated_at: string
+ * }> $itemsById
+ * @return array<int, array{
+ *   instance_id: string,
+ *   type: string,
+ *   template_id: string,
+ *   amount: int,
+ *   owner_type: string,
+ *   owner_id: string,
+ *   slot: string,
+ *   x: int|null,
+ *   y: int|null,
+ *   z: int|null,
+ *   updated_at: string
+ * }>
+ */
+function canonicalize_item_authority_items(array $itemsById): array
+{
+  ksort($itemsById, SORT_STRING);
+  return array_values($itemsById);
+}
+
+/**
+ * @param array{
+ *   id: string,
+ *   name: string,
+ *   revision: int,
+ *   updated_at: string,
+ *   items: array<int, array{
+ *     instance_id: string,
+ *     type: string,
+ *     template_id: string,
+ *     amount: int,
+ *     owner_type: string,
+ *     owner_id: string,
+ *     slot: string,
+ *     x: int|null,
+ *     y: int|null,
+ *     z: int|null,
+ *     updated_at: string
+ *   }>
+ * } $entry
+ */
+function item_authority_state_signature(array $entry, string $secret): string
+{
+  $itemsJson = json_encode($entry['items'] ?? [], JSON_UNESCAPED_SLASHES);
+  if (!is_string($itemsJson)) {
+    $itemsJson = '[]';
+  }
+  $parts = [
+    (string) ($entry['id'] ?? ''),
+    (string) ($entry['name'] ?? ''),
+    (string) ($entry['revision'] ?? 0),
+    (string) ($entry['updated_at'] ?? ''),
+    $itemsJson,
+  ];
+  return hash_hmac('sha256', implode('|', $parts), $secret);
+}
+
+/**
+ * @return array{
+ *   id: string,
+ *   name: string,
+ *   revision: int,
+ *   updated_at: string,
+ *   items: array<int, array{
+ *     instance_id: string,
+ *     type: string,
+ *     template_id: string,
+ *     amount: int,
+ *     owner_type: string,
+ *     owner_id: string,
+ *     slot: string,
+ *     x: int|null,
+ *     y: int|null,
+ *     z: int|null,
+ *     updated_at: string
+ *   }>,
+ *   sig: string
+ * }|null
+ */
+function normalize_item_authority_state_entry(array $entry, string $secret): ?array
+{
+  $id = normalize_character_profile_id((string) ($entry['id'] ?? ''));
+  if ($id === '') {
+    return null;
+  }
+  $name = trim_save_name((string) ($entry['name'] ?? ''));
+  if ($name === '') {
+    $name = 'Adventurer';
+  }
+  $revision = max(0, min(1000000000, (int) ($entry['revision'] ?? 0)));
+  $updatedAt = trim((string) ($entry['updated_at'] ?? ''));
+  if ($updatedAt === '') {
+    $updatedAt = date('c');
+  }
+  $itemsRaw = $entry['items'] ?? [];
+  if (!is_array($itemsRaw)) {
+    return null;
+  }
+  $itemsById = [];
+  foreach ($itemsRaw as $itemRaw) {
+    if (!is_array($itemRaw)) {
+      continue;
+    }
+    $item = normalize_item_authority_item_entry($itemRaw);
+    if ($item === null) {
+      continue;
+    }
+    $itemsById[(string) $item['instance_id']] = $item;
+  }
+  if (count($itemsById) > ITEM_AUTH_MAX_ITEMS_PER_CHARACTER) {
+    return null;
+  }
+  $items = canonicalize_item_authority_items($itemsById);
+
+  $normalized = [
+    'id' => $id,
+    'name' => $name,
+    'revision' => $revision,
+    'updated_at' => $updatedAt,
+    'items' => $items,
+    'sig' => '',
+  ];
+  $providedSig = trim((string) ($entry['sig'] ?? ''));
+  if ($secret !== '') {
+    $expected = item_authority_state_signature($normalized, $secret);
+    if ($providedSig === '' || !hash_equals($expected, $providedSig)) {
+      return null;
+    }
+    $normalized['sig'] = $expected;
+  } else {
+    $normalized['sig'] = hash('sha256', implode('|', [$id, (string) $revision, $updatedAt]));
+  }
+  return $normalized;
+}
+
+/**
+ * @return array<string, array{
+ *   id: string,
+ *   name: string,
+ *   revision: int,
+ *   updated_at: string,
+ *   items: array<int, array{
+ *     instance_id: string,
+ *     type: string,
+ *     template_id: string,
+ *     amount: int,
+ *     owner_type: string,
+ *     owner_id: string,
+ *     slot: string,
+ *     x: int|null,
+ *     y: int|null,
+ *     z: int|null,
+ *     updated_at: string
+ *   }>,
+ *   sig: string
+ * }>
+ */
+function load_user_item_authority_states(string $email, string $secret): array
+{
+  $file = null;
+  $bestMtime = -1;
+  foreach (user_item_authority_file_path_candidates($email) as $candidate) {
+    if (!is_file($candidate)) {
+      continue;
+    }
+    $mtime = (int) (@filemtime($candidate) ?: 0);
+    if ($file === null || $mtime > $bestMtime) {
+      $file = $candidate;
+      $bestMtime = $mtime;
+    }
+  }
+  if ($file === null) {
+    return [];
+  }
+  $raw = file_get_contents($file);
+  if (!is_string($raw) || trim($raw) === '') {
+    return [];
+  }
+  $decoded = json_decode($raw, true);
+  if (!is_array($decoded)) {
+    return [];
+  }
+  $statesRaw = $decoded['characters'] ?? [];
+  if (!is_array($statesRaw)) {
+    return [];
+  }
+  $out = [];
+  foreach ($statesRaw as $stateRaw) {
+    if (!is_array($stateRaw)) {
+      continue;
+    }
+    $state = normalize_item_authority_state_entry($stateRaw, $secret);
+    if ($state === null) {
+      continue;
+    }
+    $out[(string) $state['id']] = $state;
+  }
+  return $out;
+}
+
+/**
+ * @param array<string, array{
+ *   id: string,
+ *   name: string,
+ *   revision: int,
+ *   updated_at: string,
+ *   items: array<int, array{
+ *     instance_id: string,
+ *     type: string,
+ *     template_id: string,
+ *     amount: int,
+ *     owner_type: string,
+ *     owner_id: string,
+ *     slot: string,
+ *     x: int|null,
+ *     y: int|null,
+ *     z: int|null,
+ *     updated_at: string
+ *   }>,
+ *   sig: string
+ * }> $statesById
+ */
+function persist_user_item_authority_states(string $email, array $statesById, string $secret): bool
+{
+  if (!ensure_save_storage_root()) {
+    return false;
+  }
+  $states = array_values($statesById);
+  usort(
+    $states,
+    static function (array $a, array $b): int {
+      return strcmp((string) ($b['updated_at'] ?? ''), (string) ($a['updated_at'] ?? ''));
+    }
+  );
+  $normalizedStates = [];
+  foreach ($states as $state) {
+    $next = $state;
+    $itemsById = [];
+    foreach (($next['items'] ?? []) as $item) {
+      if (!is_array($item)) {
+        continue;
+      }
+      $normItem = normalize_item_authority_item_entry($item);
+      if ($normItem === null) {
+        continue;
+      }
+      $itemsById[(string) $normItem['instance_id']] = $normItem;
+    }
+    if (count($itemsById) > ITEM_AUTH_MAX_ITEMS_PER_CHARACTER) {
+      continue;
+    }
+    $next['items'] = canonicalize_item_authority_items($itemsById);
+    if ($secret !== '') {
+      $next['sig'] = item_authority_state_signature($next, $secret);
+    } else {
+      $next['sig'] = hash('sha256', implode('|', [$next['id'], (string) ($next['revision'] ?? 0), $next['updated_at']]));
+    }
+    $normalizedStates[] = $next;
+  }
+  $payload = [
+    'version' => 1,
+    'characters' => $normalizedStates,
+  ];
+  $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+  if (!is_string($json)) {
+    return false;
+  }
+  $file = user_item_authority_file_path($email);
+  $written = file_put_contents($file, $json . PHP_EOL, LOCK_EX) !== false;
+  if ($written) {
+    @chmod($file, 0600);
+  }
+  return $written;
+}
+
+/**
+ * @param array<string, array{
+ *   id: string,
+ *   name: string,
+ *   revision: int,
+ *   updated_at: string,
+ *   items: array<int, array{
+ *     instance_id: string,
+ *     type: string,
+ *     template_id: string,
+ *     amount: int,
+ *     owner_type: string,
+ *     owner_id: string,
+ *     slot: string,
+ *     x: int|null,
+ *     y: int|null,
+ *     z: int|null,
+ *     updated_at: string
+ *   }>,
+ *   sig: string
+ * }> $statesById
+ * @return array<int, array{id: string, name: string, revision: int, item_count: int, updated_at: string}>
+ */
+function item_authority_states_public_meta(array $statesById): array
+{
+  $out = [];
+  foreach ($statesById as $entry) {
+    $out[] = [
+      'id' => (string) ($entry['id'] ?? ''),
+      'name' => (string) ($entry['name'] ?? 'Adventurer'),
+      'revision' => (int) ($entry['revision'] ?? 0),
+      'item_count' => is_array($entry['items'] ?? null) ? count($entry['items']) : 0,
+      'updated_at' => (string) ($entry['updated_at'] ?? ''),
+    ];
+  }
+  usort(
+    $out,
+    static function (array $a, array $b): int {
+      return strcmp((string) ($b['updated_at'] ?? ''), (string) ($a['updated_at'] ?? ''));
+    }
+  );
+  return $out;
+}
+
 $currentUrl = current_request_url();
 $currentBaseUrl = current_request_base_url();
 $pageVersion = app_asset_version(__FILE__) . '-' . app_asset_version(__DIR__ . DIRECTORY_SEPARATOR . 'game.js');
@@ -2159,8 +2622,26 @@ if ($apiMode === 'savegames') {
 
   $entries = load_user_saves($userEmail, $saveSecret);
   $characterStates = load_user_character_states($userEmail, $saveSecret);
+  $itemAuthorityStates = load_user_item_authority_states($userEmail, $saveSecret);
 
   if ($method === 'GET') {
+    $itemCharacterIdQuery = normalize_character_profile_id((string) ($_GET['item_character'] ?? ''));
+    if ($itemCharacterIdQuery !== '') {
+      $itemState = $itemAuthorityStates[$itemCharacterIdQuery] ?? null;
+      if (!is_array($itemState)) {
+        json_response(['ok' => false, 'error' => 'Item state not found.'], 404);
+      }
+      json_response([
+        'ok' => true,
+        'item_state' => [
+          'id' => (string) $itemState['id'],
+          'name' => (string) ($itemState['name'] ?? 'Adventurer'),
+          'revision' => (int) ($itemState['revision'] ?? 0),
+          'updated_at' => (string) ($itemState['updated_at'] ?? ''),
+          'items' => $itemState['items'] ?? [],
+        ],
+      ]);
+    }
     $characterIdQuery = normalize_character_profile_id((string) ($_GET['character'] ?? ''));
     if ($characterIdQuery !== '') {
       $characterEntry = $characterStates[$characterIdQuery] ?? null;
@@ -2211,6 +2692,7 @@ if ($apiMode === 'savegames') {
       'name_max_len' => SAVE_NAME_MAX_LEN,
       'characters' => character_entries_public_meta($entries),
       'character_states' => character_states_public_meta($characterStates),
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
       'saves' => save_entries_public_meta($entries),
     ]);
   }
@@ -2265,6 +2747,7 @@ if ($apiMode === 'savegames') {
         'updated_at' => $updatedAt,
       ],
       'character_states' => character_states_public_meta($characterStates),
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
     ]);
   }
   if ($action === 'character_delete') {
@@ -2276,8 +2759,14 @@ if ($apiMode === 'savegames') {
       json_response(['ok' => false, 'error' => 'Character not found.'], 404);
     }
     unset($characterStates[$characterId]);
+    if (isset($itemAuthorityStates[$characterId])) {
+      unset($itemAuthorityStates[$characterId]);
+    }
     if (!persist_user_character_states($userEmail, $characterStates, $saveSecret)) {
       json_response(['ok' => false, 'error' => 'Could not persist character state deletion.'], 500);
+    }
+    if (!persist_user_item_authority_states($userEmail, $itemAuthorityStates, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist character item state deletion.'], 500);
     }
     json_response([
       'ok' => true,
@@ -2286,7 +2775,237 @@ if ($apiMode === 'savegames') {
       'name_max_len' => SAVE_NAME_MAX_LEN,
       'characters' => character_entries_public_meta($entries),
       'character_states' => character_states_public_meta($characterStates),
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
       'saves' => save_entries_public_meta($entries),
+    ]);
+  }
+  if ($action === 'item_state_replace') {
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    if ($characterId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character id.'], 400);
+    }
+    $characterName = trim_save_name((string) ($body['name'] ?? ''));
+    if ($characterName === '') {
+      $characterName = (string) ($itemAuthorityStates[$characterId]['name'] ?? 'Adventurer');
+      if ($characterName === '') {
+        $characterName = 'Adventurer';
+      }
+    }
+    $itemsRaw = $body['items'] ?? null;
+    if (!is_array($itemsRaw)) {
+      json_response(['ok' => false, 'error' => 'Invalid item state payload.'], 400);
+    }
+    $expectedRevision = (int) ($body['expected_revision'] ?? 0);
+    $expectedRevision = max(0, min(1000000000, $expectedRevision));
+
+    $current = $itemAuthorityStates[$characterId] ?? [
+      'id' => $characterId,
+      'name' => $characterName,
+      'revision' => 0,
+      'updated_at' => '',
+      'items' => [],
+      'sig' => '',
+    ];
+    $currentRevision = max(0, (int) ($current['revision'] ?? 0));
+    if ($expectedRevision !== $currentRevision) {
+      json_response([
+        'ok' => false,
+        'error' => 'Item state revision conflict.',
+        'code' => 'ITEM_STATE_REVISION_CONFLICT',
+        'current_revision' => $currentRevision,
+      ], 409);
+    }
+
+    $itemsById = [];
+    foreach ($itemsRaw as $itemRaw) {
+      if (!is_array($itemRaw)) {
+        continue;
+      }
+      $item = normalize_item_authority_item_entry($itemRaw);
+      if ($item === null) {
+        continue;
+      }
+      $itemsById[(string) $item['instance_id']] = $item;
+    }
+    if (count($itemsById) > ITEM_AUTH_MAX_ITEMS_PER_CHARACTER) {
+      json_response(['ok' => false, 'error' => 'Item state is too large.'], 413);
+    }
+    $nowIso = date('c');
+    $next = [
+      'id' => $characterId,
+      'name' => $characterName,
+      'revision' => $currentRevision + 1,
+      'updated_at' => $nowIso,
+      'items' => canonicalize_item_authority_items($itemsById),
+      'sig' => '',
+    ];
+    $itemAuthorityStates[$characterId] = $next;
+    if (!persist_user_item_authority_states($userEmail, $itemAuthorityStates, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist item state.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'item_state' => [
+        'id' => $characterId,
+        'name' => $characterName,
+        'revision' => $next['revision'],
+        'item_count' => count($next['items']),
+        'updated_at' => $nowIso,
+      ],
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
+    ]);
+  }
+  if ($action === 'item_mutate') {
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    if ($characterId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character id.'], 400);
+    }
+    $expectedRevision = (int) ($body['expected_revision'] ?? -1);
+    if ($expectedRevision < 0) {
+      json_response(['ok' => false, 'error' => 'Missing expected revision.'], 400);
+    }
+    $mutation = $body['mutation'] ?? null;
+    if (!is_array($mutation)) {
+      json_response(['ok' => false, 'error' => 'Missing mutation payload.'], 400);
+    }
+    $op = strtolower(trim((string) ($mutation['op'] ?? 'sync')));
+    if ($op === '') {
+      $op = 'sync';
+    }
+    $removeRaw = $mutation['remove'] ?? [];
+    $upsertRaw = $mutation['upsert'] ?? [];
+    if (!is_array($removeRaw) || !is_array($upsertRaw)) {
+      json_response(['ok' => false, 'error' => 'Invalid mutation shape.'], 400);
+    }
+    if ((count($removeRaw) + count($upsertRaw)) > ITEM_AUTH_MUTATION_MAX_DELTA) {
+      json_response(['ok' => false, 'error' => 'Mutation delta too large.'], 413);
+    }
+    $current = $itemAuthorityStates[$characterId] ?? [
+      'id' => $characterId,
+      'name' => 'Adventurer',
+      'revision' => 0,
+      'updated_at' => '',
+      'items' => [],
+      'sig' => '',
+    ];
+    $currentRevision = max(0, (int) ($current['revision'] ?? 0));
+    if ($expectedRevision !== $currentRevision) {
+      json_response([
+        'ok' => false,
+        'error' => 'Item state revision conflict.',
+        'code' => 'ITEM_STATE_REVISION_CONFLICT',
+        'current_revision' => $currentRevision,
+      ], 409);
+    }
+    $itemsById = [];
+    foreach (($current['items'] ?? []) as $item) {
+      if (!is_array($item)) {
+        continue;
+      }
+      $normItem = normalize_item_authority_item_entry($item);
+      if ($normItem === null) {
+        continue;
+      }
+      $itemsById[(string) $normItem['instance_id']] = $normItem;
+    }
+
+    $removeIds = [];
+    foreach ($removeRaw as $rawId) {
+      $instanceId = normalize_item_authority_instance_id((string) $rawId);
+      if ($instanceId === '') {
+        continue;
+      }
+      $removeIds[$instanceId] = true;
+    }
+    foreach (array_keys($removeIds) as $instanceId) {
+      if (!isset($itemsById[$instanceId])) {
+        json_response([
+          'ok' => false,
+          'error' => 'Mutation references missing item.',
+          'code' => 'ITEM_STATE_MISSING_ITEM',
+          'instance_id' => $instanceId,
+          'current_revision' => $currentRevision,
+        ], 409);
+      }
+    }
+
+    $upsertsById = [];
+    foreach ($upsertRaw as $itemRaw) {
+      if (!is_array($itemRaw)) {
+        continue;
+      }
+      $item = normalize_item_authority_item_entry($itemRaw);
+      if ($item === null) {
+        continue;
+      }
+      $upsertsById[(string) $item['instance_id']] = $item;
+    }
+
+    $mintAllowedOps = [
+      'system_spawn',
+      'inventory_add',
+      'item_state_replace',
+      'resync',
+    ];
+    $allowMint = in_array($op, $mintAllowedOps, true);
+    foreach ($upsertsById as $instanceId => $item) {
+      $existing = $itemsById[$instanceId] ?? null;
+      if ($existing === null) {
+        if (!$allowMint) {
+          json_response([
+            'ok' => false,
+            'error' => 'Mutation attempted to create unauthorized item instance.',
+            'code' => 'ITEM_STATE_UNAUTHORIZED_MINT',
+            'instance_id' => $instanceId,
+            'op' => $op,
+            'current_revision' => $currentRevision,
+          ], 409);
+        }
+        continue;
+      }
+      if ((string) ($existing['type'] ?? '') !== (string) ($item['type'] ?? '')) {
+        json_response([
+          'ok' => false,
+          'error' => 'Mutation attempted to change canonical item type.',
+          'code' => 'ITEM_STATE_TYPE_MISMATCH',
+          'instance_id' => $instanceId,
+          'current_revision' => $currentRevision,
+        ], 409);
+      }
+    }
+
+    foreach (array_keys($removeIds) as $instanceId) {
+      unset($itemsById[$instanceId]);
+    }
+    foreach ($upsertsById as $instanceId => $item) {
+      $itemsById[$instanceId] = $item;
+    }
+    if (count($itemsById) > ITEM_AUTH_MAX_ITEMS_PER_CHARACTER) {
+      json_response(['ok' => false, 'error' => 'Mutation exceeds item state size limit.'], 413);
+    }
+
+    $nowIso = date('c');
+    $next = [
+      'id' => $characterId,
+      'name' => (string) ($current['name'] ?? 'Adventurer'),
+      'revision' => $currentRevision + 1,
+      'updated_at' => $nowIso,
+      'items' => canonicalize_item_authority_items($itemsById),
+      'sig' => '',
+    ];
+    $itemAuthorityStates[$characterId] = $next;
+    if (!persist_user_item_authority_states($userEmail, $itemAuthorityStates, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist item mutation.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'item_state' => [
+        'id' => $characterId,
+        'revision' => $next['revision'],
+        'item_count' => count($next['items']),
+        'updated_at' => $nowIso,
+      ],
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
     ]);
   }
   if ($action === 'delete') {
@@ -2317,6 +3036,7 @@ if ($apiMode === 'savegames') {
       'name_max_len' => SAVE_NAME_MAX_LEN,
       'characters' => character_entries_public_meta($nextEntries),
       'character_states' => character_states_public_meta($characterStates),
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
       'saves' => save_entries_public_meta($nextEntries),
     ]);
   }
@@ -2382,6 +3102,7 @@ if ($apiMode === 'savegames') {
         'name_max_len' => SAVE_NAME_MAX_LEN,
         'characters' => character_entries_public_meta($entries),
         'character_states' => character_states_public_meta($characterStates),
+        'item_states' => item_authority_states_public_meta($itemAuthorityStates),
         'saves' => save_entries_public_meta($entries),
       ], 409);
     }
@@ -2432,6 +3153,7 @@ if ($apiMode === 'savegames') {
     'name_max_len' => SAVE_NAME_MAX_LEN,
     'characters' => character_entries_public_meta($entries),
     'character_states' => character_states_public_meta($characterStates),
+    'item_states' => item_authority_states_public_meta($itemAuthorityStates),
     'saves' => save_entries_public_meta($entries),
   ]);
 }
