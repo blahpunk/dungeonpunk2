@@ -5394,15 +5394,24 @@ function refreshSaveNameFromLive(force = false) {
   lastAutoSaveName = liveName;
 }
 
-function requireSaveLogin() {
-  const msg = "Log in with Google to save this current run to your account.";
-  if (game) {
-    try { localStorage.setItem(SAVE_KEY, exportSave(game)); } catch {}
-    pushLog(game, msg);
+function prepareGuestLoginHandoff(state = null) {
+  const run = state ?? game;
+  if (run) {
+    try { localStorage.setItem(SAVE_KEY, exportSave(run)); } catch {}
   }
   try {
     localStorage.setItem(SAVE_LOGIN_HANDOFF_KEY, String(Date.now()));
   } catch {}
+}
+
+function requireSaveLogin() {
+  const msg = "Log in with Google to save this current run to your account.";
+  if (game) {
+    prepareGuestLoginHandoff(game);
+    pushLog(game, msg);
+  } else {
+    prepareGuestLoginHandoff(null);
+  }
   if (authBtnEl?.href) {
     window.location.href = authBtnEl.href;
     return;
@@ -5716,6 +5725,10 @@ async function syncCharacterStateIfDirty(reason = "") {
     const payload = encodeCharacterSnapshotPayload(snapshot);
     if (!payload) return false;
     if (isAuthenticatedUser) {
+      const activeProfileId = normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId());
+      const profileId = normalizeCharacterProfileId(profile.id);
+      // Avoid creating implicit server-side characters before the user chooses/imports one.
+      if (!activeProfileId || !profileId || activeProfileId !== profileId) return false;
       await saveApiRequest("POST", {
         action: "character_sync",
         character_id: profile.id,
@@ -5908,6 +5921,7 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId) {
   }
   if (!snapshot) return false;
   if (!applyCharacterSnapshot(game, snapshot)) return false;
+  relocatePlayerToLastLadderLanding(game);
   if (isAuthenticatedUser) {
     const nextSlotId = characterStateSlotId(loadedCharacterId);
     setActiveCharacterSlotId(nextSlotId || id);
@@ -6961,6 +6975,7 @@ async function handleCharacterOverlaySecondary() {
       return;
     }
     if (!isAuthenticatedUser && authBtnEl?.href) {
+      prepareGuestLoginHandoff(game);
       window.location.href = authBtnEl.href;
     }
     return;
@@ -7004,8 +7019,16 @@ async function handleCharacterOverlayTertiary() {
   if (characterUi.loading || characterUi.mode !== "select") return;
   const selectedId = characterUi.selectedSaveId;
   if (!selectedId) return;
-  const slot = characterUi.slots.find((s) => s.id === selectedId);
+  const priorSlots = Array.isArray(characterUi.slots) ? [...characterUi.slots] : [];
+  const slot = priorSlots.find((s) => s.id === selectedId);
   if (!slot) return;
+  const deletedIdx = priorSlots.findIndex((s) => s.id === selectedId);
+  const preferredNextId = (
+    priorSlots[deletedIdx + 1]?.id ||
+    priorSlots[deletedIdx - 1]?.id ||
+    ""
+  );
+  const activeSlotIdBeforeDelete = String(getActiveCharacterSlotId() ?? "");
   if (!confirm(`Delete character slot "${slot.profile?.name ?? slot.name}"?`)) return;
   setCharacterOverlayStatus("");
   characterUi.loading = true;
@@ -7017,13 +7040,14 @@ async function handleCharacterOverlayTertiary() {
         normalizeCharacterProfileIdFromSlotId(selectedId) || slot.profile?.id || ""
       );
       if (!characterId) throw new Error("Could not resolve character id to delete.");
+      const activeCharacterId = normalizeCharacterProfileId(
+        normalizeCharacterProfileIdFromSlotId(activeSlotIdBeforeDelete) || ""
+      );
+      deletedActiveCharacter = !!(activeCharacterId && activeCharacterId === characterId);
       await saveApiRequest("POST", { action: "character_delete", character_id: characterId });
-      if (normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId()) === characterId) {
-        deletedActiveCharacter = true;
-        setActiveCharacterSlotId("");
-      }
       characterUi.slots = await fetchCharacterSlotsFromServer();
     } else {
+      deletedActiveCharacter = !!(activeSlotIdBeforeDelete && activeSlotIdBeforeDelete === selectedId);
       removeLocalSlot(selectedId);
       const localCharacterId = normalizeCharacterProfileId(slot.profile?.id ?? "");
       if (localCharacterId) {
@@ -7031,12 +7055,11 @@ async function handleCharacterOverlayTertiary() {
       }
       characterUi.slots = await fetchCharacterSlotsFromLocal();
     }
-    characterUi.selectedSaveId = characterUi.slots[0]?.id ?? "";
-    if (deletedActiveCharacter && characterUi.selectedSaveId) {
-      setActiveCharacterSlotId(characterUi.selectedSaveId);
-    } else if (characterUi.activeSaveId === selectedId) {
-      setActiveCharacterSlotId(characterUi.selectedSaveId);
-    }
+    if (deletedActiveCharacter) setActiveCharacterSlotId("");
+    const nextSelectedId = (
+      (preferredNextId && characterUi.slots.some((s) => s.id === preferredNextId)) ? preferredNextId : (characterUi.slots[0]?.id ?? "")
+    );
+    characterUi.selectedSaveId = nextSelectedId;
     if (!characterUi.slots.length) {
       setActiveCharacterSlotId("");
       requiresCharacterCreation = true;
@@ -7044,8 +7067,17 @@ async function handleCharacterOverlayTertiary() {
       characterUi.selectionPurpose = "load_run";
       setCharacterOverlayStatus("Create a character to continue.", true);
       resetCharacterCreationDraft(null, { step: "welcome" });
-    } else if (isAuthenticatedUser) {
-      refreshCharacterCreationRequirement();
+    } else {
+      if (deletedActiveCharacter && characterUi.selectedSaveId) {
+        const switched = await swapCharacterFromSlotIntoCurrentRun(characterUi.selectedSaveId);
+        if (!switched) {
+          setActiveCharacterSlotId(characterUi.selectedSaveId);
+          setCharacterOverlayStatus("Character deleted, but auto-switch to the next character failed.", true);
+        }
+      } else if (activeSlotIdBeforeDelete === selectedId) {
+        setActiveCharacterSlotId(characterUi.selectedSaveId);
+      }
+      if (isAuthenticatedUser) refreshCharacterCreationRequirement();
     }
   } catch (err) {
     setCharacterOverlayStatus(err?.message ?? "Could not delete character slot.", true);
@@ -7161,6 +7193,91 @@ function hasPendingSaveAfterLoginHandoff() {
 
 function clearPendingSaveAfterLoginHandoff() {
   try { localStorage.removeItem(SAVE_LOGIN_HANDOFF_KEY); } catch {}
+}
+
+function buildGuestImportPromptSummary(state) {
+  const profile = ensureCharacterState(state);
+  const className = characterClassDef(profile?.classId).name;
+  const speciesName = characterSpeciesDef(profile?.speciesId).name;
+  const level = Math.max(1, Math.floor(state?.player?.level ?? 1));
+  const depth = Math.trunc(state?.player?.z ?? 0);
+  return {
+    profile,
+    text: `"${profile?.name ?? DEFAULT_CHARACTER_NAME}" (${speciesName} ${className}, Lvl ${level}, Depth ${depth})`,
+  };
+}
+
+async function importGuestCharacterFromCurrentRun(options = null) {
+  if (!isAuthenticatedUser || !game) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const snapshot = exportCharacterSnapshot(game);
+  const profile = normalizeCharacterProfile(snapshot?.character ?? game.character ?? null);
+  snapshot.character = profile;
+  const payload = encodeCharacterSnapshotPayload(snapshot);
+  if (!payload) return false;
+
+  await saveApiRequest("POST", {
+    action: "character_sync",
+    character_id: profile.id,
+    name: profile.name,
+    payload,
+  });
+
+  const importedSlotId = characterStateSlotId(profile.id);
+  if (importedSlotId) setActiveCharacterSlotId(importedSlotId);
+
+  try {
+    characterUi.slots = await fetchCharacterSlotsFromServer();
+  } catch {
+    characterUi.slots = characterUi.slots ?? [];
+  }
+
+  const importedExists = !!(importedSlotId && characterUi.slots.some((slot) => slot.id === importedSlotId));
+  characterUi.selectedSaveId = importedExists
+    ? importedSlotId
+    : (characterUi.slots[0]?.id || importedSlotId || "");
+  if (characterUi.selectedSaveId) setActiveCharacterSlotId(characterUi.selectedSaveId);
+  characterUi.mode = characterUi.slots.length ? "select" : "create";
+  if (characterUi.mode === "create") {
+    resetCharacterCreationDraft(null, { step: "welcome" });
+    requiresCharacterCreation = true;
+  } else {
+    requiresCharacterCreation = false;
+  }
+  setCharacterOverlayStatus("");
+  clearPendingSaveAfterLoginHandoff();
+  markCharacterStateDirty(game, "import-guest-character");
+  void syncCharacterStateIfDirty("import-guest-character");
+  if (opts.closeOverlay !== false && isCharacterOverlayOpen()) {
+    setCharacterOverlayOpen(false);
+  } else if (isCharacterOverlayOpen()) {
+    renderCharacterOverlay();
+  }
+  return true;
+}
+
+async function maybeHandlePostLoginGuestImport() {
+  if (!isAuthenticatedUser || !game) return;
+  if (!hasPendingSaveAfterLoginHandoff()) return;
+  const summary = buildGuestImportPromptSummary(game);
+  const shouldImport = confirm(
+    `Import your guest character ${summary.text} into this account?\n\n` +
+    "Choose Cancel to skip import."
+  );
+  if (!shouldImport) {
+    clearPendingSaveAfterLoginHandoff();
+    return;
+  }
+  try {
+    const imported = await importGuestCharacterFromCurrentRun({ closeOverlay: true });
+    if (imported) {
+      pushLog(game, "Guest character imported. Use Save Game to store this dungeon run on the server.");
+    } else {
+      pushLog(game, "Could not import guest character.");
+    }
+  } catch {
+    pushLog(game, "Could not import guest character.");
+  }
 }
 async function openCharacterSelectionOverlay(options = null) {
   if (!characterOverlayEl) return;
@@ -8497,6 +8614,7 @@ function respawnAtStart(state) {
   p.slipbladeBonusReady = false;
   p.overclockUntilMs = 0;
   p.x = sp.x; p.y = sp.y; p.z = sp.z;
+  setLastLadderLanding(state, sp);
   state.disengageGrace = {};
   const combat = ensureCombatState(state);
   combat.lastEventMs = 0;
@@ -8568,6 +8686,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     poisonClouds: {},
     surfaceLink: null,
     startSpawn: null,
+    lastLadderLanding: null,
     shop: null,
     combat: { lastEventMs: 0, regenAnchorMs: Date.now(), hudTargets: {} },
     disengageGrace: {},
@@ -8587,6 +8706,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
 
   const start = computeInitialDepth0Spawn(world);
   state.startSpawn = start;
+  setLastLadderLanding(state, start);
   player.x = start.x;
   player.y = start.y;
   player.z = start.z;
@@ -10557,6 +10677,58 @@ function carveLandingAndConnect(state, x, y, z, centerTile) {
   while (cy2 !== best.y) { cy2 += Math.sign(best.y - cy2); state.world.setTile(cx2, cy2, z, FLOOR); }
 }
 
+function normalizeLadderLanding(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const x = Math.floor(Number(raw.x));
+  const y = Math.floor(Number(raw.y));
+  const z = Math.floor(Number(raw.z));
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+  return { x, y, z };
+}
+
+function setLastLadderLanding(state, raw) {
+  if (!state) return null;
+  const next = normalizeLadderLanding(raw);
+  if (!next) return null;
+  state.lastLadderLanding = next;
+  return next;
+}
+
+function resolveLastLadderLanding(state) {
+  const explicit = normalizeLadderLanding(state?.lastLadderLanding);
+  if (explicit) return explicit;
+  const start = normalizeLadderLanding(state?.startSpawn);
+  if (start) return start;
+  const p = state?.player ?? null;
+  return normalizeLadderLanding(p);
+}
+
+function relocatePlayerToLastLadderLanding(state) {
+  if (!state?.player || !state?.world) return false;
+  const landing = resolveLastLadderLanding(state);
+  if (!landing) return false;
+  state.world.ensureChunksAround(landing.x, landing.y, landing.z, viewRadiusForChunks());
+  const p = state.player;
+  p.x = landing.x;
+  p.y = landing.y;
+  p.z = landing.z;
+  p.dead = false;
+  p.attackAfterMove = false;
+  p.combatFirstStrikeReady = true;
+  p.slipbladeBonusReady = false;
+  p.overclockUntilMs = 0;
+  if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
+  setLastLadderLanding(state, p);
+  hydrateNearby(state);
+  updateAreaRespawnTracking(state, Date.now());
+  renderInventory(state);
+  renderEquipment(state);
+  renderEffects(state);
+  updateContextActionButton(state);
+  updateDeathOverlay(state);
+  return true;
+}
+
 function goToLevel(state, newZ, direction) {
   const p = state.player;
   if (p.dead) return;
@@ -10603,6 +10775,7 @@ function goToLevel(state, newZ, direction) {
   p.overclockUntilMs = 0;
 
   if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
+  setLastLadderLanding(state, p);
 
   hydrateNearby(state);
   updateAreaRespawnTracking(state, Date.now());
@@ -14721,6 +14894,7 @@ function exportSave(state) {
     poisonClouds,
     surfaceLink: state.surfaceLink ?? null,
     startSpawn: state.startSpawn ?? null,
+    lastLadderLanding: normalizeLadderLanding(state.lastLadderLanding ?? state.player) ?? null,
     shop: state.shop ?? null,
     character: character ?? null,
     areaRespawn: {
@@ -14962,6 +15136,7 @@ function importSave(saveStr) {
       poisonClouds: normalizePoisonCloudState(payload.poisonClouds ?? {}),
       surfaceLink: payload.surfaceLink ?? null,
       startSpawn: payload.startSpawn ?? null,
+      lastLadderLanding: normalizeLadderLanding(payload.lastLadderLanding ?? null),
       shop: payload.shop ?? null,
       character: normalizeCharacterProfile(
         payload.character ?? {
@@ -15003,6 +15178,9 @@ function importSave(saveStr) {
     ensureCharacterState(state);
     state.surfaceLink = resolveSurfaceLink(state);
     state.startSpawn = state.startSpawn ?? computeInitialDepth0Spawn(world);
+    if (!normalizeLadderLanding(state.lastLadderLanding)) {
+      setLastLadderLanding(state, state.player ?? state.startSpawn);
+    }
     ensureSurfaceLinkTile(state);
     if (state.shop && Array.isArray(state.shop.stock)) {
       state.shop.stock = state.shop.stock
@@ -15094,6 +15272,10 @@ btnSaveGameEl?.addEventListener("click", () => {
 
 btnLoadGameEl?.addEventListener("click", () => {
   void openSaveGameOverlay("load");
+});
+authBtnEl?.addEventListener("click", () => {
+  if (isAuthenticatedUser) return;
+  prepareGuestLoginHandoff(game);
 });
 btnChooseCharacterEl?.addEventListener("click", () => {
   void openCharacterSelectionOverlay({ purpose: "swap_character" });
@@ -15559,11 +15741,7 @@ try {
   void syncCharacterStateIfDirty("startup");
   void refreshSpriteOverridesFromServer(true);
   void startCharacterFlow().then(() => {
-    if (!hasPendingSaveAfterLoginHandoff()) return;
-    clearPendingSaveAfterLoginHandoff();
-    if (isCharacterOverlayOpen() && !mustHaveCharacterSlot()) setCharacterOverlayOpen(false);
-    void openSaveGameOverlay("save");
-    setSaveGameStatus("Signed in. Save your current run to a server slot.", false);
+    void maybeHandlePostLoginGuestImport();
   });
   syncBodyModalLock();
   syncMobileUi(true);
