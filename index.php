@@ -2755,18 +2755,37 @@ if ($apiMode === 'savegames') {
     if ($characterId === '') {
       json_response(['ok' => false, 'error' => 'Missing character id.'], 400);
     }
-    if (!isset($characterStates[$characterId])) {
+    $foundCharacterState = isset($characterStates[$characterId]);
+    $nextEntries = [];
+    $removedEntryCount = 0;
+    foreach ($entries as $entry) {
+      $entryCharacterId = normalize_character_profile_id((string) ($entry['character_id'] ?? ''));
+      if ($entryCharacterId !== '' && $entryCharacterId === $characterId) {
+        $removedEntryCount++;
+        continue;
+      }
+      $nextEntries[] = $entry;
+    }
+    if (!$foundCharacterState && $removedEntryCount <= 0) {
       json_response(['ok' => false, 'error' => 'Character not found.'], 404);
     }
-    unset($characterStates[$characterId]);
+    if ($foundCharacterState) {
+      unset($characterStates[$characterId]);
+    }
     if (isset($itemAuthorityStates[$characterId])) {
       unset($itemAuthorityStates[$characterId]);
+    }
+    if ($removedEntryCount > 0 && !persist_user_saves($userEmail, $nextEntries, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist character save deletion.'], 500);
     }
     if (!persist_user_character_states($userEmail, $characterStates, $saveSecret)) {
       json_response(['ok' => false, 'error' => 'Could not persist character state deletion.'], 500);
     }
     if (!persist_user_item_authority_states($userEmail, $itemAuthorityStates, $saveSecret)) {
       json_response(['ok' => false, 'error' => 'Could not persist character item state deletion.'], 500);
+    }
+    if ($removedEntryCount > 0) {
+      $entries = load_user_saves($userEmail, $saveSecret);
     }
     json_response([
       'ok' => true,

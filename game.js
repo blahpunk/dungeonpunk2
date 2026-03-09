@@ -4697,10 +4697,23 @@ function monsterFactionForType(type) {
 function familyEntriesForLootContext({ state = null, depth = 0, source = "floor", biomeId = "", factionId = "", category = "" } = {}) {
   const biome = BIOME_FAMILY_WEIGHTS[biomeId] ? biomeId : biomeIdForDepth(state, depth);
   const base = BIOME_FAMILY_WEIGHTS[biome] ?? BIOME_FAMILY_WEIGHTS.default;
+  const defaultBase = BIOME_FAMILY_WEIGHTS.default ?? {};
   const sourceMods = SOURCE_FAMILY_MULT[normalizeLootSource(source)] ?? SOURCE_FAMILY_MULT.floor;
   const factionMods = factionId ? (FACTION_FAMILY_MULT[factionId] ?? { default: 1 }) : { default: 1 };
+  const weaponBaselineMult = 0.35;
+  const mergedBase = { ...base };
+  if (category === "weapon") {
+    for (const [familyIdRaw, weightRaw] of Object.entries(defaultBase)) {
+      const familyId = String(familyIdRaw ?? "").trim().toLowerCase();
+      if (!WEAPON_FAMILY_DEFS[familyId]) continue;
+      const baseWeight = Math.max(0, Number(weightRaw ?? 0));
+      if (baseWeight <= 0) continue;
+      const existing = Math.max(0, Number(mergedBase[familyId] ?? 0));
+      mergedBase[familyId] = Math.max(existing, baseWeight * weaponBaselineMult);
+    }
+  }
   const out = [];
-  for (const [familyIdRaw, weightRaw] of Object.entries(base)) {
+  for (const [familyIdRaw, weightRaw] of Object.entries(mergedBase)) {
     const familyId = String(familyIdRaw ?? "").trim().toLowerCase();
     if (!familyId || familyId === "default") continue;
     const isWeapon = !!WEAPON_FAMILY_DEFS[familyId];
@@ -7107,67 +7120,65 @@ async function fetchCharacterSlotsFromServer() {
   const characterStates = Array.isArray(base?.character_states) ? base.character_states : [];
   const out = [];
   const knownCharacterIds = new Set();
-  if (characterStates.length) {
-    for (const stateMeta of characterStates) {
-      const characterId = normalizeCharacterProfileId(stateMeta?.id ?? "");
-      if (!characterId || knownCharacterIds.has(characterId)) continue;
-      const slotId = characterStateSlotId(characterId);
-      if (!slotId) continue;
-      const profileFallback = normalizeCharacterProfile({
-        id: characterId,
-        name: String(stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
-      });
-      const snapshot = await resolveCharacterSnapshotFromServerState(characterId);
-      const slot = {
-        id: slotId,
-        name: String(stateMeta?.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
-        updatedAt: String(stateMeta?.updated_at ?? ""),
-        level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
-        depth: 0,
-        profile: snapshot?.character ? normalizeCharacterProfile(snapshot.character) : profileFallback,
-        deepestDepth: Math.max(
-          0,
-          Math.floor(snapshot?.character?.deepestDepth ?? profileFallback.deepestDepth ?? 0)
-        ),
-      };
-      out.push(slot);
-      knownCharacterIds.add(characterId);
+  for (const stateMeta of characterStates) {
+    const characterId = normalizeCharacterProfileId(stateMeta?.id ?? "");
+    if (!characterId || knownCharacterIds.has(characterId)) continue;
+    const slotId = characterStateSlotId(characterId);
+    if (!slotId) continue;
+    const profileFallback = normalizeCharacterProfile({
+      id: characterId,
+      name: String(stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
+    });
+    const snapshot = await resolveCharacterSnapshotFromServerState(characterId);
+    const slot = {
+      id: slotId,
+      name: String(stateMeta?.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
+      updatedAt: String(stateMeta?.updated_at ?? ""),
+      level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
+      depth: 0,
+      profile: snapshot?.character ? normalizeCharacterProfile(snapshot.character) : profileFallback,
+      deepestDepth: Math.max(
+        0,
+        Math.floor(snapshot?.character?.deepestDepth ?? profileFallback.deepestDepth ?? 0)
+      ),
+    };
+    out.push(slot);
+    knownCharacterIds.add(characterId);
+  }
+
+  for (const entry of characters) {
+    const characterId = normalizeCharacterProfileId(entry?.character_id ?? "");
+    if (!characterId || knownCharacterIds.has(characterId)) continue;
+    const slotId = characterStateSlotId(characterId);
+    if (!slotId) continue;
+    const profileFallback = normalizeCharacterProfile({
+      id: characterId,
+      name: String(entry?.character_name ?? DEFAULT_CHARACTER_NAME),
+    });
+    const slot = {
+      id: slotId,
+      name: String(entry?.character_name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
+      updatedAt: String(entry?.updated_at ?? ""),
+      level: Math.max(1, Math.floor(entry?.level ?? 1)),
+      depth: Math.trunc(entry?.depth ?? 0),
+      profile: profileFallback,
+      deepestDepth: Math.max(0, Math.trunc(entry?.depth ?? 0)),
+    };
+    const saveId = String(entry?.latest_save_id ?? "").trim();
+    if (saveId) {
+      try {
+        const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
+        const summary = parseCharacterSummaryPayload(detail?.save?.payload ?? "");
+        if (summary) {
+          slot.profile = summary.profile;
+          slot.level = summary.level;
+          slot.depth = summary.depth;
+          slot.deepestDepth = summary.deepestDepth;
+        }
+      } catch {}
     }
-  } else {
-    for (const entry of characters) {
-      const characterId = normalizeCharacterProfileId(entry?.character_id ?? "");
-      if (!characterId || knownCharacterIds.has(characterId)) continue;
-      const slotId = characterStateSlotId(characterId);
-      if (!slotId) continue;
-      const profileFallback = normalizeCharacterProfile({
-        id: characterId,
-        name: String(entry?.character_name ?? DEFAULT_CHARACTER_NAME),
-      });
-      const slot = {
-        id: slotId,
-        name: String(entry?.character_name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
-        updatedAt: String(entry?.updated_at ?? ""),
-        level: Math.max(1, Math.floor(entry?.level ?? 1)),
-        depth: Math.trunc(entry?.depth ?? 0),
-        profile: profileFallback,
-        deepestDepth: Math.max(0, Math.trunc(entry?.depth ?? 0)),
-      };
-      const saveId = String(entry?.latest_save_id ?? "").trim();
-      if (saveId) {
-        try {
-          const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
-          const summary = parseCharacterSummaryPayload(detail?.save?.payload ?? "");
-          if (summary) {
-            slot.profile = summary.profile;
-            slot.level = summary.level;
-            slot.depth = summary.depth;
-            slot.deepestDepth = summary.deepestDepth;
-          }
-        } catch {}
-      }
-      out.push(slot);
-      knownCharacterIds.add(characterId);
-    }
+    out.push(slot);
+    knownCharacterIds.add(characterId);
   }
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   return out;
@@ -7696,10 +7707,13 @@ async function handleCharacterOverlayPrimary() {
     renderCharacterOverlay();
     try {
       const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
-      const saved = await saveStateToServerSlot(game, "", slotName);
-      const savedId = String(saved?.save?.id ?? "");
+      await saveStateToServerSlot(game, "", slotName);
+      markCharacterStateDirty(game, "character-create");
+      await syncCharacterStateIfDirty("character-create");
       characterUi.slots = await fetchCharacterSlotsFromServer();
-      characterUi.selectedSaveId = savedId || characterUi.slots[0]?.id || "";
+      const preferredSlotId = characterStateSlotId(profile.id);
+      const preferredExists = !!(preferredSlotId && characterUi.slots.some((slot) => slot.id === preferredSlotId));
+      characterUi.selectedSaveId = preferredExists ? preferredSlotId : (characterUi.slots[0]?.id || "");
       setActiveCharacterSlotId(characterUi.selectedSaveId);
       requiresCharacterCreation = false;
       setCharacterOverlayStatus("");
