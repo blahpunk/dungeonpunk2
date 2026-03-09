@@ -7489,18 +7489,27 @@ function renderCharacterCreateBody() {
       });
     }
   } else if (step === "stats") {
+    const statsSpriteDisplay = resolveCharacterSpriteDisplay(draft.speciesId, draft.classId);
+    const statsSpriteVisual = statsSpriteDisplay.src
+      ? `<img class="charLargeSprite" src="${statsSpriteDisplay.src}" alt="${escapeHtmlText(species.name)} ${escapeHtmlText(klass.name)} sprite" />`
+      : `<div class="charLargeSpriteFallback">@</div>`;
     characterOverlayBodyEl.innerHTML =
       statusHtml +
       `<div class="charStepLead">Step 4/5: Allocate Attribute Points</div>` +
-      `<div class="charPointsBanner${remaining === 0 ? " ready" : ""}">` +
-      `<span class="charPointsBannerLabel">Points Remaining</span>` +
-      `<strong class="charPointsBannerValue">${remaining}</strong>` +
-      `<span class="charPointsBannerMeta">Spent ${spent}/${budget}</span>` +
+      `<div class="charStatsSpriteCard">` +
+      `<div class="charStatsSpriteVisual">${statsSpriteVisual}</div>` +
+      `<div class="charStatsSpriteDerived">` +
+      `<div class="charDerivedGrid">` +
+      `<div class="charDerivedCell"><span>Max HP</span><strong>${derived.maxHp}</strong></div>` +
+      `<div class="charDerivedCell"><span>ATK</span><strong>${derived.atkLo}-${derived.atkHi}</strong></div>` +
+      `<div class="charDerivedCell"><span>DEF</span><strong>${derived.def}</strong></div>` +
+      `<div class="charDerivedCell"><span>ACC</span><strong>${derived.acc}</strong></div>` +
+      `<div class="charDerivedCell"><span>EVA</span><strong>${derived.eva}</strong></div>` +
+      `<div class="charDerivedCell"><span>SPD</span><strong>${derived.spd.toFixed(2)}</strong></div>` +
+      `<div class="charDerivedCell"><span>Energy</span><strong>${derived.energy}</strong></div>` +
+      `<div class="charDerivedCell"><span>Potions</span><strong>${potionCapacityForState({ player: { classId: draft.classId }, character: { classId: draft.classId } })}</strong></div>` +
       `</div>` +
-      `<div class="charCreatorGrid charCreatorGridStatsMeta">` +
-      `<div class="charCreatorField"><label>Species</label><input type="text" value="${escapeHtmlText(species.name)}" disabled /></div>` +
-      `<div class="charCreatorField"><label>Class</label><input type="text" value="${escapeHtmlText(klass.name)}" disabled /></div>` +
-      `<div class="charCreatorField"><label>Point Budget</label><input type="text" value="${spent}/${budget}" disabled /></div>` +
+      `</div>` +
       `</div>` +
       `<div class="charStatsWrap">` +
       `<div class="charStatsHeader">Distribute points (max ${CHARACTER_CREATION_MAX_STAT} per stat)</div>` +
@@ -7511,19 +7520,14 @@ function renderCharacterCreateBody() {
           `<div class="charStatLabelWrap"><div class="charStatLabel">${label}</div><div class="charStatKey">${characterStatLabelShort(key)}</div></div>` +
           `<div class="charStatValueBox"><span class="charStatValue">${val}</span></div>` +
           `<button class="charStatBtn" data-op="minus" data-stat="${key}" type="button">-</button>` +
-          `<button class="charStatBtn" data-op="plus" data-stat="${key}" type="button">+</button>` +
+      `<button class="charStatBtn" data-op="plus" data-stat="${key}" type="button">+</button>` +
         `</div>`;
       }).join("")}` +
       `</div>` +
-      `<div class="charDerivedGrid">` +
-      `<div class="charDerivedCell"><span>Max HP</span><strong>${derived.maxHp}</strong></div>` +
-      `<div class="charDerivedCell"><span>ATK</span><strong>${derived.atkLo}-${derived.atkHi}</strong></div>` +
-      `<div class="charDerivedCell"><span>DEF</span><strong>${derived.def}</strong></div>` +
-      `<div class="charDerivedCell"><span>ACC</span><strong>${derived.acc}</strong></div>` +
-      `<div class="charDerivedCell"><span>EVA</span><strong>${derived.eva}</strong></div>` +
-      `<div class="charDerivedCell"><span>SPD</span><strong>${derived.spd.toFixed(2)}</strong></div>` +
-      `<div class="charDerivedCell"><span>Energy</span><strong>${derived.energy}</strong></div>` +
-      `<div class="charDerivedCell"><span>Potions</span><strong>${potionCapacityForState({ player: { classId: draft.classId }, character: { classId: draft.classId } })}</strong></div>` +
+      `<div class="charPointsBanner charPointsBannerBottom${remaining === 0 ? " ready" : ""}">` +
+      `<span class="charPointsBannerLabel">Points Remaining</span>` +
+      `<strong class="charPointsBannerValue">${remaining}</strong>` +
+      `<span class="charPointsBannerMeta">Spent ${spent}/${budget}</span>` +
       `</div>`;
     for (const btn of characterOverlayBodyEl.querySelectorAll(".charStatBtn")) {
       btn.addEventListener("click", () => {
@@ -13339,11 +13343,28 @@ function renderLevelUpOverlay(state) {
   if (!state?.player) return;
   const profile = ensureCharacterState(state);
   const stats = normalizeCharacterStats(profile?.stats, profile?.speciesId);
+  const speciesId = state?.player?.speciesId ?? profile?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID;
+  const classId = state?.player?.classId ?? profile?.classId ?? DEFAULT_CHARACTER_CLASS_ID;
+  const species = characterSpeciesDef(speciesId);
+  const klass = characterClassDef(classId);
+  const levelUpSpriteDisplay = resolveCharacterSpriteDisplay(speciesId, classId);
+  const levelUpSpriteVisual = levelUpSpriteDisplay.src
+    ? `<img class="levelUpLargeSprite" src="${levelUpSpriteDisplay.src}" alt="${escapeHtmlText(species.name)} ${escapeHtmlText(klass.name)} sprite" />`
+    : `<div class="levelUpLargeSpriteFallback">@</div>`;
   const unspent = Math.max(0, Math.floor(profile?.unspentStatPoints ?? 0));
   const drafted = levelUpDraftSpentTotal();
   const remaining = Math.max(0, unspent - drafted);
 
-  levelUpStatsListEl.innerHTML = CHARACTER_STAT_KEYS.map((key) => {
+  levelUpStatsListEl.innerHTML =
+    `<div class="levelUpSpriteCard">` +
+    `<div class="levelUpSpriteVisual">${levelUpSpriteVisual}</div>` +
+    `<div class="levelUpSpriteMeta">` +
+    `<div class="levelUpSpriteTitle">${escapeHtmlText(profile?.name ?? DEFAULT_CHARACTER_NAME)}</div>` +
+    `<div class="levelUpSpriteSub">${escapeHtmlText(species.name)} • ${escapeHtmlText(klass.name)}</div>` +
+    `<div class="levelUpSpriteHint">Assign points to shape this character's growth.</div>` +
+    `</div>` +
+    `</div>` +
+    CHARACTER_STAT_KEYS.map((key) => {
     const baseVal = Math.max(0, Math.floor(stats[key] ?? 0));
     const pending = levelUpDraftForKey(key);
     const val = baseVal + pending;

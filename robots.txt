@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://dungeonpunk2.blahpunk.com/sitemap.xml

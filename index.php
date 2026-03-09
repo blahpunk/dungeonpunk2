@@ -3203,13 +3203,55 @@ $monsterEditorJson = json_encode(
 if (!is_string($monsterEditorJson)) {
   $monsterEditorJson = '{"version":1,"monsters":{},"spawn_rules":[],"updated_at":""}';
 }
+$seoCanonical = 'https://dungeonpunk2.blahpunk.com/';
+$seoTitle = 'DungeonPunk2! | Free Browser Dungeon Crawler RPG with Infinite Exploration';
+$seoDescription = 'Play DungeonPunk2! free in your browser. Explore infinite dungeons, unlock 18 weapon tiers, equip powerful gear, build diverse classes, and battle dozens of unique monsters.';
+$seoImage = 'https://dungeonpunk2.blahpunk.com/client/assets/shopkeeper_full.png';
+$seoSchema = [
+  '@context' => 'https://schema.org',
+  '@type' => 'VideoGame',
+  'name' => 'DungeonPunk2!',
+  'url' => $seoCanonical,
+  'description' => $seoDescription,
+  'genre' => ['Dungeon Crawler', 'RPG', 'Retro', 'Fantasy'],
+  'gamePlatform' => 'Web Browser',
+  'playMode' => 'SinglePlayer',
+  'isAccessibleForFree' => true,
+  'publisher' => [
+    '@type' => 'Organization',
+    'name' => 'Blahpunk',
+    'url' => 'https://blahpunk.com/',
+  ],
+  'keywords' => [
+    'free browser dungeon crawler',
+    'play dungeon crawler online',
+    'retro browser RPG',
+    'infinite dungeon game',
+    'fantasy RPG browser game',
+  ],
+];
+header('X-Robots-Tag: index, follow, max-image-preview:large', true);
 ?>
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DungeonPunk!</title>
+    <title><?= htmlspecialchars($seoTitle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?></title>
+    <meta name="description" content="<?= htmlspecialchars($seoDescription, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <link rel="canonical" href="<?= htmlspecialchars($seoCanonical, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Blahpunk" />
+    <meta property="og:title" content="<?= htmlspecialchars($seoTitle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta property="og:description" content="<?= htmlspecialchars($seoDescription, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta property="og:url" content="<?= htmlspecialchars($seoCanonical, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta property="og:image" content="<?= htmlspecialchars($seoImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="<?= htmlspecialchars($seoTitle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta name="twitter:description" content="<?= htmlspecialchars($seoDescription, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <meta name="twitter:image" content="<?= htmlspecialchars($seoImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?>" />
+    <script type="application/ld+json"><?= json_encode($seoSchema, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?></script>
     <style>
       :root {
         color-scheme: dark;
@@ -4210,6 +4252,73 @@ if (!is_string($monsterEditorJson)) {
         padding: 12px;
         background: linear-gradient(180deg, rgba(16, 24, 39, 0.95) 0%, rgba(10, 16, 27, 0.95) 100%);
       }
+      .charStatsSpriteCard {
+        margin-top: 10px;
+        border: 1px solid #39527a;
+        border-radius: 10px;
+        padding: 10px 12px;
+        background: linear-gradient(180deg, rgba(18, 28, 45, 0.95) 0%, rgba(11, 18, 30, 0.95) 100%);
+        display: grid;
+        grid-template-columns: 216px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+      }
+      .charStatsSpriteVisual {
+        width: 216px;
+        height: 216px;
+        border: 1px solid #2f456b;
+        border-radius: 10px;
+        background: rgba(8, 14, 25, 0.92);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .charLargeSprite {
+        width: 198px;
+        height: 198px;
+        object-fit: contain;
+        image-rendering: pixelated;
+      }
+      .charLargeSpriteFallback {
+        width: 198px;
+        height: 198px;
+        border-radius: 10px;
+        border: 1px solid #2f456b;
+        background: rgba(11, 18, 30, 0.88);
+        display: grid;
+        place-items: center;
+        color: #d6e4ff;
+        font-size: 56px;
+        font-weight: 800;
+      }
+      .charStatsSpriteMeta {
+        min-width: 0;
+      }
+      .charStatsSpriteDerived {
+        min-width: 0;
+      }
+      .charStatsSpriteDerived .charDerivedGrid {
+        margin-top: 0;
+      }
+      .charStatsSpriteTitle {
+        font-size: 18px;
+        font-weight: 800;
+        color: #f2f6ff;
+        line-height: 1.15;
+      }
+      .charStatsSpriteSub {
+        margin-top: 3px;
+        font-size: 13px;
+        color: #c4d7f6;
+      }
+      .charStatsSpriteHint {
+        margin-top: 7px;
+        font-size: 12px;
+        color: #9db5d8;
+      }
+      .charPointsBannerBottom {
+        margin-top: 12px;
+      }
       .charStatsHeader {
         font-size: 14px;
         font-weight: 700;
@@ -4398,6 +4507,26 @@ if (!is_string($monsterEditorJson)) {
         }
         .classChoiceCard .charChoiceSpriteFallback {
           font-size: 28px;
+        }
+        .charStatsSpriteCard {
+          grid-template-columns: 132px minmax(0, 1fr);
+          gap: 10px;
+          padding: 9px 10px;
+        }
+        .charStatsSpriteVisual {
+          width: 132px;
+          height: 132px;
+        }
+        .charLargeSprite,
+        .charLargeSpriteFallback {
+          width: 118px;
+          height: 118px;
+        }
+        .charLargeSpriteFallback {
+          font-size: 42px;
+        }
+        .charStatsSpriteTitle {
+          font-size: 16px;
         }
       }
       #shopOverlay {
@@ -4743,6 +4872,59 @@ if (!is_string($monsterEditorJson)) {
         gap: 8px;
         max-height: min(60vh, 420px);
         overflow: auto;
+      }
+      .levelUpSpriteCard {
+        border: 1px solid #335179;
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(20, 33, 54, 0.94) 0%, rgba(11, 18, 30, 0.94) 100%);
+        padding: 10px;
+        display: grid;
+        grid-template-columns: 140px minmax(0, 1fr);
+        gap: 10px;
+        align-items: center;
+      }
+      .levelUpSpriteVisual {
+        width: 140px;
+        height: 140px;
+        border: 1px solid #2f456b;
+        border-radius: 10px;
+        background: rgba(8, 14, 25, 0.92);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .levelUpLargeSprite {
+        width: 126px;
+        height: 126px;
+        object-fit: contain;
+        image-rendering: pixelated;
+      }
+      .levelUpLargeSpriteFallback {
+        width: 126px;
+        height: 126px;
+        border-radius: 10px;
+        border: 1px solid #2f456b;
+        background: rgba(11, 18, 30, 0.88);
+        display: grid;
+        place-items: center;
+        color: #d6e4ff;
+        font-size: 50px;
+        font-weight: 800;
+      }
+      .levelUpSpriteTitle {
+        font-size: 17px;
+        font-weight: 800;
+        color: #f2f6ff;
+      }
+      .levelUpSpriteSub {
+        margin-top: 2px;
+        font-size: 12px;
+        color: #c4d7f6;
+      }
+      .levelUpSpriteHint {
+        margin-top: 6px;
+        font-size: 12px;
+        color: #9db5d8;
       }
       .levelUpRow {
         border: 1px solid #2b3956;
@@ -5753,6 +5935,23 @@ if (!is_string($monsterEditorJson)) {
           overflow: auto;
           -webkit-overflow-scrolling: touch;
           padding-bottom: max(18px, env(safe-area-inset-bottom));
+        }
+        .levelUpSpriteCard {
+          grid-template-columns: 104px minmax(0, 1fr);
+          gap: 8px;
+          padding: 8px;
+        }
+        .levelUpSpriteVisual {
+          width: 104px;
+          height: 104px;
+        }
+        .levelUpLargeSprite,
+        .levelUpLargeSpriteFallback {
+          width: 92px;
+          height: 92px;
+        }
+        .levelUpLargeSpriteFallback {
+          font-size: 40px;
         }
         #shopFooter,
         #saveGameFooter,
