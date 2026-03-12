@@ -1726,6 +1726,7 @@ const saveRuntime = {
   saving: false,
   pendingAutosaveReason: "",
   activeRunSaveId: "",
+  activeAutosaveSaveId: "",
 };
 const characterSyncRuntime = {
   dirty: false,
@@ -6958,6 +6959,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
       updateDeathOverlay(game);
       setActiveCharacterSlotId(id);
       saveRuntime.activeRunSaveId = "";
+      saveRuntime.activeAutosaveSaveId = "";
       refreshSaveNameFromLive(true);
       saveNow(game);
       clearSaveDirty();
@@ -7214,6 +7216,9 @@ async function deleteServerSave(saveId) {
     if (String(saveRuntime.activeRunSaveId ?? "") === String(saveId)) {
       saveRuntime.activeRunSaveId = "";
     }
+    if (String(saveRuntime.activeAutosaveSaveId ?? "") === String(saveId)) {
+      saveRuntime.activeAutosaveSaveId = "";
+    }
     setSaveGameStatus("Save deleted.", false);
     renderSaveGameOverlay();
     return true;
@@ -7245,7 +7250,7 @@ async function loadSaveFromServer(saveId, options = null) {
     if (!loaded) {
       throw new Error("Save payload is invalid.");
     }
-    if (requireAlive && loaded?.player?.dead) {
+    if (requireAlive && (loaded?.player?.dead || Number(loaded?.player?.hp ?? 0) <= 0)) {
       throw new Error("Autosave is from a dead state.");
     }
     game = loaded;
@@ -7254,6 +7259,7 @@ async function loadSaveFromServer(saveId, options = null) {
       const latestSnapshot = await resolveLatestCharacterSnapshot(targetCharacterId);
       if (latestSnapshot) applyCharacterSnapshot(game, latestSnapshot);
     }
+    if (requireAlive) applyRespawnRecoveryState(game);
     if (forceEntrance) {
       respawnAtStart(game);
       pushLog(game, "You re-enter at the dungeon entrance.");
@@ -7264,6 +7270,9 @@ async function loadSaveFromServer(saveId, options = null) {
     updateContextActionButton(game);
     updateDeathOverlay(game);
     saveRuntime.activeRunSaveId = String(saveId);
+    if (saveNameLooksLikeAutosave(data?.save?.name ?? "")) {
+      saveRuntime.activeAutosaveSaveId = String(saveId);
+    }
     const activeCharacterSlotId = characterStateSlotId(targetCharacterId);
     if (activeCharacterSlotId) setActiveCharacterSlotId(activeCharacterSlotId);
     saveNow(game);
@@ -7292,6 +7301,11 @@ async function saveCurrentGameToServer(overwriteId = "", options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const useAutosaveName = opts.autosave === true;
   const forceName = String(opts.forceName ?? "").trim();
+  let targetOverwriteId = String(overwriteId ?? "").trim();
+  if (useAutosaveName) {
+    if (!targetOverwriteId) targetOverwriteId = String(saveRuntime.activeAutosaveSaveId ?? "").trim();
+    if (!targetOverwriteId) targetOverwriteId = await resolveAutosaveOverwriteIdFromServer(game);
+  }
   const mode = saveMenuUi.mode === "save" ? "save" : "load";
   if (mode !== "save") saveMenuUi.mode = "save";
   if (!useAutosaveName) refreshSaveNameFromLive(false);
@@ -7304,18 +7318,22 @@ async function saveCurrentGameToServer(overwriteId = "", options = null) {
 
   saveMenuUi.loading = true;
   renderSaveGameOverlay();
-  setSaveGameStatus(overwriteId ? "Overwriting save..." : "Saving game...", false);
+  setSaveGameStatus(targetOverwriteId ? "Overwriting save..." : "Saving game...", false);
   try {
     const data = await saveApiRequest("POST", {
       action: "save",
-      overwrite_id: overwriteId || undefined,
+      overwrite_id: targetOverwriteId || undefined,
       name,
       payload,
       level,
       depth,
     });
     saveMenuUi.saves = Array.isArray(data.saves) ? data.saves : [];
-    if (data?.save?.id) saveRuntime.activeRunSaveId = String(data.save.id);
+    if (data?.save?.id) {
+      const savedId = String(data.save.id);
+      if (useAutosaveName) saveRuntime.activeAutosaveSaveId = savedId;
+      else saveRuntime.activeRunSaveId = savedId;
+    }
     saveResumeSnapshot(game);
     clearSaveDirty();
     refreshSaveNameFromLive(true);
@@ -8339,6 +8357,34 @@ function clearPendingSaveAfterLoginHandoff() {
 function saveNameLooksLikeAutosave(name = "") {
   return String(name ?? "").trim().toLowerCase().startsWith("autosave");
 }
+function saveEntryCharacterId(entry = null) {
+  return normalizeCharacterProfileId(entry?.character_id ?? "");
+}
+function activeCharacterProfileIdFromGameState(state = null) {
+  return normalizeCharacterProfileId(state?.character?.id ?? "");
+}
+function pickMostRecentAutosaveIdForCharacter(saves = [], characterId = "") {
+  const cid = normalizeCharacterProfileId(characterId);
+  const autosaves = (Array.isArray(saves) ? saves : [])
+    .filter((entry) => saveNameLooksLikeAutosave(entry?.name ?? ""))
+    .filter((entry) => !cid || saveEntryCharacterId(entry) === cid)
+    .slice()
+    .sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
+  return String(autosaves[0]?.id ?? "").trim();
+}
+async function resolveAutosaveOverwriteIdFromServer(state = null) {
+  const characterId = activeCharacterProfileIdFromGameState(state);
+  const cached = pickMostRecentAutosaveIdForCharacter(saveMenuUi?.saves ?? [], characterId);
+  if (cached) return cached;
+  try {
+    const data = await saveApiRequest("GET");
+    const saves = Array.isArray(data?.saves) ? data.saves : [];
+    saveMenuUi.saves = saves;
+    return pickMostRecentAutosaveIdForCharacter(saves, characterId);
+  } catch {
+    return "";
+  }
+}
 
 function mostRecentCharacterSlotIdFromSaveListResponse(listData = null) {
   const data = (listData && typeof listData === "object") ? listData : {};
@@ -8392,6 +8438,7 @@ async function loadLatestAccountRunAfterGuestDecline() {
 function activateLoadedRunStateForRespawn(loaded, reason = "respawn-autosave") {
   if (!loaded?.player || !loaded?.world) return false;
   game = loaded;
+  applyRespawnRecoveryState(game);
   enforceAdminControlPolicy(game);
   updateDebugMenuUi(game);
   setDebugMenuOpen(false);
@@ -8402,6 +8449,22 @@ function activateLoadedRunStateForRespawn(loaded, reason = "respawn-autosave") {
   markCharacterStateDirty(game, reason);
   void syncCharacterStateIfDirty(reason);
   return true;
+}
+function applyRespawnRecoveryState(state) {
+  const p = state?.player;
+  if (!p) return;
+  p.dead = false;
+  p.hp = Math.max(1, Math.floor(p.maxHp ?? 1));
+  p.effects = [];
+  p.attackAfterMove = false;
+  p.combatFirstStrikeReady = true;
+  p.slipbladeBonusReady = false;
+  p.overclockUntilMs = 0;
+  state.disengageGrace = {};
+  const combat = ensureCombatState(state);
+  combat.lastEventMs = 0;
+  combat.regenAnchorMs = Date.now();
+  combat.hudTargets = {};
 }
 function loadLocalAutosaveForRespawn() {
   try {
@@ -9904,21 +9967,9 @@ function respawnAtStart(state) {
   const p = state.player;
   const sp = state.startSpawn ?? computeInitialDepth0Spawn(state.world);
   state.startSpawn = sp;
-
-  p.dead = false;
-  p.hp = p.maxHp;
-  p.effects = [];
-  p.attackAfterMove = false;
-  p.combatFirstStrikeReady = true;
-  p.slipbladeBonusReady = false;
-  p.overclockUntilMs = 0;
+  applyRespawnRecoveryState(state);
   p.x = sp.x; p.y = sp.y; p.z = sp.z;
   setLastLadderLanding(state, sp);
-  state.disengageGrace = {};
-  const combat = ensureCombatState(state);
-  combat.lastEventMs = 0;
-  combat.regenAnchorMs = Date.now();
-  combat.hudTargets = {};
 
   if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
   ensureSurfaceLinkTile(state);
@@ -17746,12 +17797,7 @@ btnRespawnEl?.addEventListener("click", async () => {
     return;
   }
   if (relocatePlayerToLastLadderLanding(game)) {
-    game.player.hp = game.player.maxHp;
-    game.player.effects = [];
-    const combat = ensureCombatState(game);
-    combat.lastEventMs = 0;
-    combat.regenAnchorMs = Date.now();
-    combat.hudTargets = {};
+    applyRespawnRecoveryState(game);
     pushLog(game, "No autosave found. You awaken at your last savepoint.");
     saveNow(game);
     return;

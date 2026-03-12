@@ -124,6 +124,42 @@ function current_request_base_url(): ?string
   return sprintf('%s://%s%s', $scheme, $host, $path);
 }
 
+function is_same_origin_request(): bool
+{
+  $rawHost = strtolower(trim((string) ($_SERVER['HTTP_HOST'] ?? '')));
+  if ($rawHost === '') {
+    return false;
+  }
+  $host = preg_replace('/:\d+$/', '', $rawHost);
+  if (!is_string($host) || $host === '') {
+    return false;
+  }
+
+  $reqScheme = 'http';
+  $forwardedProto = trim((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+  if ($forwardedProto !== '') {
+    $reqScheme = strtolower(trim(explode(',', $forwardedProto)[0]));
+  } elseif (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') {
+    $reqScheme = 'https';
+  }
+
+  $origin = trim((string) ($_SERVER['HTTP_ORIGIN'] ?? ''));
+  $referer = trim((string) ($_SERVER['HTTP_REFERER'] ?? ''));
+  $candidate = $origin !== '' ? $origin : $referer;
+  if ($candidate === '') {
+    return false;
+  }
+  $candidateHost = strtolower(trim((string) (parse_url($candidate, PHP_URL_HOST) ?? '')));
+  if ($candidateHost === '' || !hash_equals($host, $candidateHost)) {
+    return false;
+  }
+  $candidateScheme = strtolower(trim((string) (parse_url($candidate, PHP_URL_SCHEME) ?? '')));
+  if ($candidateScheme !== '' && $candidateScheme !== $reqScheme) {
+    return false;
+  }
+  return true;
+}
+
 function local_auth_secret(): string
 {
   $secret = trim((string) (getenv('LOCAL_AUTH_SECRET') ?: ''));
@@ -2702,7 +2738,8 @@ if ($apiMode === 'savegames') {
   }
 
   $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
-  if ($csrfHeader === '' || !hash_equals($saveGamesCsrf, $csrfHeader)) {
+  $csrfValid = $csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader);
+  if (!$csrfValid && !is_same_origin_request()) {
     json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
   }
 
