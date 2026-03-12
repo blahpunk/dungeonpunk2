@@ -427,20 +427,6 @@
       "xp": 23,
       "glyph": "s",
       "sizeGrowth": true
-    },
-    "slime": {
-      "id": "slime",
-      "name": "Slime",
-      "aliasOf": "slime_yellow",
-      "glyph": "s",
-      "sizeGrowth": true
-    },
-    "jelly": {
-      "id": "jelly",
-      "name": "Slime",
-      "aliasOf": "slime_yellow",
-      "glyph": "s",
-      "sizeGrowth": true
     }
   },
   "spawn_rules": [

@@ -49,6 +49,10 @@ const STAIRS_DOWN = ">";
 const STAIRS_UP = "<";
 const SURFACE_LEVEL = -1;
 const SURFACE_HALF_SIZE = 22;
+const DEBUG_ROSTER_LEFT_RIGHT_PADDING = 5;
+const DEBUG_ROSTER_FIRST_ROW_OFFSET = 5;
+const DEBUG_ROSTER_CELL_GAP = 4;
+const DEBUG_ROSTER_ID_PREFIX = "dbg_roster|";
 
 const KEY_RED = "key_red";
 const KEY_GREEN = "key_green";
@@ -1560,6 +1564,12 @@ const debugDepthInputEl = document.getElementById("debugDepthInput");
 const debugDepthGoEl = document.getElementById("debugDepthGo");
 const debugLevelInputEl = document.getElementById("debugLevelInput");
 const debugLevelGoEl = document.getElementById("debugLevelGo");
+const debugClearRadiusInputEl = document.getElementById("debugClearRadiusInput");
+const debugClearGoEl = document.getElementById("debugClearGo");
+const debugRosterGoEl = document.getElementById("debugRosterGo");
+const debugQuickSwitchClassEl = document.getElementById("debugQuickSwitchClass");
+const debugQuickSwitchGoEl = document.getElementById("debugQuickSwitchGo");
+const debugQuickSwitchStatusEl = document.getElementById("debugQuickSwitchStatus");
 const mainCanvasWrapEl = document.getElementById("mainCanvasWrap");
 const surfaceCompassEl = document.getElementById("surfaceCompass");
 const surfaceCompassArrowEl = document.getElementById("surfaceCompassArrow");
@@ -1754,7 +1764,7 @@ let hydrationStateRef = null;
 let hydrationSig = "";
 let occupancyStateRef = null;
 let occupancySig = "";
-let occupancyCache = { monsters: new Map(), items: new Map(), traps: new Map() };
+let occupancyCache = { monsters: new Map(), items: new Map(), traps: new Map(), actors: new Map() };
 
 function maybeAdjustVisualQuality(frameMs) {
   if (!Number.isFinite(frameMs) || frameMs <= 0) return;
@@ -1816,6 +1826,93 @@ function stateDebug(state) {
 function canUseAdminControls() {
   return !!canAdminControls;
 }
+function ensureQuickSwitchState(state) {
+  if (!state || typeof state !== "object") return null;
+  if (!state.quickSwitch || typeof state.quickSwitch !== "object") {
+    state.quickSwitch = {
+      active: false,
+      baseCharacterId: "",
+      baseClassId: "",
+      baseSpeciesId: "",
+      baseName: "",
+      startedAt: 0,
+    };
+  }
+  const qs = state.quickSwitch;
+  qs.active = !!qs.active;
+  qs.baseCharacterId = String(qs.baseCharacterId ?? "");
+  qs.baseClassId = String(qs.baseClassId ?? "");
+  qs.baseSpeciesId = String(qs.baseSpeciesId ?? "");
+  qs.baseName = String(qs.baseName ?? "");
+  qs.startedAt = Number.isFinite(qs.startedAt) ? Math.floor(qs.startedAt) : 0;
+  return qs;
+}
+function isQuickSwitchCharacterActive(state) {
+  if (!state || typeof state !== "object") return false;
+  return !!state?.quickSwitch?.active;
+}
+function clearQuickSwitchCharacterState(state) {
+  const qs = ensureQuickSwitchState(state);
+  if (!qs) return false;
+  const changed = qs.active || qs.baseCharacterId || qs.baseClassId || qs.baseSpeciesId || qs.baseName || qs.startedAt;
+  qs.active = false;
+  qs.baseCharacterId = "";
+  qs.baseClassId = "";
+  qs.baseSpeciesId = "";
+  qs.baseName = "";
+  qs.startedAt = 0;
+  const profile = state?.character;
+  if (profile && typeof profile === "object" && typeof profile.name === "string") {
+    profile.name = profile.name.replace(/\s+\[Quick\]\s*$/i, "");
+  }
+  return !!changed;
+}
+function clearQuickSwitchPersistenceRuntime() {
+  clearSaveDirty();
+  saveRuntime.pendingAutosaveReason = "";
+  if (characterSyncRuntime.timer) {
+    clearTimeout(characterSyncRuntime.timer);
+    characterSyncRuntime.timer = 0;
+  }
+  characterSyncRuntime.dirty = false;
+  characterSyncRuntime.reason = "";
+}
+function quickSwitchClassLabel(classId = "") {
+  const cls = characterClassDef(classId);
+  const species = characterSpeciesDef(cls?.speciesId ?? "");
+  return `${species?.name ?? "Unknown"} ${cls?.name ?? classId}`;
+}
+function ensureDebugQuickSwitchClassOptions() {
+  if (!debugQuickSwitchClassEl) return;
+  if (debugQuickSwitchClassEl.options.length > 0) return;
+  const entries = Object.values(CLASS_DEFS)
+    .slice()
+    .sort((a, b) => {
+      const aSpecies = characterSpeciesDef(a?.speciesId ?? "").name;
+      const bSpecies = characterSpeciesDef(b?.speciesId ?? "").name;
+      return aSpecies.localeCompare(bSpecies) || String(a?.name ?? "").localeCompare(String(b?.name ?? ""));
+    });
+  for (const entry of entries) {
+    if (!entry?.id) continue;
+    const species = characterSpeciesDef(entry.speciesId ?? "");
+    const opt = document.createElement("option");
+    opt.value = entry.id;
+    opt.textContent = `${species?.name ?? "Unknown"} - ${entry.name ?? entry.id}`;
+    debugQuickSwitchClassEl.appendChild(opt);
+  }
+}
+function updateDebugQuickSwitchStatus(state) {
+  if (!debugQuickSwitchStatusEl) return;
+  const active = isQuickSwitchCharacterActive(state);
+  if (!active) {
+    debugQuickSwitchStatusEl.textContent = "Quick characters are temporary and never saved.";
+    debugQuickSwitchStatusEl.classList.remove("active");
+    return;
+  }
+  const classId = normalizeCharacterClassId(state?.player?.classId ?? state?.character?.classId ?? "");
+  debugQuickSwitchStatusEl.textContent = `Quick active: ${quickSwitchClassLabel(classId)} (not saved). Load a real character to switch back.`;
+  debugQuickSwitchStatusEl.classList.add("active");
+}
 function enforceAdminControlPolicy(state) {
   if (!state || canUseAdminControls()) return false;
   const d = stateDebug(state);
@@ -1861,6 +1958,18 @@ function updateDebugMenuUi(state) {
   if (toggleLockpickEl) toggleLockpickEl.checked = d.lockpick;
   if (debugDepthInputEl) debugDepthInputEl.value = `${state?.player?.z ?? 0}`;
   if (debugLevelInputEl) debugLevelInputEl.value = `${Math.max(1, Math.floor(state?.player?.level ?? 1))}`;
+  if (debugClearRadiusInputEl) {
+    const raw = Number(debugClearRadiusInputEl.value ?? "");
+    if (!Number.isFinite(raw) || raw <= 0) debugClearRadiusInputEl.value = "10";
+  }
+  ensureDebugQuickSwitchClassOptions();
+  if (debugQuickSwitchClassEl && document.activeElement !== debugQuickSwitchClassEl) {
+    const classId = normalizeCharacterClassId(state?.player?.classId ?? state?.character?.classId ?? DEFAULT_CHARACTER_CLASS_ID);
+    if (classId && Array.from(debugQuickSwitchClassEl.options).some((opt) => opt.value === classId)) {
+      debugQuickSwitchClassEl.value = classId;
+    }
+  }
+  updateDebugQuickSwitchStatus(state);
 }
 
 function spawnDebugObjectByKey(state, key) {
@@ -1917,6 +2026,32 @@ function spawnDebugObjectByKey(state, key) {
     state.dynamic.set(id, ent);
     state.entities.set(id, ent);
     pushLog(state, `Debug: spawned ${monsterDisplayName(monsterType, targetZ)} at (${targetX}, ${targetY}, ${targetZ}).`);
+  } else if (spawnKey.startsWith("actor:")) {
+    const rawSpriteId = spawnKey.slice(6).trim();
+    let spriteId = rawSpriteId;
+    if (!spriteId || !SPRITE_SOURCES[spriteId]) {
+      spriteId = SPRITE_SOURCES.hero ? "hero" : (Object.keys(SPRITE_SOURCES)[0] ?? "");
+    }
+    if (!spriteId) {
+      pushLog(state, "No actor sprite is available to spawn.");
+      return false;
+    }
+    if (!state.world.isPassable(targetX, targetY, targetZ)) state.world.setTile(targetX, targetY, targetZ, FLOOR);
+    const id = `dbg_a|${spriteId}|${targetZ}|${targetX},${targetY}|${now}|${Math.floor(Math.random() * 1e9)}`;
+    const ent = {
+      id,
+      origin: "dynamic",
+      kind: "actor",
+      type: "hero_actor",
+      spriteId,
+      x: targetX,
+      y: targetY,
+      z: targetZ,
+      ai: "none",
+    };
+    state.dynamic.set(id, ent);
+    state.entities.set(id, ent);
+    pushLog(state, `Debug: spawned actor sprite ${spriteId} at (${targetX}, ${targetY}, ${targetZ}).`);
   } else {
     pushLog(state, "Unknown spawn object selection.");
     return false;
@@ -1925,6 +2060,180 @@ function spawnDebugObjectByKey(state, key) {
   updateContextActionButton(state);
   updateDebugMenuUi(state);
   saveNow(state);
+  return true;
+}
+function removeEntityByAdminAction(state, ent) {
+  if (!state || !ent) return false;
+  if (ent.origin === "base") {
+    state.removedIds.add(ent.id);
+    state.entityOverrides.delete(ent.id);
+  } else if (ent.origin === "dynamic") {
+    state.dynamic.delete(ent.id);
+  }
+  state.entities.delete(ent.id);
+  return true;
+}
+function clearMonstersAndActorsAroundPlayer(state, radius = 10) {
+  if (!canUseAdminControls()) return { radius: 0, monsterCount: 0, actorCount: 0 };
+  const p = state?.player;
+  if (!state || !p || p.dead) return { radius: 0, monsterCount: 0, actorCount: 0 };
+  const rad = clamp(Math.floor(Number(radius) || 0), 1, 120);
+  const radSq = rad * rad;
+  let monsterCount = 0;
+  let actorCount = 0;
+  for (const ent of Array.from(state.entities.values())) {
+    if (!ent || ent.z !== p.z) continue;
+    if (ent.kind !== "monster" && ent.kind !== "actor") continue;
+    const dx = (ent.x ?? 0) - p.x;
+    const dy = (ent.y ?? 0) - p.y;
+    if (dx * dx + dy * dy > radSq) continue;
+    if (!removeEntityByAdminAction(state, ent)) continue;
+    if (ent.kind === "monster") monsterCount += 1;
+    else actorCount += 1;
+  }
+  if (monsterCount > 0 || actorCount > 0) {
+    hydrateNearby(state);
+    updateContextActionButton(state);
+    updateDeathOverlay(state);
+    saveNow(state);
+  }
+  return { radius: rad, monsterCount, actorCount };
+}
+function debugMonsterRosterTypes() {
+  return Object.entries(MONSTER_TYPES ?? {})
+    .filter(([id, spec]) => typeof id === "string" && id && !!spec && typeof spec === "object")
+    .sort((a, b) => {
+      const aName = String(a[1]?.name ?? a[0]);
+      const bName = String(b[1]?.name ?? b[0]);
+      return aName.localeCompare(bName) || a[0].localeCompare(b[0]);
+    })
+    .map(([id]) => id);
+}
+function clearDebugMonsterRoster(state) {
+  if (!state?.entities) return 0;
+  let removed = 0;
+  for (const ent of Array.from(state.entities.values())) {
+    if (!ent || typeof ent.id !== "string") continue;
+    if (!ent.id.startsWith(DEBUG_ROSTER_ID_PREFIX)) continue;
+    if (!removeEntityByAdminAction(state, ent)) continue;
+    removed += 1;
+  }
+  return removed;
+}
+function spawnMonsterRosterOnSurface(state) {
+  if (!canUseAdminControls()) return { total: 0, spawned: 0, removed: 0, truncated: false };
+  const p = state?.player;
+  if (!state || !p || p.dead) return { total: 0, spawned: 0, removed: 0, truncated: false };
+
+  const rosterTypes = debugMonsterRosterTypes();
+  const total = rosterTypes.length;
+  const removed = clearDebugMonsterRoster(state);
+  if (!total) return { total, spawned: 0, removed, truncated: false };
+
+  state.world.ensureChunksAround(0, 0, SURFACE_LEVEL, SURFACE_HALF_SIZE + 2);
+  const minX = (-SURFACE_HALF_SIZE + 1) + DEBUG_ROSTER_LEFT_RIGHT_PADDING;
+  const maxX = (SURFACE_HALF_SIZE - 1) - DEBUG_ROSTER_LEFT_RIGHT_PADDING;
+  const startY = (-SURFACE_HALF_SIZE + 1) + DEBUG_ROSTER_FIRST_ROW_OFFSET;
+  const maxY = SURFACE_HALF_SIZE - 1;
+  const step = DEBUG_ROSTER_CELL_GAP + 1;
+  if (minX > maxX || startY > maxY) {
+    return { total, spawned: 0, removed, truncated: total > 0 };
+  }
+
+  const batch = `${Date.now()}|${Math.floor(Math.random() * 1e9)}`;
+  let x = minX;
+  let y = startY;
+  let spawned = 0;
+
+  for (const type of rosterTypes) {
+    if (x > maxX) {
+      x = minX;
+      y += step;
+    }
+    if (y > maxY) break;
+    if (!state.world.isPassable(x, y, SURFACE_LEVEL)) state.world.setTile(x, y, SURFACE_LEVEL, FLOOR);
+    const spec = monsterStatsForDepth(type, SURFACE_LEVEL);
+    const id = `${DEBUG_ROSTER_ID_PREFIX}${batch}|${spawned}|${type}|${x},${y}`;
+    const ent = {
+      id,
+      origin: "dynamic",
+      kind: "monster",
+      type,
+      x,
+      y,
+      z: SURFACE_LEVEL,
+      hp: spec.maxHp,
+      maxHp: spec.maxHp,
+      awake: false,
+      cd: 0,
+      abilityCd: 0,
+    };
+    state.dynamic.set(id, ent);
+    state.entities.set(id, ent);
+    spawned += 1;
+    x += step;
+  }
+
+  if (removed > 0 || spawned > 0) {
+    hydrateNearby(state);
+    updateContextActionButton(state);
+    updateDeathOverlay(state);
+    saveNow(state);
+  }
+  return { total, spawned, removed, truncated: spawned < total };
+}
+function applyQuickSwitchClass(state, classId) {
+  if (!canUseAdminControls()) return false;
+  if (!state?.player || state.player.dead) return false;
+  const requestedClass = normalizeCharacterClassId(classId);
+  const classDef = CLASS_DEFS[requestedClass];
+  if (!classDef) return false;
+  const speciesId = normalizeCharacterSpeciesId(classDef.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID);
+  const nextClassId = normalizeCharacterClassId(requestedClass, speciesId);
+  const p = state.player;
+  const profile = ensureCharacterState(state);
+  const qs = ensureQuickSwitchState(state);
+  if (qs && !qs.active) {
+    qs.active = true;
+    qs.baseCharacterId = String(profile.id ?? "");
+    qs.baseClassId = normalizeCharacterClassId(profile.classId, profile.speciesId);
+    qs.baseSpeciesId = normalizeCharacterSpeciesId(profile.speciesId);
+    qs.baseName = String(profile.name ?? "");
+    qs.startedAt = Date.now();
+  }
+  const prevMaxHp = Math.max(1, Math.floor(p.maxHp ?? maxHpForLevel(Math.max(1, p.level ?? 1), profile)));
+  const hpRatio = clamp((p.hp ?? prevMaxHp) / prevMaxHp, 0, 1);
+
+  profile.classId = nextClassId;
+  profile.speciesId = speciesId;
+  profile.stats = normalizeCharacterStats(profile.stats, speciesId);
+  if (typeof profile.name === "string") {
+    profile.name = profile.name.replace(/\s+\[Quick\]\s*$/i, "");
+    profile.name = `${profile.name || DEFAULT_CHARACTER_NAME} [Quick]`;
+  } else {
+    profile.name = `${DEFAULT_CHARACTER_NAME} [Quick]`;
+  }
+
+  p.classId = nextClassId;
+  p.speciesId = speciesId;
+  p.equip = normalizeEquip(p.equip ?? {}, { speciesId, classId: nextClassId });
+  p.effects = [];
+  p.attackAfterMove = false;
+  p.combatFirstStrikeReady = true;
+  p.slipbladeBonusReady = false;
+  p.overclockUntilMs = 0;
+  p.dead = false;
+
+  recalcDerivedStats(state);
+  p.hp = clamp(Math.round((p.maxHp ?? 1) * hpRatio), 0, p.maxHp ?? 1);
+  clearQuickSwitchPersistenceRuntime();
+  renderInventory(state);
+  renderEquipment(state);
+  renderEffects(state);
+  updateContextActionButton(state);
+  updateDeathOverlay(state);
+  updateDebugMenuUi(state);
+  pushLog(state, `Quick Switch: now testing ${quickSwitchClassLabel(nextClassId)}. This character will not be saved.`);
   return true;
 }
 function setDebugFlag(state, key, enabled) {
@@ -3394,8 +3703,6 @@ const FALLBACK_MONSTERS_MIN = {
     name: "Yellow Slime",
     baseHp: 26, baseAtk: 10, baseDef: 3, baseAcc: 68, baseEva: 11, spd: 1.0, xp: 6, glyph: "s", sizeGrowth: true,
   },
-  slime: { id: "slime", name: "Slime", aliasOf: "slime_yellow", glyph: "s", sizeGrowth: true },
-  jelly: { id: "jelly", name: "Slime", aliasOf: "slime_yellow", glyph: "s", sizeGrowth: true },
 };
 const MONSTER_TYPES = JSON.parse(JSON.stringify(FALLBACK_MONSTERS_MIN));
 const VOID_ALIGNED_MONSTER_IDS = new Set([
@@ -3429,6 +3736,7 @@ function monsterSizeTier(depth, spec) {
 function normalizeMonsterTypeId(type) {
   const id = String(type ?? "").trim();
   if (!id) return "";
+  if (id === "slime" || id === "jelly") return "slime_yellow";
   if (id === "jelly_green") return "slime_green";
   if (id === "jelly_yellow") return "slime_yellow";
   if (id === "jelly_red") return "slime_red";
@@ -5087,8 +5395,12 @@ function renderShopOverlay(state) {
       btn.type = "button";
       btn.className = `shopItemBtn${idx === selectedIdx ? " active" : ""}`;
       const nm = ITEM_TYPES[entry.type]?.name ?? entry.type;
-      if (isBuyMode) btn.textContent = `${idx + 1}. ${nm} x${Math.max(1, entry.amount ?? 1)} - ${entry.price}g`;
-      else btn.textContent = `${idx + 1}. ${nm} x${entry.amount} - ${entry.price}g`;
+      const equipValidation = (entry.type.startsWith("weapon_") || entry.type.startsWith("armor_"))
+        ? canPlayerEquipItemType(state, entry.type)
+        : { ok: true, reason: "" };
+      const unusableBadge = equipValidation.ok ? "" : " [Unusable]";
+      if (isBuyMode) btn.textContent = `${idx + 1}. ${nm}${unusableBadge} x${Math.max(1, entry.amount ?? 1)} - ${entry.price}g`;
+      else btn.textContent = `${idx + 1}. ${nm}${unusableBadge} x${entry.amount} - ${entry.price}g`;
       btn.addEventListener("click", () => {
         if (isBuyMode) shopUi.selectedBuy = idx;
         else shopUi.selectedSell = idx;
@@ -5269,8 +5581,11 @@ function monsterTableForDepth(z) {
 }
 
 function normalizeMonsterEditorId(raw) {
-  const id = String(raw ?? "").trim().toLowerCase();
+  let id = String(raw ?? "").trim().toLowerCase();
   if (!/^[a-z0-9_]{1,80}$/.test(id)) return null;
+  if (id === "slime" || id === "jelly" || id === "jelly_yellow") id = "slime_yellow";
+  else if (id === "jelly_green") id = "slime_green";
+  else if (id === "jelly_red") id = "slime_red";
   return id;
 }
 
@@ -6145,7 +6460,7 @@ function refreshSaveNameFromLive(force = false) {
 
 function prepareGuestLoginHandoff(state = null) {
   const run = state ?? game;
-  if (run) {
+  if (run && !isQuickSwitchCharacterActive(run)) {
     try { localStorage.setItem(SAVE_KEY, exportSave(run)); } catch {}
   }
   try {
@@ -6311,6 +6626,10 @@ async function fetchCharacterSlotsFromLocal() {
 
 function markSaveDirty(state, reason = "") {
   if (!state) return;
+  if (isQuickSwitchCharacterActive(state)) {
+    saveRuntime.pendingAutosaveReason = "";
+    return;
+  }
   saveRuntime.dirty = true;
   saveRuntime.dirtyReason = String(reason || "state-change");
   saveRuntime.lastDirtyAt = Date.now();
@@ -6331,6 +6650,7 @@ function clearSaveDirty() {
 
 async function saveCurrentGameToLocalSlot(slotId = "", nameOverride = "") {
   if (isAuthenticatedUser || !game) return false;
+  if (isQuickSwitchCharacterActive(game)) return false;
   const id = normalizeCharacterSlotId(slotId || getActiveCharacterSlotId() || "") || `slot_${Date.now().toString(36)}`;
   const profile = ensureCharacterState(game);
   const className = characterClassDef(profile.classId).name;
@@ -6348,6 +6668,10 @@ async function saveCurrentGameToLocalSlot(slotId = "", nameOverride = "") {
 }
 
 async function autosaveIfDirty(reason = "") {
+  if (isQuickSwitchCharacterActive(game)) {
+    clearQuickSwitchPersistenceRuntime();
+    return true;
+  }
   if (!game || !saveRuntime.dirty || saveRuntime.saving) return true;
   saveRuntime.saving = true;
   try {
@@ -6490,6 +6814,15 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
 }
 
 async function syncCharacterStateIfDirty(reason = "") {
+  if (isQuickSwitchCharacterActive(game)) {
+    characterSyncRuntime.dirty = false;
+    characterSyncRuntime.reason = "";
+    if (characterSyncRuntime.timer) {
+      clearTimeout(characterSyncRuntime.timer);
+      characterSyncRuntime.timer = 0;
+    }
+    return true;
+  }
   if (!game || characterSyncRuntime.syncing || !characterSyncRuntime.dirty) return true;
   const profile = ensureCharacterState(game);
   if (!profile?.id) return false;
@@ -6525,6 +6858,7 @@ async function syncCharacterStateIfDirty(reason = "") {
 
 function markCharacterStateDirty(state, reason = "") {
   if (!state) return;
+  if (isQuickSwitchCharacterActive(state)) return;
   characterSyncRuntime.dirty = true;
   characterSyncRuntime.reason = String(reason || "state-change");
   if (characterSyncRuntime.timer) {
@@ -6543,6 +6877,7 @@ function applyCharacterSnapshot(state, snapshot) {
   const snapPlayer = snapshot.player ?? {};
   const profile = normalizeCharacterProfile(snapshot.character ?? null);
   state.character = profile;
+  clearQuickSwitchCharacterState(state);
 
   p.level = Math.max(1, Math.floor(snapPlayer.level ?? p.level ?? 1));
   p.xp = Math.max(0, Math.floor(snapPlayer.xp ?? p.xp ?? 0));
@@ -6583,7 +6918,9 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const forceEntrance = opts.forceEntrance === true;
   const currentId = String(getActiveCharacterSlotId() ?? "");
-  if (currentId && currentId === id) return true;
+  // In Quick Switch mode we must still reload even if slot id matches,
+  // otherwise the temporary test class cannot be reverted.
+  if (currentId && currentId === id && !isQuickSwitchCharacterActive(game)) return true;
 
   const saved = await autosaveIfDirty("switch-character");
   if (!saved && game) {
@@ -6668,7 +7005,9 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId) {
   const id = String(slotId ?? "").trim();
   if (!id || !game) return false;
   const currentId = String(getActiveCharacterSlotId() ?? "");
-  if (currentId && currentId === id) return true;
+  // In Quick Switch mode we must still reload even if slot id matches,
+  // otherwise the temporary test class cannot be reverted.
+  if (currentId && currentId === id && !isQuickSwitchCharacterActive(game)) return true;
 
   const saved = await autosaveIfDirty("swap-character");
   if (!saved && game) {
@@ -6894,6 +7233,7 @@ async function loadSaveFromServer(saveId, options = null) {
   const showStatus = opts.showStatus !== false;
   const closeOverlay = opts.closeOverlay !== false;
   const forceEntrance = opts.forceEntrance === true;
+  const requireAlive = opts.requireAlive === true;
   saveMenuUi.loading = true;
   renderSaveGameOverlay();
   if (showStatus) setSaveGameStatus("Loading save...", false);
@@ -6904,6 +7244,9 @@ async function loadSaveFromServer(saveId, options = null) {
     const loaded = importSave(payload);
     if (!loaded) {
       throw new Error("Save payload is invalid.");
+    }
+    if (requireAlive && loaded?.player?.dead) {
+      throw new Error("Autosave is from a dead state.");
     }
     game = loaded;
     const targetCharacterId = activeCharacterId || normalizeCharacterProfileId(loaded?.character?.id ?? "");
@@ -6942,6 +7285,10 @@ async function loadSaveFromServer(saveId, options = null) {
 
 async function saveCurrentGameToServer(overwriteId = "", options = null) {
   if (!isAuthenticatedUser || !game) return false;
+  if (isQuickSwitchCharacterActive(game)) {
+    setSaveGameStatus("Quick Switch character cannot be saved. Load your real character first.", true);
+    return false;
+  }
   const opts = (options && typeof options === "object") ? options : {};
   const useAutosaveName = opts.autosave === true;
   const forceName = String(opts.forceName ?? "").trim();
@@ -8041,6 +8388,69 @@ async function loadLatestAccountRunAfterGuestDecline() {
     if (loadedCharacter) return true;
   }
   return false;
+}
+function activateLoadedRunStateForRespawn(loaded, reason = "respawn-autosave") {
+  if (!loaded?.player || !loaded?.world) return false;
+  game = loaded;
+  enforceAdminControlPolicy(game);
+  updateDebugMenuUi(game);
+  setDebugMenuOpen(false);
+  updateContextActionButton(game);
+  updateDeathOverlay(game);
+  refreshSaveNameFromLive(true);
+  clearSaveDirty();
+  markCharacterStateDirty(game, reason);
+  void syncCharacterStateIfDirty(reason);
+  return true;
+}
+function loadLocalAutosaveForRespawn() {
+  try {
+    const payload = localStorage.getItem(SAVE_KEY);
+    if (!payload) return false;
+    const loaded = importSave(payload);
+    if (!loaded || loaded?.player?.dead) return false;
+    return activateLoadedRunStateForRespawn(loaded);
+  } catch {
+    return false;
+  }
+}
+async function loadLatestAutosaveForRespawn() {
+  if (!game?.player?.dead) return false;
+
+  if (isAuthenticatedUser) {
+    const activeRunSaveId = String(saveRuntime.activeRunSaveId ?? "").trim();
+    if (activeRunSaveId) {
+      const loadedActive = await loadSaveFromServer(activeRunSaveId, {
+        showStatus: false,
+        closeOverlay: false,
+        forceEntrance: false,
+        requireAlive: true,
+      });
+      if (loadedActive && !game?.player?.dead) return true;
+    }
+    try {
+      const data = await saveApiRequest("GET");
+      const saves = Array.isArray(data?.saves) ? [...data.saves] : [];
+      saves.sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
+      const autosave = saves.find((save) => saveNameLooksLikeAutosave(save?.name ?? ""));
+      const fallback = saves[0] ?? null;
+      const tried = new Set();
+      for (const candidate of [autosave, fallback]) {
+        const id = String(candidate?.id ?? "").trim();
+        if (!id || tried.has(id)) continue;
+        tried.add(id);
+        const loaded = await loadSaveFromServer(id, {
+          showStatus: false,
+          closeOverlay: false,
+          forceEntrance: false,
+          requireAlive: true,
+        });
+        if (loaded && !game?.player?.dead) return true;
+      }
+    } catch {}
+  }
+
+  return loadLocalAutosaveForRespawn();
 }
 
 async function importGuestCharacterFromCurrentRun(options = null) {
@@ -9580,6 +9990,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     combat: { lastEventMs: 0, regenAnchorMs: Date.now(), hudTargets: {} },
     disengageGrace: {},
     areaRespawn: { currentAreaKey: "", schedules: {} },
+    quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
     debug: normalizeDebugFlags(),
   };
 
@@ -9760,6 +10171,7 @@ function buildOccupancy(state) {
   const monsters = new Map();
   const items = new Map();
   const traps = new Map();
+  const actors = new Map();
   const pz = state.player.z;
   for (const e of state.entities.values()) {
     if (e.z !== pz) continue;
@@ -9767,14 +10179,15 @@ function buildOccupancy(state) {
     if (e.kind === "monster") monsters.set(k, e.id);
     else if (e.kind === "item") items.set(k, e.id);
     else if (e.kind === "trap") traps.set(k, e.id);
+    else if (e.kind === "actor") actors.set(k, e.id);
   }
-  return { monsters, items, traps };
+  return { monsters, items, traps, actors };
 }
 function getCachedOccupancy(state) {
   if (occupancyStateRef !== state) {
     occupancyStateRef = state;
     occupancySig = "";
-    occupancyCache = { monsters: new Map(), items: new Map(), traps: new Map() };
+    occupancyCache = { monsters: new Map(), items: new Map(), traps: new Map(), actors: new Map() };
   }
   const sig = `${state.turn ?? 0}|${state.player.z}|${state.entities.size}`;
   if (sig !== occupancySig) {
@@ -12268,14 +12681,12 @@ function getSpriteIfReady(id) {
   return spriteProcessed[id] ?? spriteImages[id] ?? null;
 }
 const MONSTER_SPRITE_FALLBACKS = {
-  slime: "slime_yellow",
   slime_green: "slime_green",
   slime_yellow: "slime_yellow",
   slime_orange: "slime_orange",
   slime_red: "slime_red",
   slime_violet: "slime_violet",
   slime_indigo: "slime_indigo",
-  jelly: "slime_yellow",
   hobgoblin: "goblin",
   dire_wolf: "rat",
   cave_troll: "goblin",
@@ -13049,7 +13460,7 @@ function monsterGlyph(type) {
   if (type === "deepcore_ballista_sentinel") return { g: "D", c: "#d69f8a" };
   if (type === "singularity_hunter") return { g: "Q", c: "#b386ff" };
   if (type === "slime_green") return { g: "s", c: "#79ff79" };
-  if (type === "slime_yellow" || type === "slime" || type === "jelly") return { g: "s", c: "#ffd966" };
+  if (type === "slime_yellow") return { g: "s", c: "#ffd966" };
   if (type === "slime_orange") return { g: "s", c: "#ffb266" };
   if (type === "slime_red") return { g: "s", c: "#ff7b7b" };
   if (type === "slime_violet") return { g: "s", c: "#c79bff" };
@@ -14401,6 +14812,11 @@ async function processItemAuthorityMutationQueue(state) {
           itemAuthorityRuntime.revision = Math.max(0, Math.floor(curRev));
           continue;
         }
+        if (code === "ITEM_STATE_MISSING_ITEM") {
+          itemAuthorityRuntime.ready = false;
+          if (Number.isFinite(curRev)) itemAuthorityRuntime.revision = Math.max(0, Math.floor(curRev));
+          continue;
+        }
         itemAuthorityRuntime.lastError = String(err?.message ?? "item-mutation-failed");
         pushLog(state, `Item authority sync failed: ${itemAuthorityRuntime.lastError}`);
         break;
@@ -15073,16 +15489,19 @@ function setSpriteEditorOverlayOpen(open) {
 
 function isSpawnableSpriteEditorObject(entry) {
   const objectId = String(entry?.objectId ?? "");
-  return !!ITEM_TYPES[objectId] || !!MONSTER_TYPES[objectId];
+  if (!!ITEM_TYPES[objectId] || !!MONSTER_TYPES[objectId]) return true;
+  return entry?.category === "actor";
 }
 
 function spawnSpriteEditorObject(state, entry) {
   if (!canUseAdminControls()) return false;
   if (!state || !entry) return false;
   const objectId = String(entry.objectId ?? "");
+  const display = resolveSpriteDisplayForEntry(entry);
+  const actorSpriteId = display.spriteId || entry.spriteId || "hero";
   const key = ITEM_TYPES[objectId]
     ? `item:${objectId}`
-    : (MONSTER_TYPES[objectId] ? `monster:${objectId}` : "");
+    : (MONSTER_TYPES[objectId] ? `monster:${objectId}` : (entry?.category === "actor" ? `actor:${actorSpriteId}` : ""));
   if (!key) {
     setSpriteEditorStatus(`Spawn is not supported for ${objectId}.`, true);
     return false;
@@ -15486,7 +15905,7 @@ function draw(state) {
   syncMobileUi();
 
   const { world, player, seen, visible } = state;
-  const { monsters, items, traps } = getCachedOccupancy(state);
+  const { monsters, items, traps, actors } = getCachedOccupancy(state);
   updateContextActionButton(state, { monsters, items, traps });
   const theme = applyVisibilityBoostToTheme(themeForDepth(player.z, world.seedStr ?? ""));
   const timeSec = Date.now() / 1000;
@@ -15624,6 +16043,7 @@ function draw(state) {
       if (isVisible || !fogEnabled) {
         const mk = monsters.get(occKey);
         const ik = items.get(occKey);
+        const ak = actors.get(occKey);
 
         if (ik) {
           const ent = state.entities.get(ik);
@@ -15744,6 +16164,34 @@ function draw(state) {
                 color: gm.c,
               });
             }
+          }
+        }
+        if (ak) {
+          const ent = state.entities.get(ak);
+          const actorSpriteIdValue = (ent?.spriteId && SPRITE_SOURCES[ent.spriteId]) ? ent.spriteId : (SPRITE_SOURCES.hero ? "hero" : "");
+          const actorSprite = actorSpriteIdValue ? getSpriteIfReady(actorSpriteIdValue) : null;
+          if (actorSprite) {
+            deferredWorldObjects.push({
+              kind: "actor-sprite",
+              sortY: wy,
+              sortX: wx,
+              order: 1.5,
+              sx,
+              sy,
+              img: actorSprite,
+              spriteId: actorSpriteIdValue,
+            });
+          } else {
+            deferredWorldObjects.push({
+              kind: "glyph",
+              sortY: wy,
+              sortX: wx,
+              order: 1.5,
+              sx,
+              sy,
+              glyph: "@",
+              color: "#d6ebff",
+            });
           }
         }
       }
@@ -15869,6 +16317,16 @@ function draw(state) {
       const bob = Math.sin(timeSec * 2 + (obj.sortX + obj.sortY) * 0.65) * TILE * 0.008;
       drawSoftGlow(ctx, cx, cy, MONSTER_GLOW_RADIUS, "rgba(255,120,90,0.20)", "rgba(255,120,90,0)");
       const size = scaledSpriteSize(MONSTER_SPRITE_SIZE, obj.spriteId);
+      drawBottomAnchoredSpriteAt(ctx, cx, footY, obj.img, size, size, bob);
+      continue;
+    }
+    if (obj.kind === "actor-sprite") {
+      const cx = obj.sx * TILE + TILE / 2;
+      const footY = (obj.sy + 1) * TILE;
+      const cy = footY - TILE * 0.5;
+      const bob = Math.sin(timeSec * 1.7 + (obj.sortX + obj.sortY) * 0.45) * TILE * 0.005;
+      drawSoftGlow(ctx, cx, cy, HERO_GLOW_RADIUS * 0.72, "rgba(120,220,255,0.14)", "rgba(120,220,255,0)");
+      const size = scaledSpriteSize(PLAYER_SPRITE_SIZE, obj.spriteId);
       drawBottomAnchoredSpriteAt(ctx, cx, footY, obj.img, size, size, bob);
       continue;
     }
@@ -16380,6 +16838,26 @@ function normalizeDynamicEntries(items, options = null) {
       out.push(entry);
       continue;
     }
+    if (kind === "actor") {
+      const x = Math.floor(Number(raw.x));
+      const y = Math.floor(Number(raw.y));
+      const z = Math.floor(Number(raw.z));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      const spriteIdRaw = String(raw.spriteId ?? raw.type ?? "hero").trim();
+      const spriteId = (spriteIdRaw && SPRITE_SOURCES[spriteIdRaw]) ? spriteIdRaw : (SPRITE_SOURCES.hero ? "hero" : spriteIdRaw);
+      if (!spriteId) continue;
+      out.push({
+        ...raw,
+        kind: "actor",
+        type: "hero_actor",
+        spriteId,
+        x,
+        y,
+        z,
+        ai: "none",
+      });
+      continue;
+    }
     const type = normalizeItemType(raw.type, options);
     if (!ITEM_TYPES[type]) continue;
     const x = Math.floor(Number(raw.x));
@@ -16648,9 +17126,10 @@ function importSave(saveStr) {
               Object.entries(payload.areaRespawn.schedules)
                 .map(([k, v]) => [k, Number(v)])
                 .filter(([, v]) => Number.isFinite(v))
-            )
+              )
           : {},
       },
+      quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
       debug: normalizeDebugFlags(payload.debug),
     };
 
@@ -16691,6 +17170,7 @@ function importSave(saveStr) {
       state.shop = null;
     }
     state.debug = normalizeDebugFlags(state.debug);
+    ensureQuickSwitchState(state);
     ensureShopState(state);
 
     recalcDerivedStats(state);
@@ -16709,6 +17189,7 @@ function importSave(saveStr) {
 }
 
 function saveNow(state) {
+  if (!state || isQuickSwitchCharacterActive(state)) return;
   const payload = exportSave(state);
   try { localStorage.setItem(SAVE_KEY, payload); } catch {}
   clearSaveDirty();
@@ -16716,7 +17197,7 @@ function saveNow(state) {
 }
 
 function saveResumeSnapshot(state) {
-  if (!state) return;
+  if (!state || isQuickSwitchCharacterActive(state)) return;
   try { localStorage.setItem(SAVE_KEY, exportSave(state)); } catch {}
 }
 
@@ -17139,6 +17620,79 @@ debugLevelInputEl?.addEventListener("keydown", (e) => {
   e.stopPropagation();
   runDebugSetLevel();
 });
+const runDebugClearRadius = () => {
+  if (!canUseAdminControls()) return;
+  if (!game || !debugClearRadiusInputEl) return;
+  const parsed = Number(debugClearRadiusInputEl.value.trim());
+  if (!Number.isFinite(parsed)) {
+    pushLog(game, "Invalid clear radius.");
+    return;
+  }
+  const result = clearMonstersAndActorsAroundPlayer(game, parsed);
+  debugClearRadiusInputEl.value = `${result.radius || 10}`;
+  if (result.monsterCount === 0 && result.actorCount === 0) {
+    pushLog(game, `Clear: no monsters or spawned actors found within radius ${result.radius}.`);
+    return;
+  }
+  pushLog(
+    game,
+    `Clear: removed ${result.monsterCount} monster${result.monsterCount === 1 ? "" : "s"} and ${result.actorCount} actor${result.actorCount === 1 ? "" : "s"} within radius ${result.radius}.`
+  );
+};
+debugClearGoEl?.addEventListener("click", (e) => {
+  e.preventDefault();
+  runDebugClearRadius();
+});
+debugClearRadiusInputEl?.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  e.stopPropagation();
+  runDebugClearRadius();
+});
+const runDebugSpawnRoster = () => {
+  if (!canUseAdminControls()) return;
+  if (!game) return;
+  const result = spawnMonsterRosterOnSurface(game);
+  if (result.total <= 0) {
+    pushLog(game, "Roster: no monsters found.");
+    return;
+  }
+  const base = result.truncated
+    ? `Roster: spawned ${result.spawned}/${result.total} monsters on surface (space limit reached).`
+    : `Roster: spawned ${result.spawned} monsters on surface.`;
+  const refreshed = result.removed > 0
+    ? `${base} Cleared ${result.removed} previous roster monster${result.removed === 1 ? "" : "s"} first.`
+    : base;
+  pushLog(game, refreshed);
+  if ((game.player?.z ?? 0) !== SURFACE_LEVEL) {
+    pushLog(game, "Roster location: surface depth -1 near the top-left.");
+  }
+};
+debugRosterGoEl?.addEventListener("click", (e) => {
+  e.preventDefault();
+  runDebugSpawnRoster();
+});
+const runDebugQuickSwitchClass = () => {
+  if (!canUseAdminControls()) return;
+  if (!game || !debugQuickSwitchClassEl) return;
+  const classId = normalizeCharacterClassId(debugQuickSwitchClassEl.value);
+  if (!classId || !CLASS_DEFS[classId]) {
+    pushLog(game, "Choose a class for Quick Switch.");
+    return;
+  }
+  const ok = applyQuickSwitchClass(game, classId);
+  if (!ok) pushLog(game, "Quick Switch failed.");
+};
+debugQuickSwitchGoEl?.addEventListener("click", (e) => {
+  e.preventDefault();
+  runDebugQuickSwitchClass();
+});
+debugQuickSwitchClassEl?.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  e.stopPropagation();
+  runDebugQuickSwitchClass();
+});
 shopCloseBtnEl?.addEventListener("click", () => {
   closeShopOverlay();
 });
@@ -17183,9 +17737,25 @@ contextPotionBtn?.addEventListener("click", () => {
   if (!game) return;
   takeTurn(game, usePotionFromContext(game));
 });
-btnRespawnEl?.addEventListener("click", () => {
+btnRespawnEl?.addEventListener("click", async () => {
   if (!game || !game.player?.dead) return;
   closeShopOverlay();
+  const loadedAutosave = await loadLatestAutosaveForRespawn();
+  if (loadedAutosave) {
+    pushLog(game, "Loaded your latest autosave.");
+    return;
+  }
+  if (relocatePlayerToLastLadderLanding(game)) {
+    game.player.hp = game.player.maxHp;
+    game.player.effects = [];
+    const combat = ensureCombatState(game);
+    combat.lastEventMs = 0;
+    combat.regenAnchorMs = Date.now();
+    combat.hudTargets = {};
+    pushLog(game, "No autosave found. You awaken at your last savepoint.");
+    saveNow(game);
+    return;
+  }
   respawnAtStart(game);
 });
 btnNewDungeonEl?.addEventListener("click", () => {

@@ -2937,14 +2937,10 @@ if ($apiMode === 'savegames') {
       $removeIds[$instanceId] = true;
     }
     foreach (array_keys($removeIds) as $instanceId) {
+      // Treat remove as idempotent. If an item is already absent server-side,
+      // skip that id instead of failing the whole mutation batch.
       if (!isset($itemsById[$instanceId])) {
-        json_response([
-          'ok' => false,
-          'error' => 'Mutation references missing item.',
-          'code' => 'ITEM_STATE_MISSING_ITEM',
-          'instance_id' => $instanceId,
-          'current_revision' => $currentRevision,
-        ], 409);
+        unset($removeIds[$instanceId]);
       }
     }
 
@@ -3413,6 +3409,14 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         padding: 4px 10px;
         border-radius: 8px;
         font-size: 13px;
+      }
+      .debugQuickSwitchStatus {
+        font-size: 11px;
+        line-height: 1.35;
+        color: #b7c7de;
+      }
+      .debugQuickSwitchStatus.active {
+        color: #ffd58a;
       }
       button, .headerAuthLink {
         background:
@@ -6255,6 +6259,27 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
                 <button id="debugLevelGo" type="button">Go</button>
               </div>
             </div>
+            <div class="debugTeleport">
+              <label class="debugTeleportLabel" for="debugClearRadiusInput">Clear radius</label>
+              <div class="debugTeleportRow">
+                <input id="debugClearRadiusInput" type="number" min="1" step="1" inputmode="numeric" value="10" />
+                <button id="debugClearGo" type="button">Clear</button>
+              </div>
+            </div>
+            <div class="debugTeleport">
+              <label class="debugTeleportLabel" for="debugRosterGo">Monster Roster</label>
+              <div class="debugTeleportRow">
+                <button id="debugRosterGo" type="button">Roster</button>
+              </div>
+            </div>
+            <div class="debugTeleport">
+              <label class="debugTeleportLabel" for="debugQuickSwitchClass">Quick Switch</label>
+              <div class="debugTeleportRow">
+                <select id="debugQuickSwitchClass"></select>
+                <button id="debugQuickSwitchGo" type="button">Swap</button>
+              </div>
+              <div id="debugQuickSwitchStatus" class="debugQuickSwitchStatus">Quick characters are temporary and never saved.</div>
+            </div>
           </div>
         </div>
       <?php endif; ?>
@@ -6392,7 +6417,6 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
             <button id="shopActionBtn" type="button" disabled>Choose</button>
           </div>
         </div>
-        <div id="shopFooter">Buy and sell with tap-friendly controls. Sell value is 25% of listed item value.</div>
       </div>
     </div>
     <div id="infoOverlay" aria-hidden="true">
