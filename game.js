@@ -2,7 +2,63 @@ import {
   LOCAL_SLOT_BACKUP_MIGRATED_KEY,
   LOCAL_SLOT_MAX,
   createLocalSlotStore,
-} from "./client/save/saveManager.js";
+} from "./client/save/saveManager.js?v=20260315a";
+import {
+  drawCellHighlight,
+  drawFootShadow,
+  drawIntentBadge,
+  drawLineTelegraph,
+  drawTargetRing,
+} from "./client/render/intentOverlays.js?v=20260315a";
+import {
+  SPRITE_PROFILE_VERSION,
+  buildCombatAdjacencyClusters,
+  computeSpriteDrawMetrics,
+  defaultSpriteProfile,
+  ensureSpriteBounds,
+  getSpriteCombatOffset,
+  normalizeSpriteProfiles,
+} from "./client/render/spriteProfiles.js?v=20260315a";
+import {
+  activeAbilityCostForPlayer,
+  activeAbilityForClass,
+  activeAbilityRangeForPlayer,
+  activeAbilityStatus,
+  canPlayerUseActiveAbility,
+} from "./client/gameplay/abilities.js?v=20260315a";
+import {
+  buildChunkEncounterProfile,
+  weightedMonsterTableForEncounter,
+} from "./client/gameplay/roomArchetypes.js?v=20260315a";
+import {
+  chooseTrapFamily,
+  trapDamageMultiplier,
+  trapFamilyDef,
+  trapRevealStyle,
+} from "./client/gameplay/traps.js?v=20260315a";
+import { createAnalyticsApi } from "./client/telemetry/analyticsApi.js?v=20260315a";
+import {
+  HEARTBEAT_INTERVAL_MS,
+  accumulateAnalyticsTime,
+  advanceAnalyticsTurn,
+  analyticsNeedsHeartbeat,
+  analyticsSnapshotForSave,
+  buildHeartbeatPayload,
+  buildRunEndPayload,
+  buildRunStartPayload,
+  createOrResumeAnalyticsState,
+  drainAnalyticsEvents,
+  enterAnalyticsFloor,
+  markAnalyticsEnded,
+  markAnalyticsHeartbeat,
+  markAnalyticsInput,
+  queueAnalyticsEvent,
+  recordAnalyticsCounter,
+  recordAnalyticsDamage,
+  recordAnalyticsDiscovery,
+  recordAnalyticsKill,
+  recordAnalyticsMovement,
+} from "./client/telemetry/runStats.js?v=20260315a";
 
 // Infinite Dungeon Roguelike (Explore-Generated, Chunked, Multi-depth)
 // v4.5
@@ -113,6 +169,15 @@ const STAIRS_UP_SPAWN_CHANCE = 0.50;
 const EDGE_SHADE_PX = Math.max(2, Math.floor(TILE * 0.12));
 const CORNER_CHAMFER_PX = Math.max(3, Math.floor(TILE * 0.22));
 const EDGE_SOFT_PX = Math.max(2, Math.floor(TILE * 0.08));
+const FEATURE_FLAGS = Object.freeze({
+  spriteFootprints: true,
+  roomArchetypes: true,
+  advancedTraps: true,
+  monsterIntentTelegraphs: true,
+  telemetryUpload: true,
+  adminConsole: true,
+  classActives: true,
+});
 const ENV_STYLE_VARIANTS = Object.freeze([
   {
     id: "carved_stone",
@@ -1381,6 +1446,7 @@ const ctx = canvas.getContext("2d");
 const canAdminControls = document.body?.dataset?.canAdminControls === "1";
 const isAuthenticatedUser = document.body?.dataset?.isAuthenticated === "1";
 const saveApiCsrfToken = document.body?.dataset?.saveCsrf ?? "";
+const analyticsApi = createAnalyticsApi({ baseUrl: "./index.php", csrfToken: saveApiCsrfToken });
 const saveSlotMax = Math.max(1, Number.parseInt(document.body?.dataset?.saveMaxSlots ?? "10", 10) || 10);
 const saveNameMaxLen = Math.max(1, Number.parseInt(document.body?.dataset?.saveNameMaxLen ?? "48", 10) || 48);
 const localSlotStore = createLocalSlotStore({
@@ -1407,6 +1473,7 @@ const logPanelEl = document.getElementById("logPanel");
 const logEl = document.getElementById("log");
 const logTickerEl = document.getElementById("logTicker");
 const contextActionBtn = document.getElementById("contextActionBtn");
+const contextAbilityBtn = document.getElementById("contextAbilityBtn");
 const contextPotionBtn = document.getElementById("contextPotionBtn");
 const contextAttackListEl = document.getElementById("contextAttackList");
 const dpadCenterBtnEl = document.querySelector('.dpad-btn.center[data-dx="0"][data-dy="0"]');
@@ -1747,8 +1814,14 @@ const itemAuthorityRuntime = {
   lastSyncAt: 0,
   lastError: "",
 };
-const spriteOverrideState = { overrides: {}, scales: {}, entries: [] };
+const spriteOverrideState = { overrides: {}, scales: {}, profiles: {}, entries: [] };
 const monsterEditorState = { version: 1, monsters: {}, spawnRules: [], updatedAt: "" };
+const spriteBoundsCache = Object.create(null);
+const analyticsRuntime = {
+  heartbeatTimer: 0,
+  flushing: false,
+  lastError: "",
+};
 let infoTierSignature = "";
 let spriteEditorSignature = "";
 let monsterEditorSignature = "";
@@ -1805,6 +1878,7 @@ function bootstrapSpriteOverrides() {
     }
     spriteOverrideState.scales = next;
   }
+  spriteOverrideState.profiles = normalizeSpriteProfiles(payload.profiles ?? {}, spriteOverrideState.scales);
   if (Array.isArray(payload.entries)) {
     spriteOverrideState.entries = payload.entries.slice();
   }
@@ -3437,6 +3511,7 @@ function generateSurfaceChunk(z, cx, cy) {
     areaMap: area.areaMap,
     areaCount: area.areaCount,
     surface: true,
+    encounterProfile: null,
   };
 }
 
@@ -3592,6 +3667,16 @@ function generateChunk(seedStr, z, cx, cy) {
     ...tryAddShrineRoom(seedStr, rng, z, grid, anchors),
   };
   const lockedDoorRewards = applyLockedDoorChokepoints(grid, rng, z);
+  const encounterProfile = FEATURE_FLAGS.roomArchetypes
+    ? buildChunkEncounterProfile({
+        depth: z,
+        seed: seedStr,
+        cx,
+        cy,
+        specials,
+        lockedDoorRewards,
+      })
+    : null;
   const specialRoomCount = (specials.treasure ? 1 : 0) + (specials.shrine ? 1 : 0);
   const specialCorridorCount = specialRoomCount; // each special room uses one connector corridor
   const explore = {
@@ -3599,7 +3684,18 @@ function generateChunk(seedStr, z, cx, cy) {
     corridors: corridorCount + specialCorridorCount,
   };
   const area = buildChunkAreaMap(grid);
-  return { z, cx, cy, grid, specials, explore, lockedDoorRewards, areaMap: area.areaMap, areaCount: area.areaCount };
+  return {
+    z,
+    cx,
+    cy,
+    grid,
+    specials,
+    explore,
+    lockedDoorRewards,
+    areaMap: area.areaMap,
+    areaCount: area.areaCount,
+    encounterProfile,
+  };
 }
 
 // ---------- World ----------
@@ -5845,6 +5941,16 @@ function chunkBaseSpawns(worldSeed, chunk) {
   const { z, cx, cy, grid, specials, lockedDoorRewards = [] } = chunk;
   if (z === SURFACE_LEVEL || chunk.surface) return { monsters: [], items: [], traps: [] };
   const rng = makeRng(`${worldSeed}|spawns|z${z}|${cx},${cy}`);
+  const encounterProfile = FEATURE_FLAGS.roomArchetypes
+    ? (chunk.encounterProfile ?? buildChunkEncounterProfile({
+        depth: z,
+        seed: worldSeed,
+        cx,
+        cy,
+        specials,
+        lockedDoorRewards,
+      }))
+    : null;
   const isOpenCell = (x, y) => {
     const t = grid[y]?.[x];
     return t === FLOOR || isOpenDoorTile(t) || t === STAIRS_DOWN || t === STAIRS_UP;
@@ -5856,7 +5962,10 @@ function chunkBaseSpawns(worldSeed, chunk) {
   const depthBoost = clamp(z, 0, 60);
 
   const monsterCount = clamp(
-    randInt(rng, 2, 5) + (rng() < depthBoost / 50 ? 1 : 0) + (rng() < 0.38 ? 1 : 0),
+    randInt(rng, 2, 5) +
+      (rng() < depthBoost / 50 ? 1 : 0) +
+      (rng() < 0.38 ? 1 : 0) +
+      Math.max(-1, Math.min(2, Math.floor(encounterProfile?.monsterCountBonus ?? 0))),
     0,
     10
   );
@@ -5864,8 +5973,8 @@ function chunkBaseSpawns(worldSeed, chunk) {
   // Higher baseline item density for a richer dungeon.
   const itemCount = clamp(randInt(rng, 2, 6) + (rng() < 0.30 ? 1 : 0), 0, 9);
   const trapCount = clamp(
-    randInt(rng, 0, 1) +
-      (rng() < clamp(0.18 + z * 0.012, 0.18, 0.46) ? 1 : 0) +
+    Math.round(randInt(rng, 0, 1) * Math.max(0.5, Number(encounterProfile?.trapWeightMult ?? 1))) +
+      (rng() < clamp((0.18 + z * 0.012) * Math.max(0.5, Number(encounterProfile?.trapWeightMult ?? 1)), 0.12, 0.6) ? 1 : 0) +
       (rng() < clamp((z - 6) * 0.01, 0, 0.22) ? 1 : 0),
     0,
     3
@@ -5873,7 +5982,9 @@ function chunkBaseSpawns(worldSeed, chunk) {
 
   const cells = samplePassableCellsInChunk(grid, rng, monsterCount + itemCount + trapCount + 24);
   const monsters = [];
-  const mTable = monsterTableForDepth(z);
+  const mTable = encounterProfile
+    ? weightedMonsterTableForEncounter(monsterTableForDepth(z), encounterProfile)
+    : monsterTableForDepth(z);
 
   for (let i = 0; i < monsterCount; i++) {
     const c = cells[i];
@@ -5954,8 +6065,8 @@ function chunkBaseSpawns(worldSeed, chunk) {
     const roll = rng();
     // Potions are common; equipment appears regularly; keys are occasional.
     const equipmentType = rng() < 0.6
-      ? weaponForDepth(z, rng, { source: "floor" })
-      : armorForDepth(z, rng, { source: "floor" });
+      ? weaponForDepth(z, rng, { source: "floor", factionId: encounterProfile?.factionId ?? "" })
+      : armorForDepth(z, rng, { source: "floor", factionId: encounterProfile?.factionId ?? "" });
     const type = roll < 0.45 ? "potion" : roll < 0.66 ? "gold" : roll < 0.94 ? equipmentType : keyTypeForDepth(z, rng);
     const id = `i|${z}|${cx},${cy}|${i}`;
     const amount = type === "gold" ? randInt(rng, 4, 22) + clamp(z, 0, 30) : 1;
@@ -6056,13 +6167,36 @@ function chunkBaseSpawns(worldSeed, chunk) {
     if (!c) continue;
     const ck = cellKey(c.x, c.y);
     trapCellUsed.add(ck);
+    const trapFamily = FEATURE_FLAGS.advancedTraps
+      ? chooseTrapFamily({
+          archetypeId: encounterProfile?.archetypeId ?? "",
+          rng,
+        })
+      : "pressure_plate";
     traps.push({
       id: `t|${z}|${cx},${cy}|${i}`,
-      type: TRAP_TYPE_PRESSURE,
+      type: trapFamily,
+      trapFamily,
       depth: z,
+      factionId: encounterProfile?.factionId ?? "",
       lx: c.x,
       ly: c.y,
+      charges: 1,
+      payload: {},
     });
+  }
+
+  if (encounterProfile?.archetypeId === "merchant_refuge") {
+    const c = cells[monsterCount + itemCount + trapCount + 2] ?? cells[cells.length - 1];
+    if (c && !occupiedItemCells.has(cellKey(c.x, c.y))) {
+      pushItem({
+        id: `shopkeeper|${z}|${cx},${cy}|merchant`,
+        type: "shopkeeper",
+        amount: 1,
+        lx: c.x,
+        ly: c.y,
+      });
+    }
   }
 
   return { monsters, items, traps };
@@ -6891,6 +7025,7 @@ function applyCharacterSnapshot(state, snapshot) {
   p.slipbladeBonusReady = false;
   p.overclockUntilMs = 0;
   p.attackAfterMove = false;
+  p.abilityCd = 0;
   p.dead = false;
   state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
     speciesId: profile.speciesId,
@@ -6903,6 +7038,7 @@ function applyCharacterSnapshot(state, snapshot) {
   const hpRatio = clamp(snapHp / snapMaxHp, 0, 1);
   recalcDerivedStats(state);
   p.hp = clamp(Math.round((p.maxHp ?? 1) * hpRatio), 0, p.maxHp ?? 1);
+  p.energy = p.energyMax;
   touchCharacterProgress(state);
   renderInventory(state);
   renderEquipment(state);
@@ -7090,6 +7226,111 @@ async function saveApiRequest(method = "GET", body = null, query = "") {
     throw err;
   }
   return data;
+}
+
+function initializeAnalyticsForState(state, snapshot = null, reason = "runtime") {
+  if (!state?.player || !state?.world) return null;
+  const analytics = createOrResumeAnalyticsState(snapshot, {
+    seed: state.world.seedStr,
+    depth: state.player.z,
+    nowMs: Date.now(),
+  });
+  enterAnalyticsFloor(analytics, state.player.z, Date.now());
+  const isFreshRun = !snapshot || snapshot.runId !== analytics.runId;
+  if (isFreshRun) {
+    queueAnalyticsEvent(analytics, "floor_enter", state.player.z, state.player.x, state.player.y, {
+      reason,
+    });
+  }
+  state.analytics = analytics;
+  return analytics;
+}
+
+function ensureAnalyticsState(state) {
+  if (!state) return null;
+  if (!state.analytics || typeof state.analytics !== "object") {
+    state.analytics = initializeAnalyticsForState(state, null, "ensure");
+  }
+  return state.analytics ?? null;
+}
+
+function analyticsEventAtPlayer(state, type, payload = null, depth = null, x = null, y = null) {
+  const analytics = ensureAnalyticsState(state);
+  if (!analytics) return null;
+  return queueAnalyticsEvent(
+    analytics,
+    type,
+    depth ?? state?.player?.z ?? analytics.currentDepth ?? 0,
+    x ?? state?.player?.x ?? null,
+    y ?? state?.player?.y ?? null,
+    payload ?? {}
+  );
+}
+
+async function flushAnalyticsIfNeeded(state, reason = "heartbeat", force = false) {
+  const analytics = ensureAnalyticsState(state);
+  if (!analytics) return false;
+  accumulateAnalyticsTime(analytics, Date.now());
+  if (!force && !analyticsNeedsHeartbeat(analytics, Date.now())) return false;
+  if (!FEATURE_FLAGS.telemetryUpload || !isAuthenticatedUser) return false;
+  if (analyticsRuntime.flushing) return false;
+
+  analyticsRuntime.flushing = true;
+  analyticsRuntime.lastError = "";
+  const queuedEvents = Array.isArray(analytics.pendingEvents) ? analytics.pendingEvents.slice() : [];
+
+  try {
+    if (!analytics.hasRunStartSent) {
+      await analyticsApi.runStart(buildRunStartPayload(analytics, state, { reason }));
+      analytics.hasRunStartSent = true;
+    }
+
+    await analyticsApi.heartbeat(buildHeartbeatPayload(analytics, state, { reason }));
+    analytics.pendingEvents = [];
+    if (queuedEvents.length) {
+      await analyticsApi.eventBatch({
+        run_id: analytics.runId,
+        reason,
+        events: queuedEvents,
+      });
+    }
+    if (force && analytics.ended) {
+      await analyticsApi.runEnd(buildRunEndPayload(analytics, state, {
+        reason,
+      }));
+    }
+    markAnalyticsHeartbeat(analytics, Date.now());
+    return true;
+  } catch (err) {
+    analyticsRuntime.lastError = String(err?.message ?? "analytics-flush-failed");
+    if (queuedEvents.length) analytics.pendingEvents = [...queuedEvents, ...(analytics.pendingEvents ?? [])];
+    return false;
+  } finally {
+    analyticsRuntime.flushing = false;
+  }
+}
+
+async function endAnalyticsRun(state, {
+  status = "ended",
+  deathCause = "",
+  deathKillerType = "",
+  reason = "run-end",
+} = {}) {
+  const analytics = ensureAnalyticsState(state);
+  if (!analytics || analytics.ended) return false;
+  markAnalyticsEnded(analytics, {
+    status,
+    deathCause,
+    deathKillerType,
+    endedAtMs: Date.now(),
+  });
+  analyticsEventAtPlayer(state, "run_end", {
+    status,
+    deathCause,
+    deathKillerType,
+    turn: state?.turn ?? 0,
+  });
+  return flushAnalyticsIfNeeded(state, reason, true);
 }
 
 function renderSaveGameOverlay() {
@@ -8655,6 +8896,344 @@ async function openCharacterSelectionOverlay(options = null) {
   }
 }
 
+function playerActiveAbility(state) {
+  const classId = normalizeCharacterClassId(state?.player?.classId, state?.player?.speciesId);
+  return FEATURE_FLAGS.classActives ? activeAbilityForClass(classId) : null;
+}
+
+function restorePlayerEnergy(state, amount) {
+  if (!state?.player || !Number.isFinite(amount) || amount <= 0) return;
+  state.player.energy = clamp(Math.floor((state.player.energy ?? 0) + amount), 0, state.player.energyMax ?? 0);
+}
+
+function spendPlayerEnergy(state, amount) {
+  if (!state?.player) return false;
+  const cost = Math.max(0, Math.floor(Number(amount) || 0));
+  if ((state.player.energy ?? 0) < cost) return false;
+  state.player.energy = Math.max(0, Math.floor((state.player.energy ?? 0) - cost));
+  return true;
+}
+
+function adjacentOpenCellsAround(state, x, y, z) {
+  const occ = getCachedOccupancy(state);
+  const out = [];
+  for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (!state.world.isPassable(nx, ny, z)) continue;
+    if (occ.monsters.has(keyXYZ(nx, ny, z))) continue;
+    if (nx === state.player.x && ny === state.player.y) continue;
+    out.push({ x: nx, y: ny });
+  }
+  return out;
+}
+
+function monstersTargetableByAbility(state, ability, occupancy = null) {
+  const p = state?.player;
+  if (!p || p.dead || !ability) return [];
+  const occ = occupancy ?? getCachedOccupancy(state);
+  const range = activeAbilityRangeForPlayer(p, ability);
+  const out = [];
+  for (const ent of state.entities.values()) {
+    if (!ent || ent.kind !== "monster" || ent.z !== p.z) continue;
+    const dist = Math.abs((ent.x ?? 0) - p.x) + Math.abs((ent.y ?? 0) - p.y);
+    if (dist <= 0 || dist > range) continue;
+    if ((ability.id === "charge_strike" || ability.id === "shadowstep") && adjacentOpenCellsAround(state, ent.x, ent.y, ent.z).length <= 0) continue;
+    if ((ability.id === "aimed_shot" || ability.id === "throw_vial" || ability.id === "acid_glob") && !hasLineOfSight(state.world, p.z, p.x, p.y, ent.x, ent.y)) continue;
+    out.push({
+      monster: ent,
+      dist,
+      score: monsterThreatScore(state, ent),
+    });
+  }
+  out.sort((a, b) => (b.score - a.score) || (a.dist - b.dist) || (a.monster.id.localeCompare(b.monster.id)));
+  return out;
+}
+
+function spendActiveAbility(state, ability) {
+  const p = state?.player;
+  if (!p || !ability) return false;
+  const cost = activeAbilityCostForPlayer(p, ability);
+  if (!spendPlayerEnergy(state, cost)) return false;
+  p.abilityCd = Math.max(0, Math.floor(Number(ability.cooldown ?? 0))) + 1;
+  state.lastPlayerActionKind = "ability";
+  return true;
+}
+
+function activeAbilityAction(state, occupancy = null) {
+  const p = state?.player;
+  if (!p || p.dead) return null;
+  const ability = playerActiveAbility(state);
+  if (!ability) return null;
+  const status = activeAbilityStatus(p, ability);
+  const baseLabel = ability.label;
+  if (!status.ok) {
+    return {
+      type: "active-ability-disabled",
+      abilityId: ability.id,
+      label: `${baseLabel} (${status.reason})`,
+      disabled: true,
+      run: () => false,
+    };
+  }
+
+  if (ability.targeting === "self" || ability.targeting === "ground") {
+    return {
+      type: "active-ability",
+      abilityId: ability.id,
+      label: baseLabel,
+      run: () => usePlayerActiveAbility(state, ability, null, occupancy),
+    };
+  }
+
+  const candidates = monstersTargetableByAbility(state, ability, occupancy);
+  const target = candidates[0]?.monster ?? null;
+  if (!target) {
+    return {
+      type: "active-ability-disabled",
+      abilityId: ability.id,
+      label: `${baseLabel} (No target)`,
+      disabled: true,
+      run: () => false,
+    };
+  }
+  return {
+    type: "active-ability",
+    abilityId: ability.id,
+    targetMonsterId: target.id,
+    monsterType: target.type,
+    label: `${baseLabel}: ${monsterDisplayName(target, p.z)}`,
+    run: () => usePlayerActiveAbility(state, ability, target, occupancy),
+  };
+}
+
+function abilityAttackMonster(state, monster, ability, {
+  damageMod = 1,
+  accuracyBonus = 0,
+  critBonus = 0,
+  defIgnorePct = 0,
+  kind = "ranged",
+  requiresLos = true,
+} = {}) {
+  if (!monster || monster.kind !== "monster") return false;
+  const p = state.player;
+  const dist = Math.abs((monster.x ?? 0) - p.x) + Math.abs((monster.y ?? 0) - p.y);
+  if (requiresLos && !hasLineOfSight(state.world, p.z, p.x, p.y, monster.x, monster.y)) {
+    pushLog(state, `${ability.label} cannot find a clear line.`);
+    return false;
+  }
+  const spec = monsterStatsForDepth(monster.type, monster.z ?? p.z);
+  const attackAcc = Math.max(1, Math.round((p.acc ?? 70) + accuracyBonus));
+  if (!rollHit(attackAcc, spec.eva ?? 0)) {
+    monster.awake = true;
+    rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
+    alertMonsterPack(state, monster, p, monsterAlertRadius(spec));
+    persistMonsterOverride(state, monster);
+    pushLog(state, `${ability.label} misses the ${monsterDisplayName(monster, p.z)}.`);
+    return true;
+  }
+  const profile = {
+    ...(playerWeaponAttackProfile(state) ?? {}),
+    kind,
+    range: activeAbilityRangeForPlayer(p, ability),
+    minRange: 1,
+    requiresLOS: requiresLos,
+    cannotFireAdjacent: false,
+    damageMod: Math.max(0.2, Number(playerWeaponAttackProfile(state)?.damageMod ?? 1) * damageMod),
+    critChanceMod: Math.round(critBonus),
+    defIgnorePct: Math.max(0, Number(defIgnorePct ?? 0)),
+    attackName: ability.label,
+    source: "active_ability",
+  };
+  const hpBefore = Math.max(0, Math.floor(monster.hp ?? 0));
+  const attack = playerAttackDamage(state, monster, {
+    distance: dist,
+    targetUnengaged: !monster.awake,
+    firstCombatStrike: false,
+    attackAfterMove: false,
+    weaponProfile: profile,
+  });
+  monster.hp = Math.max(0, hpBefore - attack.dmg);
+  monster.awake = true;
+  rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
+  alertMonsterPack(state, monster, p, monsterAlertRadius(spec));
+  persistMonsterOverride(state, monster);
+  const applied = Math.max(0, Math.min(attack.dmg, hpBefore));
+  markCombatEvent(state, monster);
+  recordAnalyticsCounter(ensureAnalyticsState(state), "attacks", 1, p.z);
+  recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { dealt: applied });
+  if (monster.hp <= 0) {
+    const xpMult = xpChallengeMultiplier(state, monster, spec);
+    handleMonsterDefeat(state, monster, {
+      xpMult,
+      deathMessage: `${ability.label} drops the ${monsterDisplayName(monster, p.z)}.`,
+    });
+  }
+  pushLog(state, `${ability.label} hits the ${monsterDisplayName(monster, p.z)} for ${attack.dmg}${attack.crit ? " (critical)" : ""}.`);
+  return true;
+}
+
+function deployPlayerTrap(state, trapFamily = "pressure_plate") {
+  const p = state?.player;
+  if (!p || p.dead) return false;
+  const candidates = adjacentOpenCellsAround(state, p.x, p.y, p.z)
+    .filter((cell) => !getTrapAt(state, cell.x, cell.y, p.z));
+  const target = candidates[0] ?? null;
+  if (!target) {
+    pushLog(state, "No adjacent tile is clear enough for a trap.");
+    return false;
+  }
+  const trapId = `dyn_trap|${trapFamily}|${state.turn}|${target.x},${target.y}`;
+  const trap = {
+    id: trapId,
+    origin: "dynamic",
+    kind: "trap",
+    trapType: trapFamily,
+    trapFamily,
+    x: target.x,
+    y: target.y,
+    z: p.z,
+    depth: p.z,
+    armed: true,
+    detected: true,
+    triggered: false,
+    disarmed: false,
+    charges: 1,
+    factionId: "player",
+    payload: {},
+    friendlyTo: "player",
+    ownerId: state.character?.id ?? "player",
+  };
+  state.dynamic.set(trapId, trap);
+  state.entities.set(trapId, trap);
+  pushLog(state, `You deploy ${trapDisplayName(trap).toLowerCase()}.`);
+  return true;
+}
+
+function usePlayerActiveAbility(state, ability = null, explicitTarget = null, occupancy = null) {
+  const p = state?.player;
+  if (!p || p.dead) return false;
+  const resolvedAbility = ability ?? playerActiveAbility(state);
+  if (!resolvedAbility || !canPlayerUseActiveAbility(p, resolvedAbility)) return false;
+  const occ = occupancy ?? getCachedOccupancy(state);
+
+  let spent = false;
+  if (resolvedAbility.id === "brace_stance") {
+    p.effects.push({ type: "brace", turnsLeft: 3, incomingDamageMult: 0.72, speedMult: 0.94 });
+    recalcDerivedStats(state);
+    pushLog(state, "You brace for impact.");
+    spent = true;
+  } else if (resolvedAbility.id === "anchor_field") {
+    p.effects.push({ type: "anchor_field", turnsLeft: 4, incomingDamageMult: 0.84, accDelta: 4 });
+    for (const entry of getAdjacentMonsters(state, occ)) {
+      if (tryKnockbackMonster(state, entry.monster, p.x, p.y)) {
+        entry.monster.cd = Math.max(1, Math.floor(entry.monster.cd ?? 0));
+        persistMonsterOverride(state, entry.monster);
+      }
+    }
+    recalcDerivedStats(state);
+    pushLog(state, "A stabilizing field blooms around you.");
+    spent = true;
+  } else if (resolvedAbility.id === "scan_reveal") {
+    applyReveal(state, 18);
+    for (const trap of state.entities.values()) {
+      if (!trap || trap.kind !== "trap" || trap.z !== p.z) continue;
+      const dist = Math.abs((trap.x ?? 0) - p.x) + Math.abs((trap.y ?? 0) - p.y);
+      if (dist > 7) continue;
+      trap.detected = true;
+      persistTrapOverride(state, trap);
+    }
+    pushLog(state, "Your senses flare across the dungeon.");
+    spent = true;
+  } else if (resolvedAbility.id === "overclock") {
+    p.effects.push({ type: "overclock_boost", turnsLeft: 4, accDelta: 6, evaDelta: 4, speedMult: 1.16 });
+    p.overclockUntilMs = Date.now() + 6000;
+    recalcDerivedStats(state);
+    pushLog(state, "Systems surge into overclock.");
+    spent = true;
+  } else if (resolvedAbility.id === "deploy_trap") {
+    const classId = normalizeCharacterClassId(p.classId, p.speciesId);
+    const family = classId === "fabricator"
+      ? "beam_link"
+      : (classId === "broodmind" ? "poison_vent" : "dart_line");
+    spent = deployPlayerTrap(state, family);
+  } else {
+    const target = explicitTarget ?? monstersTargetableByAbility(state, resolvedAbility, occ)[0]?.monster ?? null;
+    if (!target) return false;
+    if (resolvedAbility.id === "charge_strike") {
+      const landing = adjacentOpenCellsAround(state, target.x, target.y, target.z)[0] ?? null;
+      if (!landing) {
+        pushLog(state, "No clear lane to charge.");
+        return false;
+      }
+      const moveDist = Math.abs(landing.x - p.x) + Math.abs(landing.y - p.y);
+      p.x = landing.x;
+      p.y = landing.y;
+      recordAnalyticsMovement(ensureAnalyticsState(state), p.z, moveDist);
+      spent = abilityAttackMonster(state, target, resolvedAbility, { damageMod: 1.28, accuracyBonus: 6, defIgnorePct: 0.12, kind: "melee", requiresLos: false });
+      if (spent && target.hp > 0 && tryKnockbackMonster(state, target, p.x, p.y)) {
+        pushLog(state, `The charge knocks the ${monsterDisplayName(target, p.z)} back.`);
+      }
+    } else if (resolvedAbility.id === "aimed_shot") {
+      spent = abilityAttackMonster(state, target, resolvedAbility, { damageMod: 1.16, accuracyBonus: 12, critBonus: 8, defIgnorePct: 0.18, kind: "ranged", requiresLos: true });
+    } else if (resolvedAbility.id === "shadowstep") {
+      const landing = adjacentOpenCellsAround(state, target.x, target.y, target.z)[0] ?? null;
+      if (!landing) {
+        pushLog(state, "No clear place to shadowstep.");
+        return false;
+      }
+      const moveDist = Math.abs(landing.x - p.x) + Math.abs(landing.y - p.y);
+      p.x = landing.x;
+      p.y = landing.y;
+      recordAnalyticsMovement(ensureAnalyticsState(state), p.z, moveDist);
+      spent = abilityAttackMonster(state, target, resolvedAbility, { damageMod: 1.22, accuracyBonus: 8, critBonus: 10, defIgnorePct: 0.26, kind: "melee", requiresLos: false });
+    } else if (resolvedAbility.id === "mind_lance") {
+      spent = abilityAttackMonster(state, target, resolvedAbility, { damageMod: 1.12, accuracyBonus: 10, critBonus: 6, defIgnorePct: 0.32, kind: "ranged", requiresLos: false });
+      if (spent && target.hp > 0) {
+        target.cd = Math.max(1, Math.floor(target.cd ?? 0));
+        persistMonsterOverride(state, target);
+      }
+    } else if (resolvedAbility.id === "throw_vial") {
+      spent = abilityAttackMonster(state, target, resolvedAbility, { damageMod: 0.92, accuracyBonus: 6, critBonus: 0, defIgnorePct: 0.08, kind: "ranged", requiresLos: true });
+      if (spent && target.hp > 0) {
+        applyPoisonToMonster(state, target, Math.max(1, Math.round((p.atkHi ?? 1) * 0.12)), 2, "the vial");
+        spawnPoisonCloudBurst(state, target.x, target.y, target.z, 3, 1, Math.max(1, Math.round((p.atkHi ?? 1) * 0.18)), "volatile reagents");
+      }
+    } else if (resolvedAbility.id === "acid_glob") {
+      spent = abilityAttackMonster(state, target, resolvedAbility, { damageMod: 0.86, accuracyBonus: 8, critBonus: 0, defIgnorePct: 0.1, kind: "ranged", requiresLos: true });
+      if (spent && target.hp > 0) {
+        applyPoisonToMonster(state, target, Math.max(1, Math.round((p.atkHi ?? 1) * 0.18)), 3, "acid");
+        spawnPoisonCloudBurst(state, target.x, target.y, target.z, 3, 1, Math.max(1, Math.round((p.atkHi ?? 1) * 0.24)), "acid");
+      }
+    }
+  }
+
+  if (!spent) return false;
+  if (!spendActiveAbility(state, resolvedAbility)) return false;
+  state.lastPlayerActionKind = "ability";
+  markAnalyticsInput(ensureAnalyticsState(state), Date.now());
+  analyticsEventAtPlayer(state, resolvedAbility.id, {
+    abilityId: resolvedAbility.id,
+    classId: p.classId,
+    energyCost: activeAbilityCostForPlayer(p, resolvedAbility),
+  });
+  return true;
+}
+
+function updateAbilityContextButton(state, occupancy = null) {
+  if (!contextAbilityBtn) return;
+  const action = activeAbilityAction(state, occupancy);
+  if (!action) {
+    contextAbilityBtn.style.display = "none";
+    contextAbilityBtn.disabled = true;
+    return;
+  }
+  contextAbilityBtn.style.display = "";
+  contextAbilityBtn.disabled = !!action.disabled;
+  setContextButtonContent(contextAbilityBtn, action.label, { glyph: "Q", color: action.disabled ? "#9aa4b2" : "#ffd166" });
+  contextAbilityBtn.dataset.actionType = action.type;
+}
+
 function stairContextLabel(state, dir) {
   const z = state?.player?.z ?? 0;
   if (dir === "down" && z === SURFACE_LEVEL) return "Enter dungeon";
@@ -9003,6 +9582,7 @@ function updateContextActionButton(state, occupancy = null) {
     setContextButtonContent(contextActionBtn, "No Action", null);
     contextActionBtn.dataset.actionType = "none";
     updateDpadCenterButton(state, null);
+    updateAbilityContextButton(state, occupancy);
     updatePotionContextButton(state, null);
     updateAttackContextButtons(state, occupancy, null);
     return;
@@ -9012,6 +9592,7 @@ function updateContextActionButton(state, occupancy = null) {
   contextActionBtn.dataset.actionType = action.type;
   updateDpadCenterButton(state, action);
 
+  updateAbilityContextButton(state, occupancy);
   updatePotionContextButton(state, action);
   updateAttackContextButtons(state, occupancy, action);
 }
@@ -9483,6 +10064,11 @@ function recalcDerivedStats(state) {
   const newMaxHp = Math.max(1, maxHpForLevel(level, profile));
   const prevMaxHp = Math.max(1, Math.floor(p.maxHp ?? newMaxHp));
   const hpRatio = clamp((p.hp ?? newMaxHp) / prevMaxHp, 0, 1);
+  const prevEnergyMax = Math.max(1, Math.floor(p.energyMax ?? 1));
+  const hadExplicitEnergy = Number.isFinite(p.energy);
+  const energyRatio = hadExplicitEnergy
+    ? clamp((p.energy ?? prevEnergyMax) / prevEnergyMax, 0, 1)
+    : 1;
   p.maxHp = newMaxHp;
   p.hp = clamp(Math.round(newMaxHp * hpRatio), 0, newMaxHp);
 
@@ -9509,6 +10095,7 @@ function recalcDerivedStats(state) {
   p.eva = clamp(Math.round(baseEva + (species.evaFlat ?? 0) + (classDef.evaFlat ?? 0) + effEva + armorEvaBonus), 0, 85);
   p.spd = Number((baseSpd * (species.speedMult ?? 1) * (classDef.speedMult ?? 1) * effSpeedMult).toFixed(3));
   p.energyMax = Math.max(1, Math.round(((30 + int * 10) * PLAYER_STAT_SCALE) * energyMult + energyFlat + armorEnergyBonus));
+  p.energy = clamp(Math.round(p.energyMax * energyRatio), 0, p.energyMax);
   p.armorAffinityMult = armorAffinityMult;
   p.weaponAffinityMult = weaponAffinityMult;
   p.critChance = clamp(Math.round(2 + dex * 0.6 + (classDef.critFlat ?? 0)), 0, 45);
@@ -9541,6 +10128,8 @@ function recalcDerivedStats(state) {
   if (typeof p.combatFirstStrikeReady !== "boolean") p.combatFirstStrikeReady = true;
   if (typeof p.slipbladeBonusReady !== "boolean") p.slipbladeBonusReady = false;
   if (!Number.isFinite(p.overclockUntilMs)) p.overclockUntilMs = 0;
+  if (!Number.isFinite(p.abilityCd)) p.abilityCd = 0;
+  p.activeAbilityId = activeAbilityForClass(p.classId)?.id ?? "";
 }
 function characterStatLabelShort(key) {
   if (key === "vit") return "VIT";
@@ -9854,7 +10443,6 @@ function renderInventory(state) {
     const invoke = () => useInventoryIndex(state, invIdx);
     const clickHandler = (e) => { e.stopPropagation(); invoke(); };
     btn.addEventListener('click', clickHandler);
-    btn.addEventListener('touchstart', (e) => { e.stopPropagation(); e.preventDefault(); invoke(); }, { passive: false });
     btn.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -10002,7 +10590,9 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     acc: 70,
     eva: 8,
     spd: 1,
+    energy: 300,
     energyMax: 300,
+    abilityCd: 0,
     critChance: 2,
     healMult: 1,
     potionCapacity: BASE_POTION_CAPACITY,
@@ -10043,6 +10633,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     areaRespawn: { currentAreaKey: "", schedules: {} },
     quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
     debug: normalizeDebugFlags(),
+    analytics: null,
   };
 
   if (carryover) {
@@ -10074,6 +10665,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
 
   ensureCharacterState(state);
   recalcDerivedStats(state);
+  state.analytics = initializeAnalyticsForState(state, null, "new-game");
   if (carryover) pushLog(state, "A fresh dungeon forms around your enduring character.");
   else pushLog(state, "You enter the dungeon...");
   hydrateNearby(state);
@@ -10156,11 +10748,13 @@ function hydrateChunkEntities(state, z, cx, cy) {
     const wx = cx * CHUNK + trap.lx;
     const wy = cy * CHUNK + trap.ly;
     const ov = state.entityOverrides.get(trap.id);
+    const trapFamilyId = trapFamilyDef(ov?.trapFamily ?? ov?.trapType ?? trap.trapFamily ?? trap.type ?? "pressure_plate")?.id ?? "pressure_plate";
     state.entities.set(trap.id, {
       id: trap.id,
       origin: "base",
       kind: "trap",
-      trapType: trap.type ?? TRAP_TYPE_PRESSURE,
+      trapType: trapFamilyId,
+      trapFamily: trapFamilyId,
       x: Math.floor(ov?.x ?? wx),
       y: Math.floor(ov?.y ?? wy),
       z: Math.floor(ov?.z ?? z),
@@ -10169,6 +10763,13 @@ function hydrateChunkEntities(state, z, cx, cy) {
       detected: !!ov?.detected,
       triggered: !!ov?.triggered,
       disarmed: !!ov?.disarmed,
+      charges: Math.max(1, Math.floor(ov?.charges ?? trap.charges ?? 1)),
+      factionId: String(ov?.factionId ?? trap.factionId ?? "").trim().toLowerCase(),
+      payload: (ov?.payload && typeof ov.payload === "object")
+        ? { ...ov.payload }
+        : ((trap.payload && typeof trap.payload === "object") ? { ...trap.payload } : {}),
+      friendlyTo: String(ov?.friendlyTo ?? trap.friendlyTo ?? "").trim().toLowerCase(),
+      ownerId: ov?.ownerId ?? trap.ownerId ?? "",
     });
   }
 
@@ -10300,10 +10901,16 @@ function persistTrapOverride(state, trap) {
     y: Math.floor(trap.y ?? 0),
     z: Math.floor(trap.z ?? 0),
     depth: Math.max(0, Math.floor(trap.depth ?? trap.z ?? 0)),
+    trapFamily: trapFamilyDef(trap.trapFamily ?? trap.trapType ?? "pressure_plate")?.id ?? "pressure_plate",
     armed: !!trap.armed,
     detected: !!trap.detected,
     triggered: !!trap.triggered,
     disarmed: !!trap.disarmed,
+    charges: Math.max(1, Math.floor(trap.charges ?? 1)),
+    factionId: String(trap.factionId ?? "").trim().toLowerCase(),
+    payload: (trap.payload && typeof trap.payload === "object") ? { ...trap.payload } : {},
+    friendlyTo: String(trap.friendlyTo ?? "").trim().toLowerCase(),
+    ownerId: trap.ownerId ?? "",
   });
 }
 function trapDepth(trap, state) {
@@ -10346,31 +10953,146 @@ function revealNearbyTrapsBySkill(state) {
     persistTrapOverride(state, trap);
     detectedCount += 1;
   }
-  if (detectedCount > 0) pushLog(state, detectedCount === 1 ? "You detect a hidden pressure trap." : `You detect ${detectedCount} hidden pressure traps.`);
+  if (detectedCount > 0) pushLog(state, detectedCount === 1 ? "You detect a hidden trap." : `You detect ${detectedCount} hidden traps.`);
   return detectedCount;
 }
 function trapPressureRawDamage(depth) {
   const legacyDamage = 7 + depth * 2.2;
   return Math.max(1, Math.round(legacyDamage * COMBAT_SCALE));
 }
-function triggerPressureTrap(state, trap) {
-  const p = state?.player;
-  if (!p || p.dead || !trap || trap.kind !== "trap" || !trap.armed) return false;
+function trapDisplayName(trap) {
+  return trapFamilyDef(trap?.trapFamily ?? trap?.trapType ?? "pressure_plate")?.label ?? "Trap";
+}
+function trapFamilyId(trap) {
+  return trapFamilyDef(trap?.trapFamily ?? trap?.trapType ?? "pressure_plate")?.id ?? "pressure_plate";
+}
+function trapRawDamageForTrap(trap, state) {
   const depth = trapDepth(trap, state);
+  const mult = trapDamageMultiplier(trapFamilyId(trap));
+  return Math.max(1, Math.round(trapPressureRawDamage(depth) * mult));
+}
+function trapAffectsEntity(trap, entity) {
+  if (!trap || !entity) return false;
+  const friendlyTo = String(trap.friendlyTo ?? "").trim().toLowerCase();
+  if (!friendlyTo) return true;
+  if (entity.kind === "monster") return friendlyTo !== "monster";
+  return friendlyTo !== "player";
+}
+function wakeMonstersNearTrap(state, trap, radius = 6) {
+  let woke = 0;
+  for (const ent of state.entities.values()) {
+    if (!ent || ent.kind !== "monster") continue;
+    if (ent.z !== trap.z) continue;
+    const dist = Math.abs((ent.x ?? 0) - trap.x) + Math.abs((ent.y ?? 0) - trap.y);
+    if (dist > radius) continue;
+    if (!ent.awake) woke += 1;
+    ent.awake = true;
+    ent.alertedTurn = Math.max(state.turn ?? 0, Math.floor(ent.alertedTurn ?? 0));
+    persistMonsterOverride(state, ent);
+  }
+  return woke;
+}
+function retireTriggeredTrap(state, trap) {
+  if (!trap) return;
   trap.detected = true;
   trap.triggered = true;
-  trap.armed = false;
+  trap.charges = Math.max(0, Math.floor(Number(trap.charges ?? 1) - 1));
+  trap.armed = trap.charges > 0;
   persistTrapOverride(state, trap);
-  if (stateDebug(state).godmode) {
-    pushLog(state, "A pressure trap triggers, but godmode negates the blast.");
-    return true;
+}
+function applyTrapDamageToMonster(state, trap, monster, rawDamage) {
+  if (!monster || monster.kind !== "monster") return 0;
+  const damage = Math.max(1, Math.floor(applyDefenseMitigation(rawDamage, monsterStatsForDepth(monster.type, monster.z ?? state?.player?.z ?? 0).def, 0.12)));
+  const hpBefore = Math.max(0, Math.floor(monster.hp ?? 0));
+  monster.hp = Math.max(0, hpBefore - damage);
+  persistMonsterOverride(state, monster);
+  recordAnalyticsDamage(ensureAnalyticsState(state), monster.z ?? state?.player?.z ?? 0, { dealt: damage });
+  if (monster.hp <= 0) {
+    const xpMult = xpChallengeMultiplier(state, monster, monsterStatsForDepth(monster.type, monster.z ?? state?.player?.z ?? 0));
+    handleMonsterDefeat(state, monster, {
+      xpMult,
+      deathMessage: `The ${monsterDisplayName(monster, state?.player?.z ?? monster.z ?? 0)} is torn apart by ${trapDisplayName(trap).toLowerCase()}.`,
+    });
   }
-  const reduced = reduceIncomingDamage(state, trapPressureRawDamage(depth), depth);
-  const dmg = Math.max(1, Math.floor(reduced?.dmg ?? 1));
-  p.hp = Math.max(0, p.hp - dmg);
-  pushLog(state, `A hidden pressure trap triggers for ${dmg} damage.`);
-  if (p.hp <= 0 && !p.dead) killPlayer(state);
+  return Math.max(0, Math.min(damage, hpBefore));
+}
+function triggerTrapForEntity(state, trap, entity) {
+  if (!trap || trap.kind !== "trap" || !trap.armed || !entity) return false;
+  if (!trapAffectsEntity(trap, entity)) return false;
+  const familyId = trapFamilyId(trap);
+  const label = trapDisplayName(trap);
+  const analytics = ensureAnalyticsState(state);
+  const depth = trapDepth(trap, state);
+  let triggered = false;
+  let damageDone = 0;
+
+  if (familyId === "alarm_trap") {
+    const woke = wakeMonstersNearTrap(state, trap, 7);
+    if (entity.kind === "monster") pushLog(state, `${label} snaps and sends nearby enemies into a frenzy.`);
+    else pushLog(state, `${label} blares. ${woke > 0 ? `${woke} nearby enemies stir.` : "Nothing answers."}`);
+    triggered = true;
+  } else if (entity.kind === "monster") {
+    const rawDamage = trapRawDamageForTrap(trap, state);
+    damageDone = applyTrapDamageToMonster(state, trap, entity, rawDamage);
+    if (familyId === "poison_vent" && entity.hp > 0) {
+      applyPoisonToMonster(state, entity, Math.max(1, Math.round(rawDamage * 0.18)), 2, label.toLowerCase());
+      spawnPoisonCloudBurst(state, trap.x, trap.y, trap.z, 3, 1, Math.max(1, Math.round(rawDamage * 0.32)), label.toLowerCase());
+    }
+    if (familyId === "collapse_tile" && entity.hp > 0) entity.cd = Math.max(Math.floor(entity.cd ?? 0), 1);
+    if (damageDone > 0) pushLog(state, `${label} hits the ${monsterDisplayName(entity, state?.player?.z ?? entity.z ?? 0)} for ${damageDone}.`);
+    triggered = damageDone > 0 || familyId === "poison_vent" || familyId === "collapse_tile";
+  } else {
+    const player = state?.player;
+    if (!player || player.dead) return false;
+    if (stateDebug(state).godmode && familyId !== "alarm_trap") {
+      pushLog(state, `${label} triggers, but godmode negates it.`);
+      triggered = true;
+    } else {
+      const rawDamage = trapRawDamageForTrap(trap, state);
+      const reduced = reduceIncomingDamage(state, rawDamage, depth);
+      const damage = Math.max(1, Math.floor(reduced?.dmg ?? 1));
+      if (familyId !== "alarm_trap") {
+        player.hp = Math.max(0, player.hp - damage);
+        damageDone = damage;
+        recordAnalyticsDamage(analytics, depth, { taken: damage });
+      }
+      if (familyId === "poison_vent") {
+        applyPoisonToPlayer(state, Math.max(1, Math.round(rawDamage * 0.14)), 3, label.toLowerCase());
+        spawnPoisonCloudBurst(state, trap.x, trap.y, trap.z, 3, 1, Math.max(1, Math.round(rawDamage * 0.28)), label.toLowerCase());
+      } else if (familyId === "collapse_tile") {
+        applySlowToPlayer(state, 2, -5, -8, 0.86, label.toLowerCase());
+      } else if (familyId === "shrine_curse_seal") {
+        player.effects.push({ type: "curse", atkDelta: -80, turnsLeft: 40 });
+        recalcDerivedStats(state);
+      }
+      if (familyId === "beam_link") {
+        pushLog(state, `${label} lances through you for ${damage}.`);
+      } else if (familyId === "dart_line") {
+        pushLog(state, `${label} tears into you for ${damage}.`);
+      } else if (familyId === "pressure_plate") {
+        pushLog(state, `A hidden ${label.toLowerCase()} triggers for ${damage} damage.`);
+      } else if (familyId === "alarm_trap") {
+        const woke = wakeMonstersNearTrap(state, trap, 7);
+        pushLog(state, `${label} blares. ${woke > 0 ? `${woke} nearby enemies stir.` : "Nothing answers."}`);
+      } else {
+        pushLog(state, `${label} triggers for ${damage}.`);
+      }
+      if (player.hp <= 0 && !player.dead) killPlayer(state, { cause: "trap", killerType: familyId });
+      triggered = true;
+    }
+  }
+
+  if (!triggered) return false;
+  retireTriggeredTrap(state, trap);
+  recordAnalyticsCounter(analytics, "trapsTriggered", 1, depth);
+  analyticsEventAtPlayer(state, "trap_triggered", {
+    trapFamily: familyId,
+    damage: damageDone,
+  }, depth, trap.x, trap.y);
   return true;
+}
+function triggerPressureTrap(state, trap) {
+  return triggerTrapForEntity(state, trap, state?.player ?? null);
 }
 function trapDisarmXp(depth) {
   return Math.max(1, Math.round((3 + depth * 0.8) * XP_SCALE));
@@ -10378,6 +11100,7 @@ function trapDisarmXp(depth) {
 function disarmTrapAtPlayer(state) {
   const p = state?.player;
   if (!p || p.dead) return false;
+  state.lastPlayerActionKind = "trap";
   const trap = getTrapAt(state, p.x, p.y, p.z, { requireArmed: true, requireRevealed: true });
   if (!trap) return false;
   const xp = trapDisarmXp(trapDepth(trap, state));
@@ -10391,7 +11114,12 @@ function disarmTrapAtPlayer(state) {
   }
   state.entities.delete(trap.id);
   grantXP(state, xp);
-  pushLog(state, `You disarm the pressure trap. (+${xp} XP)`);
+  recordAnalyticsCounter(ensureAnalyticsState(state), "trapsDisarmed", 1, trapDepth(trap, state));
+  analyticsEventAtPlayer(state, "trap_disarmed", {
+    trapFamily: trapFamilyId(trap),
+    xp,
+  }, trapDepth(trap, state), trap.x, trap.y);
+  pushLog(state, `You disarm the ${trapDisplayName(trap).toLowerCase()}. (+${xp} XP)`);
   return true;
 }
 function processPlayerTrapInteractions(state) {
@@ -10401,7 +11129,7 @@ function processPlayerTrapInteractions(state) {
   const trap = getTrapAt(state, p.x, p.y, p.z, { requireArmed: true });
   if (!trap) return false;
   if (trap.detected || trap.triggered) return false;
-  return triggerPressureTrap(state, trap);
+  return triggerTrapForEntity(state, trap, p);
 }
 
 function isDirectlyTakeableItem(type) {
@@ -10642,6 +11370,8 @@ function computeVisibility(state) {
   visibilitySig = sig;
 
   visible.clear();
+  let newlySeenTiles = 0;
+  let newlySeenChunks = 0;
 
   world.ensureChunksAround(player.x, player.y, player.z, viewRadiusForChunks());
 
@@ -10652,15 +11382,38 @@ function computeVisibility(state) {
 
       if (!fogEnabled) {
         visible.add(keyXY(wx, wy));
-        seen.add(keyXYZ(wx, wy, player.z));
+        const seenKey = keyXYZ(wx, wy, player.z);
+        if (!seen.has(seenKey)) {
+          newlySeenTiles += 1;
+          const { cx, cy } = splitWorldToChunk(wx, wy);
+          const chunkKey = keyZCXCY(player.z, cx, cy);
+          if (!state.exploredChunks.has(chunkKey)) {
+            state.exploredChunks.add(chunkKey);
+            newlySeenChunks += 1;
+          }
+          seen.add(seenKey);
+        }
         continue;
       }
 
       if (hasLineOfSight(world, player.z, player.x, player.y, wx, wy)) {
         visible.add(keyXY(wx, wy));
-        seen.add(keyXYZ(wx, wy, player.z));
+        const seenKey = keyXYZ(wx, wy, player.z);
+        if (!seen.has(seenKey)) {
+          newlySeenTiles += 1;
+          const { cx, cy } = splitWorldToChunk(wx, wy);
+          const chunkKey = keyZCXCY(player.z, cx, cy);
+          if (!state.exploredChunks.has(chunkKey)) {
+            state.exploredChunks.add(chunkKey);
+            newlySeenChunks += 1;
+          }
+          seen.add(seenKey);
+        }
       }
     }
+  }
+  if (newlySeenTiles > 0 || newlySeenChunks > 0) {
+    recordAnalyticsDiscovery(ensureAnalyticsState(state), player.z, newlySeenTiles, newlySeenChunks);
   }
 }
 
@@ -10827,19 +11580,24 @@ function applyEffectsTick(state) {
 
   for (const e of p.effects) {
     if (e.type === "regen") {
-      if (p.hp > 0) p.hp = clamp(p.hp + e.healPerTurn, 0, p.maxHp);
+      if (p.hp > 0) {
+        const before = p.hp;
+        p.hp = clamp(p.hp + e.healPerTurn, 0, p.maxHp);
+        if (p.hp > before) recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { healing: p.hp - before });
+      }
     }
     if (e.type === "poison") {
       if (p.hp > 0) {
         const dmg = Math.max(1, Math.floor(Number(e.dmgPerTurn ?? 1)));
         p.hp = Math.max(0, p.hp - dmg);
+        recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { taken: dmg });
         pushLog(state, `Poison deals ${dmg} damage.`);
       }
     }
     e.turnsLeft -= 1;
   }
   p.effects = p.effects.filter(e => e.turnsLeft > 0);
-  if (p.hp <= 0 && !p.dead) killPlayer(state);
+  if (p.hp <= 0 && !p.dead) killPlayer(state, { cause: "poison", killerType: "poison" });
 
   recalcDerivedStats(state);
   renderEquipment(state);
@@ -11048,9 +11806,10 @@ function tickPoisonClouds(state) {
     const reduced = reduceIncomingDamage(state, base, p.z);
     const dmg = Math.max(1, Math.floor(reduced?.dmg ?? 1));
     p.hp = Math.max(0, p.hp - dmg);
+    recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { taken: dmg });
     pushLog(state, `Toxic cloud burns you for ${dmg}.`);
     applyPoisonToPlayer(state, Math.round(base * 0.6), 2, cloud.source ?? "the cloud");
-    if (p.hp <= 0 && !p.dead) killPlayer(state);
+    if (p.hp <= 0 && !p.dead) killPlayer(state, { cause: "poison_cloud", killerType: cloud.source ?? "cloud" });
   }
   for (const k of Object.keys(clouds)) {
     const entry = clouds[k];
@@ -11061,11 +11820,25 @@ function tickPoisonClouds(state) {
 
 function applyReveal(state, radius = 28) {
   const p = state.player;
+  let newlySeenTiles = 0;
+  let newlySeenChunks = 0;
   for (let dy = -radius; dy <= radius; dy++) {
     for (let dx = -radius; dx <= radius; dx++) {
       const wx = p.x + dx, wy = p.y + dy;
-      state.seen.add(keyXYZ(wx, wy, p.z));
+      const seenKey = keyXYZ(wx, wy, p.z);
+      if (state.seen.has(seenKey)) continue;
+      state.seen.add(seenKey);
+      newlySeenTiles += 1;
+      const { cx, cy } = splitWorldToChunk(wx, wy);
+      const chunkKey = keyZCXCY(p.z, cx, cy);
+      if (!state.exploredChunks.has(chunkKey)) {
+        state.exploredChunks.add(chunkKey);
+        newlySeenChunks += 1;
+      }
     }
+  }
+  if (newlySeenTiles > 0 || newlySeenChunks > 0) {
+    recordAnalyticsDiscovery(ensureAnalyticsState(state), p.z, newlySeenTiles, newlySeenChunks);
   }
 }
 
@@ -11211,6 +11984,10 @@ function playerAttackDamage(state, monster = null, options = null) {
   if (classId === "overclock_unit" && Number(p.overclockUntilMs ?? 0) > Date.now()) damageMult *= 1.1;
   if (classId === "nullblade" && monster && isVoidAlignedMonsterType(monster.type)) damageMult *= 1.1;
   if (classId === "scrapper" && isLowTierWeaponType(p.equip?.weapon)) damageMult *= 1.1;
+  const effectDamageMult = (p.effects ?? [])
+    .filter((e) => Number.isFinite(e?.damageMult))
+    .reduce((mult, e) => mult * Math.max(0.1, Number(e.damageMult ?? 1)), 1);
+  damageMult *= effectDamageMult;
 
   let crit = false;
   const critChance = clamp(Math.round((p.critChance ?? 0) + profileCritMod), 0, 95);
@@ -11253,6 +12030,10 @@ function reduceIncomingDamage(state, dmg, attackerDepth = null) {
     reduced = Math.max(1, Math.round(reduced * 0.7));
     shaded = true;
   }
+  const effectReductionMult = (state.player.effects ?? [])
+    .filter((e) => Number.isFinite(e?.incomingDamageMult))
+    .reduce((mult, e) => mult * Math.max(0.2, Number(e.incomingDamageMult ?? 1)), 1);
+  reduced = Math.max(1, Math.round(reduced * effectReductionMult));
   return { dmg: reduced, shaded };
 }
 function ensureCombatState(state) {
@@ -11324,9 +12105,18 @@ function applyOutOfCombatRegen(state, now = Date.now()) {
   combat.regenAnchorMs += ticks * COMBAT_REGEN_TICK_MS;
   return p.hp !== before;
 }
-function killPlayer(state) {
+function killPlayer(state, options = null) {
   state.player.hp = 0;
   state.player.dead = true;
+  const opts = (options && typeof options === "object") ? options : {};
+  const cause = String(opts.cause ?? "death");
+  const killerType = String(opts.killerType ?? "");
+  void endAnalyticsRun(state, {
+    status: "dead",
+    deathCause: cause,
+    deathKillerType: killerType,
+    reason: "death",
+  });
   pushLog(state, "YOU DIED.");
 }
 
@@ -11362,6 +12152,7 @@ function lockToOpenDoorTile(t) {
 function tryUnlockDoor(state, x, y, z) {
   const t = state.world.getTile(x, y, z);
   if (!tileIsLocked(t)) return false;
+  state.lastPlayerActionKind = "door";
 
   const keyType = lockToKeyType(t);
   const lockpickEnabled = !!stateDebug(state).lockpick;
@@ -11372,6 +12163,10 @@ function tryUnlockDoor(state, x, y, z) {
   }
 
   state.world.setTile(x, y, z, lockToOpenDoorTile(t));
+  recordAnalyticsCounter(ensureAnalyticsState(state), "doorsOpened", 1, z);
+  analyticsEventAtPlayer(state, "locked_door_opened", {
+    keyType,
+  }, z, x, y);
   if (lockpickEnabled) pushLog(state, "You pick the lock and open the door.");
   else pushLog(state, "You unlock and open the door.");
   renderInventory(state);
@@ -11381,7 +12176,9 @@ function tryUnlockDoor(state, x, y, z) {
 function tryOpenClosedDoor(state, x, y, z) {
   const t = state.world.getTile(x, y, z);
   if (t !== DOOR_CLOSED) return false;
+  state.lastPlayerActionKind = "door";
   state.world.setTile(x, y, z, DOOR_OPEN);
+  recordAnalyticsCounter(ensureAnalyticsState(state), "doorsOpened", 1, z);
   pushLog(state, "You open the door.");
   state.visitedDoors?.add(keyXYZ(x, y, z));
   return true;
@@ -11400,6 +12197,8 @@ function tryCloseAdjacentDoor(state) {
     if (occ) continue;
 
     state.world.setTile(x, y, p.z, DOOR_CLOSED);
+    state.lastPlayerActionKind = "door";
+    recordAnalyticsCounter(ensureAnalyticsState(state), "doorsClosed", 1, p.z);
     pushLog(state, "You close the door.");
     return true;
   }
@@ -11526,6 +12325,8 @@ function tryKnockbackMonster(state, monster, sourceX, sourceY) {
   monster.x = tx;
   monster.y = ty;
   persistMonsterOverride(state, monster);
+  const trap = getTrapAt(state, tx, ty, tz, { requireArmed: true });
+  if (trap) triggerTrapForEntity(state, trap, monster);
   return true;
 }
 
@@ -11545,6 +12346,8 @@ function tryKnockbackPlayer(state, sourceX, sourceY) {
   if (occ.monsters.has(keyXYZ(tx, ty, tz))) return false;
   p.x = tx;
   p.y = ty;
+  const trap = getTrapAt(state, tx, ty, tz, { requireArmed: true });
+  if (trap) triggerTrapForEntity(state, trap, p);
   return true;
 }
 
@@ -11601,6 +12404,8 @@ function handleMonsterDefeat(state, monster, options = null) {
 
 function playerAttack(state, monster) {
   markCombatEvent(state, monster);
+  state.lastPlayerActionKind = "attack";
+  recordAnalyticsCounter(ensureAnalyticsState(state), "attacks", 1, state.player.z);
   const p = state.player;
   const weaponProfile = playerWeaponAttackProfile(state);
   if (!playerCanAttackMonster(state, monster, weaponProfile)) {
@@ -11625,6 +12430,8 @@ function playerAttack(state, monster) {
   const attackAcc = Math.max(1, Math.round((p.acc ?? 70) + Number(weaponProfile?.accuracyMod ?? 0)));
   if (!rollHit(attackAcc, targetEva)) {
     monster.awake = true;
+    rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
+    alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec));
     pushLog(state, `You miss the ${monsterDisplayName(monster, p.z)}.`);
     persistMonsterOverride(state, monster);
     return;
@@ -11640,6 +12447,8 @@ function playerAttack(state, monster) {
   const dmg = attack.dmg;
   monster.hp -= dmg;
   monster.awake = true;
+  rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
+  alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec));
   persistMonsterOverride(state, monster);
 
   const profileKind = weaponProfile?.kind ?? "melee";
@@ -11710,6 +12519,7 @@ function playerAttack(state, monster) {
     pushLog(state, `Telekinetic force knocks the ${monsterDisplayName(monster, p.z)} back.`);
   }
   const damageApplied = Math.max(0, Math.min(dmg, hpBefore));
+  if (damageApplied > 0) recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { dealt: damageApplied });
   const xpMult = xpChallengeMultiplier(state, monster, mSpec);
   grantXP(state, Math.round(xpFromDamage(damageApplied, monster) * xpMult));
   if (
@@ -11726,9 +12536,10 @@ function playerAttack(state, monster) {
       const reduced = reduceIncomingDamage(state, reflectedRaw, monster.z ?? p.z);
       const reflected = Math.max(1, Math.floor(reduced?.dmg ?? 1));
       p.hp = Math.max(0, p.hp - reflected);
+      recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { taken: reflected });
       pushLog(state, `The ${monsterDisplayName(monster, p.z)} reflects ${reflected} damage.`);
       if (p.hp <= 0) {
-        killPlayer(state);
+        killPlayer(state, { cause: "reflect", killerType: monster?.type ?? "" });
         return;
       }
     }
@@ -11793,12 +12604,16 @@ function playerMoveOrAttack(state, dx, dy) {
   markDisengageGraceFromStep(state, p.x, p.y, nx, ny, nz);
   p.x = nx; p.y = ny;
   p.attackAfterMove = true;
+  state.lastPlayerActionKind = "move";
+  recordAnalyticsMovement(ensureAnalyticsState(state), p.z, 1);
   return true;
 }
 
 function waitTurn(state) {
   if (state.player.dead) return false;
   state.player.attackAfterMove = false;
+  state.lastPlayerActionKind = "wait";
+  recordAnalyticsCounter(ensureAnalyticsState(state), "waits", 1, state.player.z);
   pushLog(state, "You wait.");
   return true;
 }
@@ -11806,6 +12621,7 @@ function waitTurn(state) {
 function pickup(state) {
   const p = state.player;
   if (p.dead) return false;
+  state.lastPlayerActionKind = "pickup";
 
   const itemsHere = getItemsAt(state, p.x, p.y, p.z);
   if (!itemsHere.length) { pushLog(state, "Nothing here to pick up."); return false; }
@@ -11815,6 +12631,7 @@ function pickup(state) {
 
   if (it.type === "gold") {
     p.gold += it.amount ?? 1;
+    recordAnalyticsCounter(ensureAnalyticsState(state), "goldCollected", Math.max(1, Math.floor(it.amount ?? 1)), p.z);
     pushLog(state, `Picked up ${it.amount} gold.`);
   } else if (it.type === "potion") {
     const before = invCount(state, "potion");
@@ -11849,6 +12666,13 @@ function pickup(state) {
     const chestDepth = normalizeChestLootDepth(Math.max(0, Math.floor(it.z ?? p.z ?? 0)), it);
     const g = 15 + Math.floor(Math.random() * (25 + clamp(chestDepth, 0, 55)));
     p.gold += g;
+    recordAnalyticsCounter(ensureAnalyticsState(state), "chestsOpened", 1, p.z);
+    recordAnalyticsCounter(ensureAnalyticsState(state), "goldCollected", g, p.z);
+    analyticsEventAtPlayer(state, "chest_opened", {
+      locked: isLocked,
+      lootDepth: chestDepth,
+      gold: g,
+    }, p.z, p.x, p.y);
     pushLog(state, `You open the Chest. (+${g} gold)`);
     dropEquipmentFromChest(state, it);
   } else if (it.type === "shrine") {
@@ -11885,6 +12709,7 @@ function useInventoryIndex(state, idx) {
     const heal = Math.max(1, Math.round(potionHealAmount(p.maxHp) * Math.max(0.1, Number(p.healMult ?? 1))));
     const before = p.hp;
     p.hp = clamp(p.hp + heal, 0, p.maxHp);
+    recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { healing: Math.max(0, p.hp - before) });
     pushLog(state, `You drink a potion. (+${p.hp - before} HP, ${Math.round(POTION_HEAL_PCT * 100)}% max base)`);
 
     if (isStackable(it.type)) {
@@ -12012,6 +12837,7 @@ function deterministicShrineEffect(seed, z, cx, cy) {
 function interactShrine(state) {
   const p = state.player;
   if (p.dead) return false;
+  state.lastPlayerActionKind = "shrine";
 
   const it = findItemAtByType(state, p.x, p.y, p.z, "shrine");
   if (!it || it.type !== "shrine") { pushLog(state, "Nothing to interact with here."); return false; }
@@ -12022,6 +12848,7 @@ function interactShrine(state) {
   if (eff.type === "heal") {
     const before = p.hp;
     p.hp = p.maxHp;
+    recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { healing: Math.max(0, p.hp - before) });
     pushLog(state, `The Shrine heals you to full. (+${p.hp - before} HP)`);
     const curseIdx = p.effects.findIndex(e => e.type === "curse");
     if (curseIdx >= 0) { p.effects.splice(curseIdx, 1); pushLog(state, "A curse is lifted."); }
@@ -12038,6 +12865,10 @@ function interactShrine(state) {
 
   applyReveal(state, 22);
   pushLog(state, "The dungeon\u2019s outline flashes in your mind...");
+  recordAnalyticsCounter(ensureAnalyticsState(state), "shrinesUsed", 1, p.z);
+  analyticsEventAtPlayer(state, "shrine_used", {
+    effect: eff.type,
+  }, p.z, p.x, p.y);
 
   if (it.origin === "base") state.removedIds.add(it.id);
   else if (it.origin === "dynamic") state.dynamic.delete(it.id);
@@ -12142,6 +12973,7 @@ function relocatePlayerToLastLadderLanding(state) {
 function goToLevel(state, newZ, direction) {
   const p = state.player;
   if (p.dead) return;
+  const prevZ = p.z;
 
   if (newZ === SURFACE_LEVEL) {
     // Surface uses a fixed central ladder location.
@@ -12186,6 +13018,11 @@ function goToLevel(state, newZ, direction) {
 
   if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
   setLastLadderLanding(state, p);
+  enterAnalyticsFloor(ensureAnalyticsState(state), p.z, Date.now());
+  analyticsEventAtPlayer(state, "floor_enter", {
+    fromDepth: prevZ,
+    direction,
+  }, p.z, p.x, p.y);
 
   hydrateNearby(state);
   updateAreaRespawnTracking(state, Date.now());
@@ -12197,18 +13034,24 @@ function goToLevel(state, newZ, direction) {
 function tryUseStairs(state, dir) {
   const p = state.player;
   if (p.dead) return false;
+  state.lastPlayerActionKind = dir === "down" ? "stairs-down" : "stairs-up";
+  const fromDepth = p.z;
 
   const here = state.world.getTile(p.x, p.y, p.z);
 
   if (dir === "down") {
     if (here !== STAIRS_DOWN) { pushLog(state, "No stairs down here."); return false; }
     goToLevel(state, p.z + 1, "down");
+    recordAnalyticsCounter(ensureAnalyticsState(state), "stairsDown", 1, fromDepth);
+    analyticsEventAtPlayer(state, "stairs_down", { fromDepth }, fromDepth, p.x, p.y);
     saveRuntime.pendingAutosaveReason = "stairs-transition";
     return true;
   } else {
     if (here !== STAIRS_UP) { pushLog(state, "No stairs up here."); return false; }
     if (p.z <= SURFACE_LEVEL) { pushLog(state, "You can't go up any further."); return false; }
     goToLevel(state, p.z - 1, "up");
+    recordAnalyticsCounter(ensureAnalyticsState(state), "stairsUp", 1, fromDepth);
+    analyticsEventAtPlayer(state, "stairs_up", { fromDepth }, fromDepth, p.x, p.y);
     saveRuntime.pendingAutosaveReason = "stairs-transition";
     return true;
   }
@@ -12275,6 +13118,107 @@ function bfsNextStep(state, start, goal, maxNodes = 600, maxDist = 18) {
   return cur;
 }
 
+function ensureMonsterMemory(monster) {
+  if (!monster || typeof monster !== "object") return null;
+  const raw = (monster.memory && typeof monster.memory === "object") ? monster.memory : {};
+  monster.memory = {
+    lastSeenPlayerX: Number.isFinite(Number(raw.lastSeenPlayerX)) ? Math.floor(Number(raw.lastSeenPlayerX)) : null,
+    lastSeenPlayerY: Number.isFinite(Number(raw.lastSeenPlayerY)) ? Math.floor(Number(raw.lastSeenPlayerY)) : null,
+    lastSeenTurn: Number.isFinite(Number(raw.lastSeenTurn)) ? Math.floor(Number(raw.lastSeenTurn)) : -9999,
+  };
+  return monster.memory;
+}
+
+function rememberMonsterPlayerPosition(monster, player, turn) {
+  const memory = ensureMonsterMemory(monster);
+  if (!memory || !player) return null;
+  memory.lastSeenPlayerX = Math.floor(Number(player.x ?? 0));
+  memory.lastSeenPlayerY = Math.floor(Number(player.y ?? 0));
+  memory.lastSeenTurn = Math.floor(Number(turn ?? 0));
+  return memory;
+}
+
+function monsterHasFreshPlayerMemory(monster, currentTurn, maxAge = 10) {
+  const memory = ensureMonsterMemory(monster);
+  if (!memory) return false;
+  if (!Number.isFinite(memory.lastSeenTurn)) return false;
+  if (!Number.isFinite(memory.lastSeenPlayerX) || !Number.isFinite(memory.lastSeenPlayerY)) return false;
+  return (Math.floor(Number(currentTurn ?? 0)) - Math.floor(Number(memory.lastSeenTurn ?? 0))) <= Math.max(1, Math.floor(Number(maxAge) || 10));
+}
+
+function clearMonsterIntent(monster) {
+  if (!monster || typeof monster !== "object") return;
+  monster.intent = null;
+}
+
+function monsterAlertRadius(spec) {
+  return Math.max(3, Math.floor(Number(spec?.alertRadius ?? ((spec?.range ?? 0) > 0 ? 6 : 4)) || 4));
+}
+
+function alertMonsterPack(state, sourceMonster, player, radius = 4) {
+  if (!state?.entities || !sourceMonster || !player) return 0;
+  const z = Math.floor(Number(sourceMonster.z ?? player.z ?? 0));
+  const alertRadius = Math.max(1, Math.floor(Number(radius) || 4));
+  let alerted = 0;
+  for (const ent of state.entities.values()) {
+    if (!ent || ent.kind !== "monster" || ent.id === sourceMonster.id) continue;
+    if (ent.z !== z) continue;
+    const dist = Math.abs((ent.x ?? 0) - (sourceMonster.x ?? 0)) + Math.abs((ent.y ?? 0) - (sourceMonster.y ?? 0));
+    if (dist > alertRadius) continue;
+    const wasAwake = !!ent.awake;
+    ent.awake = true;
+    rememberMonsterPlayerPosition(ent, player, state.turn ?? 0);
+    if (!wasAwake) alerted += 1;
+    persistMonsterOverride(state, ent);
+  }
+  return alerted;
+}
+
+function monsterUsesIntentTelegraph(monster, spec, ai = "") {
+  if (!FEATURE_FLAGS.monsterIntentTelegraphs) return false;
+  if ((spec?.range ?? 0) <= 0) return false;
+  const type = String(monster?.type ?? "").trim().toLowerCase();
+  if (String(ai) === "ranged_artillery") return true;
+  if (type === "storm_sniper" || type === "deepcore_ballista_sentinel") return true;
+  return String(ai) === "ranged_hold" && Math.floor(Number(spec?.range ?? 0)) >= 6 && Math.floor(Number(spec?.cdTurns ?? 0)) >= 2;
+}
+
+function queueMonsterShotIntent(state, monster, spec, player, options = null) {
+  if (!monster || !player) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  monster.intent = {
+    type: String(opts.type ?? "line_shot"),
+    targetX: Math.floor(Number(player.x ?? 0)),
+    targetY: Math.floor(Number(player.y ?? 0)),
+    executeOnTurn: Math.max(Math.floor(Number(state?.turn ?? 0)) + 1, Math.floor(Number(opts.executeOnTurn ?? ((state?.turn ?? 0) + 1)) || ((state?.turn ?? 0) + 1))),
+    visible: opts.visible !== false,
+  };
+  return monster.intent;
+}
+
+function executeMonsterShotIntent(state, monster, spec) {
+  const intent = (monster?.intent && typeof monster.intent === "object") ? monster.intent : null;
+  if (!intent || !monster || !state?.player) return false;
+  const player = state.player;
+  const z = Math.floor(Number(monster.z ?? player.z ?? 0));
+  const targetX = Number.isFinite(Number(intent.targetX)) ? Math.floor(Number(intent.targetX)) : player.x;
+  const targetY = Number.isFinite(Number(intent.targetY)) ? Math.floor(Number(intent.targetY)) : player.y;
+  const minRange = Math.max(1, Math.floor(Number(spec?.minRange ?? ((spec?.range ?? 0) > 0 ? 2 : 1)) || 1));
+  const dist = Math.abs((monster.x ?? 0) - targetX) + Math.abs((monster.y ?? 0) - targetY);
+  const hasShot = dist >= minRange && dist <= Math.max(minRange, Math.floor(Number(spec?.range ?? minRange) || minRange));
+  const hasLos = hasLineOfSight(state.world, z, monster.x, monster.y, targetX, targetY);
+  const hitsPlayer = player.x === targetX && player.y === targetY && hasShot && hasLos;
+  clearMonsterIntent(monster);
+  if (hitsPlayer) {
+    monsterHitPlayer(state, monster, spec.atkLo, spec.atkHi, "shoots");
+  } else if (state.visible.has(keyXY(monster.x, monster.y))) {
+    pushLog(state, `The ${monsterDisplayName(monster, z)} fires where you stood.`);
+  }
+  monster.cd = Math.max(0, Math.floor(Number(spec?.cdTurns ?? 2) || 2));
+  monster.awake = true;
+  return true;
+}
+
 function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
   markCombatEvent(state, monster);
   const nm = monsterDisplayName(monster, state.player.z);
@@ -12302,6 +13246,7 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
   const reduced = reduceIncomingDamage(state, raw, monster.z ?? state.player.z);
   const dmg = Math.max(1, Math.floor(reduced?.dmg ?? 1));
   state.player.hp -= dmg;
+  recordAnalyticsDamage(ensureAnalyticsState(state), state.player.z, { taken: dmg });
   if (classId === "overclock_unit") state.player.overclockUntilMs = Date.now() + 3000;
   pushLog(state, `The ${nm} ${verb} you for ${dmg}.`);
   if (reduced?.shaded) pushLog(state, "Shadeguard ward dampens the blow.");
@@ -12324,7 +13269,7 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
       pushLog(state, `${nm} knocks you back.`);
     }
   }
-  if (state.player.hp <= 0) killPlayer(state);
+  if (state.player.hp <= 0) killPlayer(state, { cause: "monster", killerType: monster?.type ?? "" });
 }
 
 function monstersTurn(state) {
@@ -12337,6 +13282,7 @@ function monstersTurn(state) {
 
   const z = p.z;
   const { monsters } = buildOccupancy(state);
+  const monsterOccupancy = new Map(monsters);
   const toAct = [];
   const disengage = ensureDisengageState(state);
   for (const [monsterId, untilTurn] of Object.entries(disengage)) {
@@ -12367,6 +13313,7 @@ function monstersTurn(state) {
       persistMonsterOverride(state, m);
     }
     if ((m.hp ?? 0) <= 0) {
+      monsterOccupancy.delete(keyXYZ(m.x, m.y, z));
       state.entities.delete(m.id);
       if (m.origin === "base") {
         state.removedIds.add(m.id);
@@ -12392,18 +13339,33 @@ function monstersTurn(state) {
     };
     const tryMoveTo = (nx, ny) => {
       if (!state.world.isPassable(nx, ny, z)) return false;
-      const occ = monsters.get(keyXYZ(nx, ny, z));
+      const occ = monsterOccupancy.get(keyXYZ(nx, ny, z));
       if (occ) return false;
       if (nx === p.x && ny === p.y) return false;
+      const oldKey = keyXYZ(m.x, m.y, z);
+      const newKey = keyXYZ(nx, ny, z);
+      monsterOccupancy.delete(oldKey);
+      monsterOccupancy.set(newKey, m.id);
       m.x = nx;
       m.y = ny;
+      clearMonsterIntent(m);
       persistOverride();
+      const trap = getTrapAt(state, nx, ny, z, { requireArmed: true });
+      if (trap) {
+        triggerTrapForEntity(state, trap, m);
+        if (!state.entities.has(m.id) || (m.hp ?? 0) <= 0) {
+          monsterOccupancy.delete(newKey);
+        }
+      }
       return true;
     };
-    const tryStepTowardPlayer = () => {
-      const next = bfsNextStep(state, { x: m.x, y: m.y }, { x: p.x, y: p.y });
+    const tryStepTowardPoint = (goalX, goalY) => {
+      const next = bfsNextStep(state, { x: m.x, y: m.y }, { x: goalX, y: goalY });
       if (!next) return false;
       return tryMoveTo(next.x, next.y);
+    };
+    const tryStepTowardPlayer = () => {
+      return tryStepTowardPoint(p.x, p.y);
     };
     const tryStepAwayFromPlayer = () => {
       const dirs = [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5);
@@ -12413,7 +13375,7 @@ function monstersTurn(state) {
         const nx = m.x + dx;
         const ny = m.y + dy;
         if (!state.world.isPassable(nx, ny, z)) continue;
-        const occ = monsters.get(keyXYZ(nx, ny, z));
+        const occ = monsterOccupancy.get(keyXYZ(nx, ny, z));
         if (occ) continue;
         if (nx === p.x && ny === p.y) continue;
         const nd = Math.abs(nx - p.x) + Math.abs(ny - p.y);
@@ -12434,7 +13396,7 @@ function monstersTurn(state) {
           if (Math.abs(dx) + Math.abs(dy) > range) continue;
           if (nx === m.x && ny === m.y) continue;
           if (!state.world.isPassable(nx, ny, z)) continue;
-          const occ = monsters.get(keyXYZ(nx, ny, z));
+          const occ = monsterOccupancy.get(keyXYZ(nx, ny, z));
           if (occ) continue;
           if (nx === p.x && ny === p.y) continue;
           const nd = Math.abs(nx - p.x) + Math.abs(ny - p.y);
@@ -12444,12 +13406,40 @@ function monstersTurn(state) {
       if (!candidates.length) return false;
       candidates.sort((a, b) => a.d - b.d);
       const pick = candidates[0];
+      const oldKey = keyXYZ(m.x, m.y, z);
+      const newKey = keyXYZ(pick.x, pick.y, z);
+      monsterOccupancy.delete(oldKey);
+      monsterOccupancy.set(newKey, m.id);
       m.x = pick.x;
       m.y = pick.y;
       m.blinkStrikeBonus = pick.d <= 1;
+      clearMonsterIntent(m);
       persistOverride();
+      const trap = getTrapAt(state, pick.x, pick.y, z, { requireArmed: true });
+      if (trap) {
+        triggerTrapForEntity(state, trap, m);
+        if (!state.entities.has(m.id) || (m.hp ?? 0) <= 0) {
+          monsterOccupancy.delete(newKey);
+        }
+      }
       return true;
     };
+
+    if (m.intent && Number.isFinite(Number(m.intent.executeOnTurn)) && Math.floor(Number(m.intent.executeOnTurn)) < (state.turn ?? 0)) {
+      clearMonsterIntent(m);
+    }
+    if (m.intent && Number.isFinite(Number(m.intent.executeOnTurn)) && Math.floor(Number(m.intent.executeOnTurn)) <= (state.turn ?? 0)) {
+      executeMonsterShotIntent(state, m, spec);
+      persistOverride();
+      continue;
+    }
+
+    if (seesPlayer) {
+      m.awake = true;
+      rememberMonsterPlayerPosition(m, p, state.turn ?? 0);
+      alertMonsterPack(state, m, p, monsterAlertRadius(spec));
+      persistOverride();
+    }
 
     if (ai === "support_undead") {
       let supportActed = false;
@@ -12466,7 +13456,7 @@ function monstersTurn(state) {
         for (const [dx, dy] of dirs) {
           const nx = m.x + dx, ny = m.y + dy;
           if (!state.world.isPassable(nx, ny, z)) continue;
-          if (monsters.get(keyXYZ(nx, ny, z))) continue;
+          if (monsterOccupancy.get(keyXYZ(nx, ny, z))) continue;
           if (nx === p.x && ny === p.y) continue;
           const sumSpec = monsterStatsForDepth("skeleton", z);
           const sid = `summon|${m.id}|${state.turn}|${nx},${ny}`;
@@ -12481,6 +13471,7 @@ function monstersTurn(state) {
             awake: true,
             cd: 0,
           });
+          monsterOccupancy.set(keyXYZ(nx, ny, z), sid);
           m.abilityCd = Math.max(2, Math.floor(spec.summonCooldownTurns ?? 6));
           m.awake = true;
           pushLog(state, `${monsterDisplayName(m, z)} summons a Skeleton.`);
@@ -12511,6 +13502,15 @@ function monstersTurn(state) {
         m.awake = true;
         continue;
       }
+    }
+
+    if (canShoot && !m.intent && monsterUsesIntentTelegraph(m, spec, ai)) {
+      queueMonsterShotIntent(state, m, spec, p, {
+        type: ai === "ranged_artillery" ? "line_shot" : "charged_shot",
+      });
+      m.awake = true;
+      persistOverride();
+      continue;
     }
 
     if (canShoot && (ai !== "ranged_kite" || distMan >= preferredRange - 1)) {
@@ -12569,9 +13569,14 @@ function monstersTurn(state) {
     }
 
     if (seesPlayer) {
-      m.awake = true;
-      persistOverride();
       if (tryStepTowardPlayer()) continue;
+    } else if (m.awake && monsterHasFreshPlayerMemory(m, state.turn ?? 0, 10)) {
+      const memory = ensureMonsterMemory(m);
+      if (memory && m.x === memory.lastSeenPlayerX && m.y === memory.lastSeenPlayerY) {
+        memory.lastSeenTurn = -9999;
+      } else if (memory && tryStepTowardPoint(memory.lastSeenPlayerX, memory.lastSeenPlayerY)) {
+        continue;
+      }
     }
 
     const wanderChance = m.awake ? 0.60 : 0.22;
@@ -12651,6 +13656,9 @@ const spriteProcessed = {};
 const spriteReady = {};
 const spriteRequested = {};
 function buildSpriteTransparency(id, img) {
+  if (FEATURE_FLAGS.spriteFootprints) {
+    ensureSpriteBounds(spriteBoundsCache, id, img, spriteProfileForId(id));
+  }
   // Use source sprites directly to avoid aggressive matte-stripping artifacts.
   return img;
 }
@@ -12703,8 +13711,18 @@ function spriteScalePercentForId(spriteId) {
   const scale = Number.isFinite(value) ? Math.floor(value) : 100;
   return clamp(scale, 25, 300);
 }
+function spriteProfileForId(spriteId) {
+  const base = defaultSpriteProfile(spriteScalePercentForId(spriteId));
+  const raw = spriteOverrideState.profiles?.[spriteId];
+  if (!raw || typeof raw !== "object") return base;
+  return {
+    ...base,
+    ...raw,
+  };
+}
 function scaledSpriteSize(baseSize, spriteId) {
-  const scale = spriteScalePercentForId(spriteId);
+  const profile = spriteProfileForId(spriteId);
+  const scale = Number.isFinite(profile?.maxHeightPct) ? profile.maxHeightPct : spriteScalePercentForId(spriteId);
   return Math.max(1, Math.round(baseSize * (scale / 100)));
 }
 function syncSpriteSources(overrides = null) {
@@ -12988,7 +14006,7 @@ function drawCombatHudOverlay(ctx2d, state, nowMs = Date.now()) {
   if (playerHudExpiry >= nowMs) {
     const cx = viewRadiusX * TILE + TILE / 2;
     const cy = viewRadiusY * TILE + TILE / 2;
-    const playerSize = scaledSpriteSize(PLAYER_SPRITE_SIZE, "hero");
+    const playerSize = scaledSpriteSize(PLAYER_SPRITE_SIZE, playerCharacterSpriteId(state));
     const playerExtraLiftPx = Math.round(TILE * PLAYER_COMBAT_HP_BAR_EXTRA_LIFT_FRAC);
     drawCombatHealthBar(ctx2d, cx, cy, playerSize, p.hp, p.maxHp, "#52e07a", playerExtraLiftPx);
   }
@@ -13011,6 +14029,110 @@ function drawCombatHudOverlay(ctx2d, state, nowMs = Date.now()) {
     drawCombatHealthBar(ctx2d, cx, cy, monsterSize, monster.hp, monster.maxHp, "#4fd77f", extraLiftPx);
   }
 }
+
+function computePlacedSpriteMetrics({
+  img,
+  spriteId,
+  baseTile,
+  centerX,
+  footY,
+  bobPx = 0,
+  inCombat = false,
+  adjacentCount = 0,
+} = {}) {
+  if (!img) return null;
+  const tile = Math.max(1, Math.floor(Number(baseTile) || TILE));
+  const profile = spriteProfileForId(spriteId);
+  const bounds = ensureSpriteBounds(spriteBoundsCache, spriteId || "__anon__", img, profile);
+  const metrics = computeSpriteDrawMetrics({
+    img,
+    baseTile: tile,
+    profile,
+    inCombat,
+    adjacentCount,
+    bounds,
+  });
+  const anchorX = Math.round(Number(centerX) || 0) + Math.round(Number(metrics.centerXOffset ?? 0));
+  const anchorFootY = Math.round((Number(footY) || 0) + (Number(bobPx) || 0)) + Math.round(Number(metrics.footYOffset ?? 0));
+  const drawX = Math.round(anchorX - metrics.drawWidth / 2);
+  const drawY = Math.round(anchorFootY - metrics.drawHeight);
+  const visibleTopY = Math.round(drawY + Math.max(0, metrics.drawHeight - metrics.visibleDrawHeight));
+  return {
+    profile,
+    bounds,
+    metrics,
+    centerX: anchorX,
+    footY: anchorFootY,
+    drawX,
+    drawY,
+    visibleTopY,
+    visibleCenterY: Math.round(visibleTopY + metrics.visibleDrawHeight / 2),
+  };
+}
+
+function drawSpritePlacement(ctx2d, img, placement) {
+  if (!ctx2d || !img || !placement) return;
+  ctx2d.drawImage(img, placement.drawX, placement.drawY, placement.metrics.drawWidth, placement.metrics.drawHeight);
+}
+
+function drawSpritePlacementShadow(ctx2d, placement, alpha = 0.36, liftPct = 0.06) {
+  if (!ctx2d || !placement) return;
+  drawFootShadow(
+    ctx2d,
+    placement.centerX,
+    placement.footY - Math.round(TILE * Math.max(0, Number(liftPct) || 0)),
+    placement.metrics.shadowWidth,
+    placement.metrics.shadowHeight,
+    alpha
+  );
+}
+
+function monsterIntentBadgeSpec(intent, targetsPlayer = false) {
+  const type = String(intent?.type ?? "").trim().toLowerCase();
+  if (type === "bombard") return { label: "*", color: targetsPlayer ? "#ff5b5b" : "#ff9f66" };
+  if (type === "charged_shot") return { label: "!", color: targetsPlayer ? "#ff5f5f" : "#ffd166" };
+  return { label: "!", color: targetsPlayer ? "#ff5f5f" : "#ff8b66" };
+}
+
+function collectVisibleMonsterIntentTelegraphs(state) {
+  if (!FEATURE_FLAGS.monsterIntentTelegraphs) return [];
+  const player = state?.player;
+  if (!player || player.dead) return [];
+  const out = [];
+  for (const ent of state.entities.values()) {
+    if (!ent || ent.kind !== "monster" || ent.z !== player.z) continue;
+    const intent = (ent.intent && typeof ent.intent === "object") ? ent.intent : null;
+    if (!intent || intent.visible === false) continue;
+    if (!state.visible.has(keyXY(ent.x, ent.y))) continue;
+    const targetX = Number.isFinite(Number(intent.targetX)) ? Math.floor(Number(intent.targetX)) : ent.x;
+    const targetY = Number.isFinite(Number(intent.targetY)) ? Math.floor(Number(intent.targetY)) : ent.y;
+    const targetsPlayer = targetX === player.x && targetY === player.y;
+    out.push({
+      monsterId: ent.id,
+      monsterX: ent.x,
+      monsterY: ent.y,
+      targetX,
+      targetY,
+      type: String(intent.type ?? "line_shot"),
+      executeOnTurn: Math.max(0, Math.floor(Number(intent.executeOnTurn ?? 0) || 0)),
+      targetsPlayer,
+      ...monsterIntentBadgeSpec(intent, targetsPlayer),
+    });
+  }
+  return out;
+}
+
+function worldToScreenCellCenter(player, wx, wy) {
+  const sx = wx - player.x + viewRadiusX;
+  const sy = wy - player.y + viewRadiusY;
+  return {
+    sx,
+    sy,
+    cx: sx * TILE + TILE / 2,
+    cy: sy * TILE + TILE / 2,
+  };
+}
+
 function tileIsBoundaryForFloor(t) {
   return t === WALL || t === DOOR_CLOSED || tileIsLocked(t);
 }
@@ -13608,17 +14730,19 @@ function characterSpriteCatalogEntries() {
 }
 
 function normalizeSpriteResponsePayload(payload) {
-  if (!payload || typeof payload !== "object") return { overrides: {}, scales: {}, entries: [] };
+  if (!payload || typeof payload !== "object") return { overrides: {}, scales: {}, profiles: {}, entries: [] };
   const overrides = normalizeSpriteOverrideMap(payload.overrides ?? {});
   const scales = normalizeSpriteScaleMap(payload.scales ?? {});
+  const profiles = normalizeSpriteProfiles(payload.profiles ?? {}, scales);
   const entries = Array.isArray(payload.entries) ? payload.entries.slice() : [];
-  return { overrides, scales, entries };
+  return { overrides, scales, profiles, entries };
 }
 
 function applySpritePayload(payload) {
   const normalized = normalizeSpriteResponsePayload(payload);
   spriteOverrideState.overrides = normalized.overrides;
   spriteOverrideState.scales = normalized.scales;
+  spriteOverrideState.profiles = normalized.profiles;
   spriteOverrideState.entries = normalized.entries;
   syncSpriteSources(normalized.overrides);
   infoTierSignature = "";
@@ -15957,7 +17081,15 @@ function draw(state) {
 
   const { world, player, seen, visible } = state;
   const { monsters, items, traps, actors } = getCachedOccupancy(state);
-  updateContextActionButton(state, { monsters, items, traps });
+  const occupancy = { monsters, items, traps, actors };
+  updateContextActionButton(state, occupancy);
+  const primaryAction = resolveContextAction(state, occupancy);
+  const abilityAction = activeAbilityAction(state, occupancy);
+  const highlightedMonsterIds = new Set();
+  if (primaryAction?.type === "attack" && primaryAction.targetMonsterId) highlightedMonsterIds.add(primaryAction.targetMonsterId);
+  if (abilityAction?.type === "active-ability" && abilityAction.targetMonsterId) highlightedMonsterIds.add(abilityAction.targetMonsterId);
+  const visibleIntentTelegraphs = collectVisibleMonsterIntentTelegraphs(state);
+  const visibleIntentTelegraphByMonsterId = new Map(visibleIntentTelegraphs.map((entry) => [entry.monsterId, entry]));
   const theme = applyVisibilityBoostToTheme(themeForDepth(player.z, world.seedStr ?? ""));
   const timeSec = Date.now() / 1000;
   const deferredWorldObjects = [];
@@ -16074,8 +17206,9 @@ function draw(state) {
               wy,
             });
           } else {
+            const trapStyle = trapRevealStyle(trapEnt);
             const trapColor = trapEnt?.armed
-              ? "#ffb26b"
+              ? trapStyle.color
               : (trapEnt?.triggered ? "#ff6f6f" : "#a7bfd8");
             deferredWorldObjects.push({
               kind: "glyph",
@@ -16084,7 +17217,7 @@ function draw(state) {
               order: -0.08,
               sx,
               sy,
-              glyph: "X",
+              glyph: trapStyle.glyph,
               color: trapColor,
             });
           }
@@ -16200,6 +17333,9 @@ function draw(state) {
               sy,
               img: monsterSprite,
               spriteId: monsterSpriteIdValue,
+              entityId: ent?.id ?? "",
+              wx,
+              wy,
             });
           } else {
             const gm = monsterGlyph(ent?.type);
@@ -16231,6 +17367,9 @@ function draw(state) {
               sy,
               img: actorSprite,
               spriteId: actorSpriteIdValue,
+              entityId: ent?.id ?? "",
+              wx,
+              wy,
             });
           } else {
             deferredWorldObjects.push({
@@ -16264,6 +17403,9 @@ function draw(state) {
       sy: viewRadiusY,
       img: heroSprite,
       spriteId: heroSpriteId,
+      entityId: "__player__",
+      wx: player.x,
+      wy: player.y,
     });
   } else {
     deferredWorldObjects.push({
@@ -16276,8 +17418,27 @@ function draw(state) {
       centerX: heroCx,
       centerY: heroCy,
       footY: (viewRadiusY + 1) * TILE,
+      entityId: "__player__",
+      wx: player.x,
+      wy: player.y,
     });
   }
+
+  const combatClusterMap = FEATURE_FLAGS.spriteFootprints
+    ? buildCombatAdjacencyClusters(
+        deferredWorldObjects
+          .filter((obj) =>
+            (obj.kind === "monster-sprite" || obj.kind === "actor-sprite" || obj.kind === "hero-sprite" || obj.kind === "hero-fallback") &&
+            typeof obj.entityId === "string" &&
+            obj.entityId
+          )
+          .map((obj) => ({
+            id: obj.entityId,
+            x: Math.floor(Number(obj.wx ?? obj.sortX ?? 0)),
+            y: Math.floor(Number(obj.wy ?? obj.sortY ?? 0)),
+          }))
+      )
+    : new Map();
 
   // Painter's algorithm for world objects: lower tiles (higher Y) render over higher tiles.
   deferredWorldObjects.sort((a, b) => {
@@ -16289,6 +17450,18 @@ function draw(state) {
     if (aIsShop && bIsHero) return -1;
     return (a.sortY - b.sortY) || (a.sortX - b.sortX) || (a.order - b.order);
   });
+  for (const telegraph of visibleIntentTelegraphs) {
+    const from = worldToScreenCellCenter(player, telegraph.monsterX, telegraph.monsterY);
+    const to = worldToScreenCellCenter(player, telegraph.targetX, telegraph.targetY);
+    if (from.sx < -1 || from.sy < -1 || from.sx > viewTilesX + 1 || from.sy > viewTilesY + 1) continue;
+    if (to.sx < -1 || to.sy < -1 || to.sx > viewTilesX + 1 || to.sy > viewTilesY + 1) continue;
+    drawLineTelegraph(ctx, from.cx, from.cy, to.cx, to.cy, {
+      color: telegraph.color,
+      lineWidth: telegraph.targetsPlayer ? 8 : 6,
+      alpha: telegraph.targetsPlayer ? 0.42 : 0.26,
+    });
+    drawCellHighlight(ctx, to.cx, to.cy, TILE * 0.72, telegraph.color, telegraph.targetsPlayer ? 0.28 : 0.16);
+  }
   for (const obj of deferredWorldObjects) {
     if (obj.kind === "tile-aura") {
       const cx = obj.sx * TILE + TILE / 2;
@@ -16362,37 +17535,82 @@ function draw(state) {
       continue;
     }
     if (obj.kind === "monster-sprite") {
-      const cx = obj.sx * TILE + TILE / 2;
-      const footY = (obj.sy + 1) * TILE;
-      const cy = footY - TILE * 0.5;
+      const clusterMeta = combatClusterMap.get(obj.entityId) ?? null;
+      const profile = spriteProfileForId(obj.spriteId);
+      const combatOffset = getSpriteCombatOffset(obj, clusterMeta, profile);
+      const cx = obj.sx * TILE + TILE / 2 + Math.round(TILE * (combatOffset.xPct / 100));
+      const footY = (obj.sy + 1) * TILE + Math.round(TILE * (combatOffset.yPct / 100));
       const bob = Math.sin(timeSec * 2 + (obj.sortX + obj.sortY) * 0.65) * TILE * 0.008;
-      drawSoftGlow(ctx, cx, cy, MONSTER_GLOW_RADIUS, "rgba(255,120,90,0.20)", "rgba(255,120,90,0)");
-      const size = scaledSpriteSize(MONSTER_SPRITE_SIZE, obj.spriteId);
-      drawBottomAnchoredSpriteAt(ctx, cx, footY, obj.img, size, size, bob);
+      const placement = computePlacedSpriteMetrics({
+        img: obj.img,
+        spriteId: obj.spriteId,
+        baseTile: MONSTER_SPRITE_SIZE,
+        centerX: cx,
+        footY,
+        bobPx: bob,
+        inCombat: (clusterMeta?.adjacentCount ?? 0) > 0,
+        adjacentCount: clusterMeta?.adjacentCount ?? 0,
+      });
+      if (!placement) continue;
+      drawSoftGlow(ctx, placement.centerX, placement.visibleCenterY, MONSTER_GLOW_RADIUS, "rgba(255,120,90,0.20)", "rgba(255,120,90,0)");
+      drawSpritePlacementShadow(ctx, placement, 0.36, 0.055);
+      drawSpritePlacement(ctx, obj.img, placement);
+      if (highlightedMonsterIds.has(obj.entityId)) {
+        drawTargetRing(ctx, placement.centerX, placement.footY - Math.round(TILE * 0.06), Math.max(12, Math.round(placement.metrics.shadowWidth * 0.58)), "#ffd166");
+      }
+      const intentOverlay = visibleIntentTelegraphByMonsterId.get(obj.entityId);
+      if (intentOverlay) {
+        drawIntentBadge(ctx, placement.centerX, placement.visibleTopY - 12, intentOverlay.label, intentOverlay.color);
+      }
       continue;
     }
     if (obj.kind === "actor-sprite") {
-      const cx = obj.sx * TILE + TILE / 2;
-      const footY = (obj.sy + 1) * TILE;
-      const cy = footY - TILE * 0.5;
+      const clusterMeta = combatClusterMap.get(obj.entityId) ?? null;
+      const profile = spriteProfileForId(obj.spriteId);
+      const combatOffset = getSpriteCombatOffset(obj, clusterMeta, profile);
+      const cx = obj.sx * TILE + TILE / 2 + Math.round(TILE * (combatOffset.xPct / 100));
+      const footY = (obj.sy + 1) * TILE + Math.round(TILE * (combatOffset.yPct / 100));
       const bob = Math.sin(timeSec * 1.7 + (obj.sortX + obj.sortY) * 0.45) * TILE * 0.005;
-      drawSoftGlow(ctx, cx, cy, HERO_GLOW_RADIUS * 0.72, "rgba(120,220,255,0.14)", "rgba(120,220,255,0)");
-      const size = scaledSpriteSize(PLAYER_SPRITE_SIZE, obj.spriteId);
-      drawBottomAnchoredSpriteAt(ctx, cx, footY, obj.img, size, size, bob);
+      const placement = computePlacedSpriteMetrics({
+        img: obj.img,
+        spriteId: obj.spriteId,
+        baseTile: PLAYER_SPRITE_SIZE,
+        centerX: cx,
+        footY,
+        bobPx: bob,
+        inCombat: (clusterMeta?.adjacentCount ?? 0) > 0,
+        adjacentCount: clusterMeta?.adjacentCount ?? 0,
+      });
+      if (!placement) continue;
+      drawSoftGlow(ctx, placement.centerX, placement.visibleCenterY, HERO_GLOW_RADIUS * 0.72, "rgba(120,220,255,0.14)", "rgba(120,220,255,0)");
+      drawSpritePlacementShadow(ctx, placement, 0.3, 0.055);
+      drawSpritePlacement(ctx, obj.img, placement);
       continue;
     }
     if (obj.kind === "hero-sprite") {
-      const cx = obj.sx * TILE + TILE / 2;
-      const footY = (obj.sy + 1) * TILE;
-      const cy = footY - TILE * 0.5;
+      const clusterMeta = combatClusterMap.get(obj.entityId) ?? null;
+      const profile = spriteProfileForId(obj.spriteId);
+      const combatOffset = getSpriteCombatOffset(obj, clusterMeta, profile);
+      const cx = obj.sx * TILE + TILE / 2 + Math.round(TILE * (combatOffset.xPct / 100));
+      const footY = (obj.sy + 1) * TILE + Math.round(TILE * (combatOffset.yPct / 100));
       const bob = Math.sin(timeSec * 2.4) * TILE * 0.01;
-      ctx.fillStyle = "rgba(0,0,0,0.38)";
-      ctx.beginPath();
-      ctx.ellipse(cx, footY - TILE * 0.06, TILE * 0.19, TILE * 0.085, 0, 0, Math.PI * 2);
-      ctx.fill();
-      drawSoftGlow(ctx, cx, cy, HERO_GLOW_RADIUS, "rgba(120,220,255,0.24)", "rgba(120,220,255,0)");
-      const size = scaledSpriteSize(PLAYER_SPRITE_SIZE, obj.spriteId);
-      drawBottomAnchoredSpriteAt(ctx, cx, footY, obj.img, size, size, bob);
+      const placement = computePlacedSpriteMetrics({
+        img: obj.img,
+        spriteId: obj.spriteId,
+        baseTile: PLAYER_SPRITE_SIZE,
+        centerX: cx,
+        footY,
+        bobPx: bob,
+        inCombat: (clusterMeta?.adjacentCount ?? 0) > 0,
+        adjacentCount: clusterMeta?.adjacentCount ?? 0,
+      });
+      if (!placement) continue;
+      drawSpritePlacementShadow(ctx, placement, 0.44, 0.06);
+      drawSoftGlow(ctx, placement.centerX, placement.visibleCenterY, HERO_GLOW_RADIUS, "rgba(120,220,255,0.24)", "rgba(120,220,255,0)");
+      drawSpritePlacement(ctx, obj.img, placement);
+      if (visibleIntentTelegraphs.some((telegraph) => telegraph.targetsPlayer)) {
+        drawTargetRing(ctx, placement.centerX, placement.footY - Math.round(TILE * 0.06), Math.max(14, Math.round(placement.metrics.shadowWidth * 0.7)), "#ff7b6b");
+      }
       continue;
     }
     if (obj.kind === "hero-fallback") {
@@ -16400,10 +17618,7 @@ function draw(state) {
       const footY = Number.isFinite(obj.footY) ? obj.footY : ((obj.sy + 1) * TILE);
       const cy = footY - TILE * 0.5;
       const bob = Math.sin(timeSec * 2.4) * TILE * 0.01;
-      ctx.fillStyle = "rgba(0,0,0,0.38)";
-      ctx.beginPath();
-      ctx.ellipse(cx, footY - TILE * 0.06, TILE * 0.19, TILE * 0.085, 0, 0, Math.PI * 2);
-      ctx.fill();
+      drawFootShadow(ctx, cx, footY - TILE * 0.06, TILE * 0.38, TILE * 0.17, 0.44);
       drawSoftGlow(ctx, cx, cy, HERO_GLOW_RADIUS, "rgba(120,220,255,0.24)", "rgba(120,220,255,0)");
       ctx.fillStyle = "#ffffff";
       // Fallback player marker while sprite is loading.
@@ -16411,6 +17626,9 @@ function draw(state) {
       ctx.beginPath();
       ctx.arc(cx, footY - prad + bob, prad, 0, Math.PI * 2);
       ctx.fill();
+      if (visibleIntentTelegraphs.some((telegraph) => telegraph.targetsPlayer)) {
+        drawTargetRing(ctx, cx, footY - Math.round(TILE * 0.06), Math.max(14, Math.round(TILE * 0.28)), "#ff7b6b");
+      }
     }
   }
   if (visualFxQuality > 0) {
@@ -16426,16 +17644,28 @@ function draw(state) {
       `<div>seed: ${world.seedStr} | theme: ${theme.name}</div>` +
       `<div>pos: (${player.x}, ${player.y}) chunk: (${cx}, ${cy}) local: (${lx}, ${ly})</div>`;
   }
+  const activeAbility = playerActiveAbility(state);
+  const activeAbilityState = activeAbility ? activeAbilityStatus(player, activeAbility) : null;
+  const energyNow = Math.max(0, Math.floor(player.energy ?? 0));
+  const energyMax = Math.max(0, Math.floor(player.energyMax ?? 0));
+  const abilityMeta = !activeAbility
+    ? "None"
+    : (activeAbilityState?.ok
+      ? `${activeAbility.label} (${activeAbilityCostForPlayer(player, activeAbility)})`
+      : `${activeAbility.label} (${activeAbilityState?.reason ?? "Locked"})`);
   metaEl.innerHTML =
     `<div class="meta-row"><div class="meta-col"><span class="label">XP</span><span class="val xp">${player.xp}/${xpToNext(player.level)}</span></div><div class="meta-col"><span class="label">Gold</span><span class="val gold">${player.gold}</span></div></div>` +
     `<div class="meta-row"><div class="meta-col"><span class="label">ATK</span><span class="val atk">${Math.max(1, player.atkLo + player.atkBonus)}-${Math.max(1, player.atkHi + player.atkBonus)}</span></div><div class="meta-col"><span class="label">DEF</span><span class="val def">+${player.defBonus}</span></div></div>` +
     `<div class="meta-row"><div class="meta-col"><span class="label">ACC</span><span class="val atk">${player.acc ?? 0}</span></div><div class="meta-col"><span class="label">EVA</span><span class="val def">${player.eva ?? 0}</span></div></div>` +
-    `<div class="meta-row"><div class="meta-col"><span class="label">PTS</span><span class="val gold">${characterUnspentStatPoints(state)}</span></div><div class="meta-col"><span class="label">SPD</span><span class="val def">${(player.spd ?? 1).toFixed(2)}</span></div></div>`;
+    `<div class="meta-row"><div class="meta-col"><span class="label">PTS</span><span class="val gold">${characterUnspentStatPoints(state)}</span></div><div class="meta-col"><span class="label">SPD</span><span class="val def">${(player.spd ?? 1).toFixed(2)}</span></div></div>` +
+    `<div class="meta-row"><div class="meta-col"><span class="label">EN</span><span class="val atk">${energyNow}/${energyMax}</span></div><div class="meta-col"><span class="label">Q</span><span class="val gold">${escapeHtmlText(abilityMeta)}</span></div></div>`;
   if (vitalsDisplayEl) {
     vitalsDisplayEl.innerHTML =
       `<span class="lbl">HP</span><span class="hp">${player.hp}/${player.maxHp}</span>` +
       `<span class="sep">|</span>` +
-      `<span class="lbl">LVL</span><span class="lvl">${player.level}</span>`;
+      `<span class="lbl">LVL</span><span class="lvl">${player.level}</span>` +
+      `<span class="sep">|</span>` +
+      `<span class="lbl">EN</span><span class="lvl">${energyNow}/${energyMax}</span>`;
   }
   if (depthDisplayEl) depthDisplayEl.textContent = `Depth: ${player.z}`;
   updateSurfaceCompass(state);
@@ -16477,7 +17707,12 @@ function takeTurn(state, didSpendTurn) {
   if (isLevelUpOverlayOpen()) return;
   if (isCharacterOverlayOpen()) return;
   if (!didSpendTurn) return;
+  const analytics = ensureAnalyticsState(state);
+  const actionKind = String(state.lastPlayerActionKind ?? "turn");
+  markAnalyticsInput(analytics, Date.now());
   state.turn += 1;
+  advanceAnalyticsTurn(analytics, state.player.z, Date.now());
+  if ((state.player.abilityCd ?? 0) > 0) state.player.abilityCd = Math.max(0, Math.floor(state.player.abilityCd ?? 0) - 1);
   maybeGrantExplorationXP(state);
   processPlayerTrapInteractions(state);
   if (state.player.dead) {
@@ -16485,16 +17720,22 @@ function takeTurn(state, didSpendTurn) {
     renderEquipment(state);
     renderEffects(state);
     markSaveDirty(state, "turn");
+    state.lastPlayerActionKind = "";
+    void flushAnalyticsIfNeeded(state, actionKind, true);
     return;
   }
 
   applyEffectsAfterPlayerAction(state);
   monstersTurn(state);
+  const energyGain = Math.max(8, Math.round((state.player.energyMax ?? 0) * (actionKind === "wait" ? 0.12 : 0.05)));
+  restorePlayerEnergy(state, energyGain);
 
   renderInventory(state);
   renderEquipment(state);
   renderEffects(state);
   markSaveDirty(state, "turn");
+  state.lastPlayerActionKind = "";
+  void flushAnalyticsIfNeeded(state, actionKind);
 }
 
 // ---------- Input ----------
@@ -16603,6 +17844,11 @@ function onKey(state, e) {
   else if (k === "arrowleft" || k === "a") { e.preventDefault(); takeTurn(state, playerMoveOrAttack(state, -1, 0)); }
   else if (k === "arrowright" || k === "d") { e.preventDefault(); takeTurn(state, playerMoveOrAttack(state, 1, 0)); }
   else if (k === "." || k === " " || k === "spacebar") { e.preventDefault(); takeTurn(state, waitTurn(state)); }
+  else if (k === "q") {
+    e.preventDefault();
+    const action = activeAbilityAction(state);
+    if (action && !action.disabled) takeTurn(state, action.run());
+  }
   else if (k === "g") { e.preventDefault(); takeTurn(state, pickup(state)); }
   else if (k === "c") { e.preventDefault(); {
       // Try to close an open adjacent door; if none, try to open a closed adjacent door.
@@ -16771,11 +18017,17 @@ function exportSave(state) {
     if (!ent) return [id, ov];
     if (ent.kind === "trap") {
       const next = { ...(ov ?? {}) };
+      next.trapFamily = trapFamilyDef(ent.trapFamily ?? ent.trapType ?? "pressure_plate")?.id ?? "pressure_plate";
       next.armed = !!ent.armed;
       next.detected = !!ent.detected;
       next.triggered = !!ent.triggered;
       next.disarmed = !!ent.disarmed;
       next.depth = Math.max(0, Math.floor(ent.depth ?? ent.z ?? 0));
+      next.charges = Math.max(1, Math.floor(ent.charges ?? 1));
+      next.factionId = String(ent.factionId ?? "").trim().toLowerCase();
+      next.payload = (ent.payload && typeof ent.payload === "object") ? { ...ent.payload } : {};
+      next.friendlyTo = String(ent.friendlyTo ?? "").trim().toLowerCase();
+      next.ownerId = ent.ownerId ?? "";
       return [id, next];
     }
     if (ent.kind !== "monster") return [id, ov];
@@ -16795,7 +18047,7 @@ function exportSave(state) {
   const poisonClouds = ensurePoisonCloudState(state);
 
   const payload = {
-    v: 9,
+    v: 10,
     seed: state.world.seedStr,
     fog: fogEnabled,
     minimap: minimapEnabled,
@@ -16822,6 +18074,7 @@ function exportSave(state) {
       schedules: areaRespawn.schedules ?? {},
     },
     debug: normalizeDebugFlags(state.debug),
+    analytics: analyticsSnapshotForSave(state.analytics),
   };
 
   return btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
@@ -16887,6 +18140,34 @@ function normalizeDynamicEntries(items, options = null) {
       if (effects.length > 0) entry.effects = effects;
       else delete entry.effects;
       out.push(entry);
+      continue;
+    }
+    if (kind === "trap") {
+      const x = Math.floor(Number(raw.x));
+      const y = Math.floor(Number(raw.y));
+      const z = Math.floor(Number(raw.z));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      const trapId = trapFamilyDef(raw.trapFamily ?? raw.trapType ?? "pressure_plate")?.id ?? "pressure_plate";
+      const payload = (raw.payload && typeof raw.payload === "object") ? { ...raw.payload } : {};
+      out.push({
+        ...raw,
+        kind: "trap",
+        trapType: trapId,
+        trapFamily: trapId,
+        x,
+        y,
+        z,
+        depth: Math.max(0, Math.floor(Number(raw.depth ?? z))),
+        armed: raw.armed !== false,
+        detected: !!raw.detected,
+        triggered: !!raw.triggered,
+        disarmed: !!raw.disarmed,
+        charges: Math.max(1, Math.floor(Number(raw.charges ?? 1))),
+        factionId: String(raw.factionId ?? "").trim().toLowerCase(),
+        payload,
+        friendlyTo: String(raw.friendlyTo ?? "").trim().toLowerCase(),
+        ownerId: raw.ownerId === null || raw.ownerId === undefined ? "" : String(raw.ownerId),
+      });
       continue;
     }
     if (kind === "actor") {
@@ -17114,6 +18395,11 @@ function migrateV8toV9(payload) {
   payload.v = 9;
   return payload;
 }
+function migrateV9toV10(payload) {
+  payload.analytics = payload.analytics ?? null;
+  payload.v = 10;
+  return payload;
+}
 
 function importSave(saveStr) {
   try {
@@ -17127,7 +18413,8 @@ function importSave(saveStr) {
     if (payload.v === 6) payload = migrateV6toV7(payload);
     if (payload.v === 7) payload = migrateV7toV8(payload);
     if (payload.v === 8) payload = migrateV8toV9(payload);
-    if (payload.v !== 9) return null;
+    if (payload.v === 9) payload = migrateV9toV10(payload);
+    if (payload.v !== 10) return null;
 
     const tileOverrides = new Map(payload.tileOv ?? []);
     const world = new World(payload.seed, tileOverrides);
@@ -17182,6 +18469,7 @@ function importSave(saveStr) {
       },
       quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
       debug: normalizeDebugFlags(payload.debug),
+      analytics: null,
     };
 
     fogEnabled = !!payload.fog;
@@ -17199,6 +18487,7 @@ function importSave(saveStr) {
     state.player.effects = state.player.effects ?? [];
     state.player.maxHp = Math.max(1, Math.floor(state.player.maxHp ?? maxHpForLevel(state.player.level, state.character)));
     state.player.hp = clamp(Math.floor(state.player.hp ?? state.player.maxHp), 0, state.player.maxHp);
+    if (!Number.isFinite(state.player.abilityCd)) state.player.abilityCd = 0;
     ensureCharacterState(state);
     state.surfaceLink = resolveSurfaceLink(state);
     state.startSpawn = state.startSpawn ?? computeInitialDepth0Spawn(world);
@@ -17225,6 +18514,8 @@ function importSave(saveStr) {
     ensureShopState(state);
 
     recalcDerivedStats(state);
+    if (!Number.isFinite(state.player.energy)) state.player.energy = state.player.energyMax;
+    state.analytics = initializeAnalyticsForState(state, payload.analytics ?? null, "import-save");
 
     hydrateNearby(state);
     updateAreaRespawnTracking(state, Date.now());
@@ -17782,6 +19073,12 @@ contextActionBtn?.addEventListener("click", () => {
   if (!game) return;
   const action = resolveContextAction(game);
   if (!action) return;
+  takeTurn(game, action.run());
+});
+contextAbilityBtn?.addEventListener("click", () => {
+  if (!game) return;
+  const action = activeAbilityAction(game);
+  if (!action || action.disabled) return;
   takeTurn(game, action.run());
 });
 contextPotionBtn?.addEventListener("click", () => {

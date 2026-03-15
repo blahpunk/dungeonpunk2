@@ -1,6 +1,9 @@
 <?php
 declare(strict_types=1);
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'bootstrap.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_db.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_write.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_admin.php';
 
 @ini_set('upload_max_filesize', '128M');
 @ini_set('post_max_size', '132M');
@@ -337,6 +340,15 @@ function versioned_relative_asset_url(string $relativePath): string
   return './' . $trimmed . '?v=' . rawurlencode($version);
 }
 
+function random_cache_bust_token(): string
+{
+  try {
+    return bin2hex(random_bytes(6));
+  } catch (Throwable $e) {
+    return bin2hex(pack('N', time())) . substr(bin2hex(pack('N', mt_rand())), 0, 4);
+  }
+}
+
 /**
  * @param array<string, mixed> $payload
  */
@@ -498,11 +510,11 @@ function ensure_sprite_custom_root(): bool
 }
 
 /**
- * @return array{scale: array<string, int>}
+ * @return array{scale: array<string, int>, profiles: array<string, array<string, int>>}
  */
 function load_sprite_metadata_file(string $filePath): array
 {
-  $out = ['scale' => []];
+  $out = ['scale' => [], 'profiles' => []];
   if (!is_file($filePath)) {
     return $out;
   }
@@ -516,30 +528,41 @@ function load_sprite_metadata_file(string $filePath): array
   }
 
   $scaleRaw = $decoded['scale'] ?? [];
-  if (!is_array($scaleRaw)) {
-    return $out;
+  if (is_array($scaleRaw)) {
+    foreach ($scaleRaw as $spriteIdRaw => $valueRaw) {
+      $spriteId = sprite_normalize_id((string) $spriteIdRaw);
+      $scale = $spriteId !== null ? sprite_normalize_scale_percent($valueRaw) : null;
+      if ($spriteId === null || $scale === null || $scale === 100) {
+        continue;
+      }
+      $out['scale'][$spriteId] = $scale;
+    }
   }
-  foreach ($scaleRaw as $spriteIdRaw => $valueRaw) {
-    $spriteId = sprite_normalize_id((string) $spriteIdRaw);
-    if ($spriteId === null) {
-      continue;
+
+  $profilesRaw = $decoded['profiles'] ?? [];
+  if (is_array($profilesRaw)) {
+    foreach ($profilesRaw as $spriteIdRaw => $profileRaw) {
+      $spriteId = sprite_normalize_id((string) $spriteIdRaw);
+      if ($spriteId === null) {
+        continue;
+      }
+      $profile = sprite_normalize_profile_payload($profileRaw);
+      if ($profile === []) {
+        continue;
+      }
+      $out['profiles'][$spriteId] = $profile;
     }
-    $scale = (int) $valueRaw;
-    if ($scale < 25 || $scale > 300 || $scale === 100) {
-      continue;
-    }
-    $out['scale'][$spriteId] = $scale;
   }
 
   return $out;
 }
 
 /**
- * @return array{scale: array<string, int>}
+ * @return array{scale: array<string, int>, profiles: array<string, array<string, int>>}
  */
 function load_sprite_metadata(): array
 {
-  $out = ['scale' => []];
+  $out = ['scale' => [], 'profiles' => []];
   $candidates = sprite_metadata_file_path_candidates();
   for ($idx = count($candidates) - 1; $idx >= 0; $idx--) {
     $candidate = $candidates[$idx];
@@ -547,23 +570,43 @@ function load_sprite_metadata(): array
     foreach (($loaded['scale'] ?? []) as $spriteId => $scale) {
       $out['scale'][$spriteId] = (int) $scale;
     }
+    foreach (($loaded['profiles'] ?? []) as $spriteId => $profile) {
+      if (!is_array($profile) || $profile === []) {
+        continue;
+      }
+      $out['profiles'][$spriteId] = $profile;
+    }
   }
 
   ksort($out['scale']);
+  ksort($out['profiles']);
   return $out;
 }
 
 /**
- * @param array{scale: array<string, int>} $meta
+ * @param array{scale?: array<string, int>, profiles?: array<string, array<string, int>>} $meta
  */
 function persist_sprite_metadata(array $meta): bool
 {
   if (!ensure_sprite_custom_root()) {
     return false;
   }
+  $scale = is_array($meta['scale'] ?? null) ? $meta['scale'] : [];
+  $profiles = is_array($meta['profiles'] ?? null) ? $meta['profiles'] : [];
+  ksort($scale);
+  ksort($profiles);
+  foreach ($profiles as $spriteId => $profile) {
+    if (!is_array($profile)) {
+      unset($profiles[$spriteId]);
+      continue;
+    }
+    ksort($profile);
+    $profiles[$spriteId] = $profile;
+  }
   $payload = [
-    'version' => 1,
-    'scale' => $meta['scale'] ?? [],
+    'version' => 2,
+    'scale' => $scale,
+    'profiles' => $profiles,
   ];
   $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
   if (!is_string($json)) {
@@ -593,10 +636,58 @@ function sprite_normalize_scale_percent(mixed $value): ?int
   return $num;
 }
 
+function sprite_normalize_profile_number(mixed $value, int $min, int $max): ?int
+{
+  if (!is_scalar($value) && $value !== null) {
+    return null;
+  }
+  $raw = trim((string) $value);
+  if ($raw === '' || !preg_match('/^-?\d+$/', $raw)) {
+    return null;
+  }
+  $num = (int) $raw;
+  if ($num < $min || $num > $max) {
+    return null;
+  }
+  return $num;
+}
+
+/**
+ * @return array<string, int>
+ */
+function sprite_normalize_profile_payload(mixed $raw): array
+{
+  if (!is_array($raw)) {
+    return [];
+  }
+  $map = [
+    'maxHeightPct' => [25, 300],
+    'maxWidthPct' => [25, 220],
+    'combatWidthPct' => [55, 140],
+    'anchorX' => [-50, 50],
+    'footOffsetYPct' => [-40, 40],
+    'adjacencyNudgePct' => [0, 25],
+    'shadowWidthPct' => [12, 80],
+    'shadowHeightPct' => [6, 36],
+    'trimAlphaThreshold' => [1, 255],
+  ];
+  $out = [];
+  foreach ($map as $key => [$min, $max]) {
+    $value = sprite_normalize_profile_number($raw[$key] ?? null, $min, $max);
+    if ($value === null) {
+      continue;
+    }
+    $out[$key] = $value;
+  }
+  ksort($out);
+  return $out;
+}
+
 /**
  * @return array{
  *   overrides: array<string, string>,
  *   scales: array<string, int>,
+ *   profiles: array<string, array<string, int>>,
  *   entries: array<int, array{sprite_id: string, category: string, url: string, updated_at: string, scale_percent: int}>
  * }
  */
@@ -607,12 +698,13 @@ function list_custom_sprite_overrides(): array
   $allowedExts = sprite_allowed_file_exts();
   $meta = load_sprite_metadata();
   $scales = $meta['scale'] ?? [];
+  $profiles = $meta['profiles'] ?? [];
 
   $overrides = [];
   $entries = [];
 
   if (!count($roots)) {
-    return ['overrides' => $overrides, 'scales' => $scales, 'entries' => $entries];
+    return ['overrides' => $overrides, 'scales' => $scales, 'profiles' => $profiles, 'entries' => $entries];
   }
 
   foreach ($roots as $root) {
@@ -673,7 +765,7 @@ function list_custom_sprite_overrides(): array
   );
 
   ksort($overrides);
-  return ['overrides' => $overrides, 'scales' => $scales, 'entries' => $entries];
+  return ['overrides' => $overrides, 'scales' => $scales, 'profiles' => $profiles, 'entries' => $entries];
 }
 
 function sprite_upload_error_message(int $errorCode): string
@@ -2297,8 +2389,7 @@ function item_authority_states_public_meta(array $statesById): array
 $currentUrl = current_request_url();
 $currentBaseUrl = current_request_base_url();
 $pageVersion = app_asset_version(__FILE__) . '-' . app_asset_version(__DIR__ . DIRECTORY_SEPARATOR . 'game.js');
-$requestedBust = trim((string) ($_GET['rb'] ?? ''));
-$renderCacheBust = $requestedBust !== '' ? $requestedBust : bin2hex(random_bytes(6));
+$renderCacheBust = random_cache_bust_token();
 $logoutRequested = trim((string) ($_GET['logout'] ?? '')) === '1';
 if ($logoutRequested) {
   clear_local_auth_cookie();
@@ -2445,6 +2536,7 @@ if ($apiMode === 'sprites') {
       'max_upload_bytes' => SPRITE_UPLOAD_MAX_BYTES,
       'overrides' => $payload['overrides'],
       'scales' => $payload['scales'],
+      'profiles' => $payload['profiles'],
       'entries' => $payload['entries'],
     ]);
   }
@@ -2478,6 +2570,7 @@ if ($apiMode === 'sprites') {
       'removed' => $removed,
       'overrides' => $payload['overrides'],
       'scales' => $payload['scales'],
+      'profiles' => $payload['profiles'],
       'entries' => $payload['entries'],
     ]);
   }
@@ -2489,13 +2582,14 @@ if ($apiMode === 'sprites') {
     }
     $meta = load_sprite_metadata();
     $scaleMap = $meta['scale'] ?? [];
+    $profileMap = $meta['profiles'] ?? [];
     if ($scalePercent === 100) {
       unset($scaleMap[$spriteId]);
     } else {
       $scaleMap[$spriteId] = $scalePercent;
     }
     ksort($scaleMap);
-    if (!persist_sprite_metadata(['scale' => $scaleMap])) {
+    if (!persist_sprite_metadata(['scale' => $scaleMap, 'profiles' => $profileMap])) {
       json_response(['ok' => false, 'error' => 'Could not persist sprite scale metadata.'], 500);
     }
     $payload = list_custom_sprite_overrides();
@@ -2506,6 +2600,7 @@ if ($apiMode === 'sprites') {
       'scale_percent' => $scalePercent,
       'overrides' => $payload['overrides'],
       'scales' => $payload['scales'],
+      'profiles' => $payload['profiles'],
       'entries' => $payload['entries'],
     ]);
   }
@@ -2573,6 +2668,7 @@ if ($apiMode === 'sprites') {
     'url' => $publicUrl,
     'overrides' => $payload['overrides'],
     'scales' => $payload['scales'],
+    'profiles' => $payload['profiles'],
     'entries' => $payload['entries'],
   ]);
 }
@@ -2638,6 +2734,94 @@ if ($apiMode === 'monsters') {
     'spawn_rules' => $saved['spawn_rules'] ?? [],
     'updated_at' => (string) ($saved['updated_at'] ?? ''),
   ]);
+}
+if ($apiMode === 'analytics') {
+  $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+  if ($method === 'GET' && !app_rate_limit('api_analytics_get', 240, 60)) {
+    json_response(['ok' => false, 'error' => 'Too many analytics requests. Please retry shortly.'], 429);
+  }
+  if ($method === 'POST' && !app_rate_limit('api_analytics_post', 180, 60)) {
+    json_response(['ok' => false, 'error' => 'Too many analytics writes. Please retry shortly.'], 429);
+  }
+
+  try {
+    $db = analytics_db();
+  } catch (Throwable $e) {
+    json_response(['ok' => false, 'error' => $e->getMessage()], 500);
+  }
+
+  if ($method === 'GET') {
+    if (!$isAdminUser) {
+      json_response(['ok' => false, 'error' => 'Admin access required.'], 403);
+    }
+    $action = strtolower(trim((string) ($_GET['action'] ?? 'overview')));
+    if ($action === '' || $action === 'overview') {
+      json_response([
+        'ok' => true,
+        'overview' => analytics_admin_overview($db),
+        'live_sessions' => analytics_admin_live_sessions($db),
+      ]);
+    }
+    if ($action === 'run') {
+      $runId = trim((string) ($_GET['run_id'] ?? ''));
+      if ($runId === '') {
+        json_response(['ok' => false, 'error' => 'Missing run id.'], 400);
+      }
+      $detail = analytics_admin_run($db, $runId);
+      if (!is_array($detail['run'] ?? null)) {
+        json_response(['ok' => false, 'error' => 'Run not found.'], 404);
+      }
+      json_response(['ok' => true] + $detail);
+    }
+    if ($action === 'player') {
+      $targetUser = strtolower(trim((string) ($_GET['user'] ?? '')));
+      if ($targetUser === '' || filter_var($targetUser, FILTER_VALIDATE_EMAIL) === false) {
+        json_response(['ok' => false, 'error' => 'Missing or invalid player email.'], 400);
+      }
+      json_response(['ok' => true, 'player' => analytics_admin_player($db, $targetUser)]);
+    }
+    json_response(['ok' => false, 'error' => 'Unsupported analytics action.'], 400);
+  }
+
+  if ($method !== 'POST') {
+    json_response(['ok' => false, 'error' => 'Method not allowed.'], 405);
+  }
+  if ($user === null || $userEmail === '') {
+    json_response(['ok' => false, 'error' => 'Please log in to submit analytics.'], 401);
+  }
+
+  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+  $csrfValid = $csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader);
+  if (!$csrfValid && !is_same_origin_request()) {
+    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
+  }
+
+  $body = request_json_body();
+  if ($body === null) {
+    json_response(['ok' => false, 'error' => 'Invalid JSON body.'], 400);
+  }
+  $action = strtolower(trim((string) ($body['action'] ?? '')));
+  try {
+    if ($action === 'run_start') {
+      json_response(['ok' => true, 'run' => analytics_write_run_start($db, $userEmail, $body)]);
+    }
+    if ($action === 'heartbeat') {
+      json_response(['ok' => true, 'heartbeat' => analytics_write_heartbeat($db, $userEmail, $body)]);
+    }
+    if ($action === 'event_batch') {
+      json_response(['ok' => true, 'batch' => analytics_write_event_batch($db, $userEmail, $body)]);
+    }
+    if ($action === 'run_end') {
+      json_response(['ok' => true, 'run' => analytics_write_run_end($db, $userEmail, $body)]);
+    }
+    json_response(['ok' => false, 'error' => 'Unsupported analytics action.'], 400);
+  } catch (InvalidArgumentException $e) {
+    json_response(['ok' => false, 'error' => $e->getMessage()], 400);
+  } catch (RuntimeException $e) {
+    json_response(['ok' => false, 'error' => $e->getMessage()], 409);
+  } catch (Throwable $e) {
+    json_response(['ok' => false, 'error' => 'Analytics write failed.'], 500);
+  }
 }
 if ($apiMode === 'savegames') {
   $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
@@ -3213,7 +3397,6 @@ app_apply_html_security_headers();
 $gameScriptUrl = versioned_relative_asset_url('game.js');
 $shopkeeperFullUrl = versioned_relative_asset_url('client/assets/shopkeeper_full.png');
 $gameScriptUrl .= '&rb=' . rawurlencode($renderCacheBust);
-$shopkeeperFullUrl .= '&rb=' . rawurlencode($renderCacheBust);
 $appBuildVersion = $pageVersion . '-' . $renderCacheBust;
 $spriteOverridesPayload = list_custom_sprite_overrides();
 $spriteOverridesJson = json_encode(
@@ -3221,7 +3404,7 @@ $spriteOverridesJson = json_encode(
   JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
 );
 if (!is_string($spriteOverridesJson)) {
-  $spriteOverridesJson = '{"overrides":{},"scales":{},"entries":[]}';
+  $spriteOverridesJson = '{"overrides":{},"scales":{},"profiles":{},"entries":[]}';
 }
 $monsterEditorPayload = load_monster_editor_config();
 $monsterEditorJson = json_encode(
@@ -3374,6 +3557,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         width: 100%;
         display: block;
         text-align: left;
+        text-decoration: none;
         border: 1px solid #2a3c5f;
         background: linear-gradient(180deg, rgba(34, 56, 92, 0.95) 0%, rgba(22, 35, 58, 0.95) 100%);
         color: var(--text);
@@ -5540,6 +5724,15 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         font-size: 13px;
         text-align: left;
       }
+      #contextAbilityBtn {
+        width: auto;
+        min-width: 180px;
+        max-width: 100%;
+        border-radius: 10px;
+        padding: 8px 10px;
+        font-size: 13px;
+        text-align: left;
+      }
       #contextPotionBtn {
         width: auto;
         min-width: 180px;
@@ -5550,6 +5743,10 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         text-align: left;
       }
       #contextActionBtn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      #contextAbilityBtn:disabled {
         opacity: 0.55;
         cursor: default;
       }
@@ -5701,6 +5898,8 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         max-height: calc(var(--inv-row-height) * 5);
         overflow-y: auto;
         overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
         padding-right: 2px;
       }
       #equipBadges {
@@ -5852,6 +6051,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         color: inherit;
         font: inherit;
         cursor: pointer;
+        touch-action: manipulation;
       }
       #invList > .invLabelBtn:focus { outline: none; }
       .invRow {
@@ -6005,6 +6205,28 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
           bottom: 0;
           z-index: 2;
           background: linear-gradient(180deg, rgba(10, 15, 24, 0.96) 0%, rgba(7, 11, 18, 0.99) 100%);
+        }
+        #shopBody {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(0, 1fr) auto;
+          overflow: hidden;
+          padding-bottom: max(10px, env(safe-area-inset-bottom));
+        }
+        .shopListWrap {
+          height: auto;
+          max-height: none;
+          min-height: 0;
+          -webkit-overflow-scrolling: touch;
+          touch-action: pan-y;
+        }
+        #shopDetail {
+          min-height: 0;
+          padding-bottom: max(10px, env(safe-area-inset-bottom));
+        }
+        #shopActionBtn {
+          position: sticky;
+          bottom: 0;
+          z-index: 1;
         }
         #characterOverlay {
           align-items: flex-start;
@@ -6265,6 +6487,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
           <div id="debugMenu" aria-hidden="true">
             <button id="btnSpriteEditor" type="button" class="adminMenuAction">Sprite Editor</button>
             <button id="btnMonsterEditor" type="button" class="adminMenuAction">Monster Editor</button>
+            <a href="./server/admin/dungeon_stats.php" target="_blank" rel="noopener" class="adminMenuAction">Dungeon Stats</a>
             <div class="adminMenuDivider"></div>
             <label class="debugToggle" for="toggleGodmode">
               <span>Godmode</span>
@@ -6367,6 +6590,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
             <div id="vitalsDisplay">HP: 0/0 | LVL: 1</div>
             <div id="contextActionWrap">
               <button id="contextActionBtn" type="button" title="Contextual action">No action</button>
+              <button id="contextAbilityBtn" type="button" title="Use class ability" style="display:none;">Ability</button>
               <button id="contextPotionBtn" type="button" title="Use potion" style="display:none;">Use Potion</button>
               <div id="contextAttackList"></div>
             </div>
@@ -6415,7 +6639,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
           <div id="help">
             Move: <code>Arrow</code>/<code>WASD</code> &middot; Wait: <code>.</code>/<code>Space</code><br />
             Pickup: <code>G</code> &middot; Use/Equip: <code>1&ndash;9</code> &middot; Drop: <code>Shift+1&ndash;9</code> &middot; Inventory: <code>I</code><br />
-            Doors: bump to open, <code>C</code> close adjacent open door<br />
+            Doors: bump to open, <code>C</code> close adjacent open door, <code>Q</code> use class ability<br />
             
             Interact shrine/take stairs: <code>E</code> &middot; Toggle minimap: <code>M</code> &middot; New dungeon: <code>R</code> &middot; Weapon tier details: <code>Info</code> button
           </div>
