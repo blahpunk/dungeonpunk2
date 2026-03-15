@@ -7740,7 +7740,7 @@ function renderCharacterSelectBody() {
     : "Load Selected Run";
   characterOverlayPrimaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId;
   characterOverlayPrimaryEl.style.display = "";
-  characterOverlaySecondaryEl.textContent = "Start New Run";
+    characterOverlaySecondaryEl.textContent = "New Character";
   characterOverlaySecondaryEl.disabled = characterUi.loading || slots.length >= slotCap;
   characterOverlaySecondaryEl.style.display = "";
   characterOverlayTertiaryEl.textContent = "Delete Selected";
