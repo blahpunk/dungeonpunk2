@@ -1448,6 +1448,7 @@ const isAuthenticatedUser = document.body?.dataset?.isAuthenticated === "1";
 const saveApiCsrfToken = document.body?.dataset?.saveCsrf ?? "";
 const analyticsApi = createAnalyticsApi({ baseUrl: "./index.php", csrfToken: saveApiCsrfToken });
 const saveSlotMax = Math.max(1, Number.parseInt(document.body?.dataset?.saveMaxSlots ?? "10", 10) || 10);
+const characterSlotMax = Math.max(1, Number.parseInt(document.body?.dataset?.characterMaxSlots ?? "5", 10) || 5);
 const saveNameMaxLen = Math.max(1, Number.parseInt(document.body?.dataset?.saveNameMaxLen ?? "48", 10) || 48);
 const localSlotStore = createLocalSlotStore({
   storage: localStorage,
@@ -7960,7 +7961,7 @@ function renderCharacterSelectBody() {
 
   const purpose = normalizeCharacterSelectionPurpose(characterUi.selectionPurpose);
   characterOverlayTitleEl.textContent = purpose === "swap_character" ? "Switch Character" : "Choose Character";
-  const slotCap = isAuthenticatedUser ? saveSlotMax : LOCAL_SLOT_MAX;
+  const slotCap = isAuthenticatedUser ? characterSlotMax : LOCAL_SLOT_MAX;
   characterOverlaySubtitleEl.textContent = purpose === "swap_character"
     ? "Switch character while staying in the current dungeon."
     : `Load an existing run or start a new one (${slots.length}/${slotCap} slots used).`;
@@ -8036,7 +8037,7 @@ function renderCharacterCreateBody() {
       `<h3>Create your runner. The dungeon adapts.</h3>` +
       `<p>Choose species, class, and stats. Choices are permanent per character slot.</p>` +
       `<p>${isAuthenticatedUser
-        ? `You can keep up to ${saveSlotMax} characters.`
+        ? `You can keep up to ${characterSlotMax} characters.`
         : "Login is optional for cloud slots. Starting a new guest character replaces the current guest run."}</p>` +
       `</div>`;
   } else if (step === "species") {
@@ -8378,7 +8379,7 @@ async function handleCharacterOverlayPrimary() {
 async function handleCharacterOverlaySecondary() {
   if (characterUi.loading) return;
   if (characterUi.mode === "select") {
-    const slotCap = isAuthenticatedUser ? saveSlotMax : LOCAL_SLOT_MAX;
+    const slotCap = isAuthenticatedUser ? characterSlotMax : LOCAL_SLOT_MAX;
     if ((characterUi.slots?.length ?? 0) >= slotCap) return;
     characterUi.mode = "create";
     setCharacterOverlayStatus("");

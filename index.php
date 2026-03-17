@@ -31,7 +31,8 @@ ini_set('session.gc_maxlifetime', (string) $sessionLifetimeSeconds);
 session_start();
 
 const ADMIN_EMAIL = 'eric.zeigenbein@gmail.com';
-const MAX_SERVER_SAVES = 5;
+const MAX_SERVER_SAVES = 10;
+const MAX_SERVER_CHARACTERS = 5;
 const SAVE_NAME_MAX_LEN = 48;
 const SAVE_PAYLOAD_MAX_LEN = 2000000;
 const CHARACTER_STATE_PAYLOAD_MAX_LEN = 350000;
@@ -1635,7 +1636,7 @@ function load_user_saves(string $email, string $secret): array
       return strcmp((string) $b['updated_at'], (string) $a['updated_at']);
     }
   );
-
+  $entries = prune_duplicate_autosaves($entries);
   return array_slice($entries, 0, MAX_SERVER_SAVES);
 }
 
@@ -1657,6 +1658,7 @@ function persist_user_saves(string $email, array $entries, string $secret): bool
     return false;
   }
 
+  $entries = prune_duplicate_autosaves($entries);
   $normalizedEntries = [];
   foreach (array_slice($entries, 0, MAX_SERVER_SAVES) as $entry) {
     $next = $entry;
@@ -1781,6 +1783,56 @@ function character_entries_public_meta(array $entries): array
       return strcmp((string) ($b['updated_at'] ?? ''), (string) ($a['updated_at'] ?? ''));
     }
   );
+  return $out;
+}
+
+function save_name_looks_like_autosave(string $name): bool
+{
+  return str_starts_with(strtolower(trim($name)), 'autosave');
+}
+
+/**
+ * @param array<int, array<string, mixed>> $entries
+ * @param array<string, array<string, mixed>> $characterStates
+ * @return array<string, bool>
+ */
+function collect_user_character_ids(array $entries, array $characterStates): array
+{
+  $out = [];
+  foreach ($entries as $entry) {
+    $characterId = normalize_character_profile_id((string) ($entry['character_id'] ?? ''));
+    if ($characterId !== '') {
+      $out[$characterId] = true;
+    }
+  }
+  foreach ($characterStates as $characterId => $entry) {
+    $normalizedId = normalize_character_profile_id((string) ($entry['id'] ?? $characterId));
+    if ($normalizedId !== '') {
+      $out[$normalizedId] = true;
+    }
+  }
+  return $out;
+}
+
+/**
+ * @param array<int, array<string, mixed>> $entries
+ * @return array<int, array<string, mixed>>
+ */
+function prune_duplicate_autosaves(array $entries): array
+{
+  $keptAutosaves = [];
+  $out = [];
+  foreach ($entries as $entry) {
+    $characterId = normalize_character_profile_id((string) ($entry['character_id'] ?? ''));
+    $name = (string) ($entry['name'] ?? '');
+    if ($characterId !== '' && save_name_looks_like_autosave($name)) {
+      if (isset($keptAutosaves[$characterId])) {
+        continue;
+      }
+      $keptAutosaves[$characterId] = true;
+    }
+    $out[] = $entry;
+  }
   return $out;
 }
 
@@ -2909,6 +2961,7 @@ if ($apiMode === 'savegames') {
     json_response([
       'ok' => true,
       'max_saves' => MAX_SERVER_SAVES,
+      'max_characters' => MAX_SERVER_CHARACTERS,
       'name_max_len' => SAVE_NAME_MAX_LEN,
       'characters' => character_entries_public_meta($entries),
       'character_states' => character_states_public_meta($characterStates),
@@ -2949,6 +3002,21 @@ if ($apiMode === 'savegames') {
     if ($characterName === '') {
       $characterName = 'Adventurer';
     }
+    $knownCharacterIds = collect_user_character_ids($entries, $characterStates);
+    if (!isset($knownCharacterIds[$characterId]) && count($knownCharacterIds) >= MAX_SERVER_CHARACTERS) {
+      json_response([
+        'ok' => false,
+        'error' => 'Character limit reached. Delete an existing character before creating a new one.',
+        'code' => 'CHARACTER_LIMIT_REACHED',
+        'max_characters' => MAX_SERVER_CHARACTERS,
+        'max_saves' => MAX_SERVER_SAVES,
+        'name_max_len' => SAVE_NAME_MAX_LEN,
+        'characters' => character_entries_public_meta($entries),
+        'character_states' => character_states_public_meta($characterStates),
+        'item_states' => item_authority_states_public_meta($itemAuthorityStates),
+        'saves' => save_entries_public_meta($entries),
+      ], 409);
+    }
     $updatedAt = date('c');
     $characterStates[$characterId] = [
       'id' => $characterId,
@@ -2967,6 +3035,7 @@ if ($apiMode === 'savegames') {
         'name' => $characterName,
         'updated_at' => $updatedAt,
       ],
+      'max_characters' => MAX_SERVER_CHARACTERS,
       'character_states' => character_states_public_meta($characterStates),
       'item_states' => item_authority_states_public_meta($itemAuthorityStates),
     ]);
@@ -3012,6 +3081,7 @@ if ($apiMode === 'savegames') {
       'ok' => true,
       'message' => 'Character deleted.',
       'max_saves' => MAX_SERVER_SAVES,
+      'max_characters' => MAX_SERVER_CHARACTERS,
       'name_max_len' => SAVE_NAME_MAX_LEN,
       'characters' => character_entries_public_meta($entries),
       'character_states' => character_states_public_meta($characterStates),
@@ -3269,6 +3339,7 @@ if ($apiMode === 'savegames') {
       'ok' => true,
       'message' => 'Save deleted.',
       'max_saves' => MAX_SERVER_SAVES,
+      'max_characters' => MAX_SERVER_CHARACTERS,
       'name_max_len' => SAVE_NAME_MAX_LEN,
       'characters' => character_entries_public_meta($nextEntries),
       'character_states' => character_states_public_meta($characterStates),
@@ -3307,6 +3378,40 @@ if ($apiMode === 'savegames') {
   }
 
   $overwriteId = trim((string) ($body['overwrite_id'] ?? ''));
+  $isAutosave = save_name_looks_like_autosave($name);
+  $knownCharacterIds = collect_user_character_ids($entries, $characterStates);
+  if (!isset($knownCharacterIds[$characterId]) && count($knownCharacterIds) >= MAX_SERVER_CHARACTERS) {
+    json_response([
+      'ok' => false,
+      'error' => 'Character limit reached. Delete an existing character before creating a new one.',
+      'code' => 'CHARACTER_LIMIT_REACHED',
+      'max_characters' => MAX_SERVER_CHARACTERS,
+      'max_saves' => MAX_SERVER_SAVES,
+      'name_max_len' => SAVE_NAME_MAX_LEN,
+      'characters' => character_entries_public_meta($entries),
+      'character_states' => character_states_public_meta($characterStates),
+      'item_states' => item_authority_states_public_meta($itemAuthorityStates),
+      'saves' => save_entries_public_meta($entries),
+    ], 409);
+  }
+  if ($overwriteId === '' && $isAutosave) {
+    $autosaveCandidate = null;
+    foreach ($entries as $entry) {
+      $entryCharacterId = normalize_character_profile_id((string) ($entry['character_id'] ?? ''));
+      if ($entryCharacterId !== $characterId || !save_name_looks_like_autosave((string) ($entry['name'] ?? ''))) {
+        continue;
+      }
+      if (
+        $autosaveCandidate === null ||
+        strcmp((string) ($entry['updated_at'] ?? ''), (string) ($autosaveCandidate['updated_at'] ?? '')) > 0
+      ) {
+        $autosaveCandidate = $entry;
+      }
+    }
+    if (is_array($autosaveCandidate) && trim((string) ($autosaveCandidate['id'] ?? '')) !== '') {
+      $overwriteId = (string) $autosaveCandidate['id'];
+    }
+  }
   $nowIso = date('c');
   $updatedEntry = null;
 
@@ -3335,6 +3440,7 @@ if ($apiMode === 'savegames') {
         'error' => 'Save slot limit reached. Delete or overwrite an existing save.',
         'code' => 'SAVE_LIMIT_REACHED',
         'max_saves' => MAX_SERVER_SAVES,
+        'max_characters' => MAX_SERVER_CHARACTERS,
         'name_max_len' => SAVE_NAME_MAX_LEN,
         'characters' => character_entries_public_meta($entries),
         'character_states' => character_states_public_meta($characterStates),
@@ -3364,6 +3470,7 @@ if ($apiMode === 'savegames') {
       return strcmp((string) $b['updated_at'], (string) $a['updated_at']);
     }
   );
+  $entries = prune_duplicate_autosaves($entries);
 
   if (!persist_user_saves($userEmail, $entries, $saveSecret)) {
     json_response(['ok' => false, 'error' => 'Could not persist save data.'], 500);
@@ -3386,6 +3493,7 @@ if ($apiMode === 'savegames') {
     'message' => $overwriteId !== '' ? 'Save overwritten.' : 'Game saved.',
     'save' => $savedMeta,
     'max_saves' => MAX_SERVER_SAVES,
+    'max_characters' => MAX_SERVER_CHARACTERS,
     'name_max_len' => SAVE_NAME_MAX_LEN,
     'characters' => character_entries_public_meta($entries),
     'character_states' => character_states_public_meta($characterStates),
@@ -6462,6 +6570,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
     data-is-authenticated="<?php echo $user !== null ? '1' : '0'; ?>"
     data-save-csrf="<?php echo h($saveGamesCsrf); ?>"
     data-save-max-slots="<?php echo MAX_SERVER_SAVES; ?>"
+    data-character-max-slots="<?php echo MAX_SERVER_CHARACTERS; ?>"
     data-save-name-max-len="<?php echo SAVE_NAME_MAX_LEN; ?>"
     data-app-version="<?php echo h($appBuildVersion); ?>"
   >
