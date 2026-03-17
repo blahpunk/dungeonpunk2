@@ -1728,6 +1728,11 @@ const mobileUi = { gearOpen: false, logExpanded: false };
 let mobileUiSig = "";
 let contextAuxSignature = "";
 let dpadCenterSignature = "";
+let contextActionButtonSignature = "";
+let contextAbilityButtonSignature = "";
+let contextPotionButtonSignature = "";
+let currentContextAction = null;
+let currentAbilityContextAction = null;
 let newDungeonConfirmResolver = null;
 let guestNewCharacterResolver = null;
 let guestLoginImportResolver = null;
@@ -9238,14 +9243,21 @@ function usePlayerActiveAbility(state, ability = null, explicitTarget = null, oc
 function updateAbilityContextButton(state, occupancy = null) {
   if (!contextAbilityBtn) return;
   const action = activeAbilityAction(state, occupancy);
+  currentAbilityContextAction = action ?? null;
   if (!action) {
     contextAbilityBtn.style.display = "none";
     contextAbilityBtn.disabled = true;
+    contextAbilityButtonSignature = "";
     return;
   }
   contextAbilityBtn.style.display = "";
   contextAbilityBtn.disabled = !!action.disabled;
-  setContextButtonContent(contextAbilityBtn, action.label, { glyph: "Q", color: action.disabled ? "#9aa4b2" : "#ffd166" });
+  const iconSpec = { glyph: "Q", color: action.disabled ? "#9aa4b2" : "#ffd166" };
+  const signature = contextButtonSignature(action.label, iconSpec, !!action.disabled);
+  if (signature !== contextAbilityButtonSignature) {
+    setContextButtonContent(contextAbilityBtn, action.label, iconSpec);
+    contextAbilityButtonSignature = signature;
+  }
   contextAbilityBtn.dataset.actionType = action.type;
 }
 
@@ -9539,6 +9551,16 @@ function setContextButtonContent(btn, label, iconSpec = null) {
   btn.appendChild(content);
 }
 
+function contextButtonSignature(label, iconSpec = null, disabled = false) {
+  return [
+    String(label ?? ""),
+    iconSpec?.spriteId ?? "",
+    iconSpec?.glyph ?? "",
+    iconSpec?.color ?? "",
+    disabled ? "1" : "0",
+  ].join("|");
+}
+
 function updateDpadCenterButton(state, action) {
   if (!dpadCenterBtnEl) return;
   const iconSpec = action ? iconSpecForContextAction(state, action) : null;
@@ -9592,9 +9614,14 @@ function updateDpadCenterButton(state, action) {
 function updateContextActionButton(state, occupancy = null) {
   if (!contextActionBtn) return;
   const action = resolveContextAction(state, occupancy);
+  currentContextAction = action ?? null;
   if (!action) {
     contextActionBtn.disabled = true;
-    setContextButtonContent(contextActionBtn, "No Action", null);
+    const signature = contextButtonSignature("No Action", null, true);
+    if (signature !== contextActionButtonSignature) {
+      setContextButtonContent(contextActionBtn, "No Action", null);
+      contextActionButtonSignature = signature;
+    }
     contextActionBtn.dataset.actionType = "none";
     updateDpadCenterButton(state, null);
     updateAbilityContextButton(state, occupancy);
@@ -9603,7 +9630,12 @@ function updateContextActionButton(state, occupancy = null) {
     return;
   }
   contextActionBtn.disabled = false;
-  setContextButtonContent(contextActionBtn, action.label, iconSpecForContextAction(state, action));
+  const iconSpec = iconSpecForContextAction(state, action);
+  const signature = contextButtonSignature(action.label, iconSpec, false);
+  if (signature !== contextActionButtonSignature) {
+    setContextButtonContent(contextActionBtn, action.label, iconSpec);
+    contextActionButtonSignature = signature;
+  }
   contextActionBtn.dataset.actionType = action.type;
   updateDpadCenterButton(state, action);
 
@@ -9639,16 +9671,23 @@ function updatePotionContextButton(state, primaryAction = null) {
   if (primaryAction?.type === "use-potion") {
     contextPotionBtn.style.display = "none";
     contextPotionBtn.disabled = true;
+    contextPotionButtonSignature = "";
     return;
   }
   if (!shouldShowPotionContext(state)) {
     contextPotionBtn.style.display = "none";
     contextPotionBtn.disabled = true;
+    contextPotionButtonSignature = "";
     return;
   }
   contextPotionBtn.style.display = "";
   contextPotionBtn.disabled = false;
-  setContextButtonContent(contextPotionBtn, "Use Potion", iconSpecForItemType("potion"));
+  const iconSpec = iconSpecForItemType("potion");
+  const signature = contextButtonSignature("Use Potion", iconSpec, false);
+  if (signature !== contextPotionButtonSignature) {
+    setContextButtonContent(contextPotionBtn, "Use Potion", iconSpec);
+    contextPotionButtonSignature = signature;
+  }
 }
 
 function buildAuxContextActions(state, occupancy = null, primaryAction = null) {
@@ -19112,13 +19151,13 @@ mobileOverlayBackdropEl?.addEventListener("click", () => {
 });
 contextActionBtn?.addEventListener("click", () => {
   if (!game) return;
-  const action = resolveContextAction(game);
+  const action = currentContextAction ?? resolveContextAction(game);
   if (!action) return;
   takeTurn(game, action.run());
 });
 contextAbilityBtn?.addEventListener("click", () => {
   if (!game) return;
-  const action = activeAbilityAction(game);
+  const action = currentAbilityContextAction ?? activeAbilityAction(game);
   if (!action || action.disabled) return;
   takeTurn(game, action.run());
 });
@@ -19263,7 +19302,7 @@ try {
       const handleDpad = (dx, dy) => {
         if (!game) return;
         if (dx === 0 && dy === 0) {
-          const action = resolveContextAction(game);
+          const action = currentContextAction ?? resolveContextAction(game);
           if (action) takeTurn(game, action.run());
         } else {
           takeTurn(game, playerMoveOrAttack(game, dx, dy));
