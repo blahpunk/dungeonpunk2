@@ -4733,6 +4733,14 @@ function applyAmplifierToAttackProfile(nativeProfile, amplifierProfile, amplifie
   };
   return out;
 }
+function weaponAttackNameForType(type, family = "") {
+  const explicit = String(ITEM_TYPES[type]?.name ?? "").trim();
+  if (explicit) return explicit;
+  const familyId = normalizeWeaponFamilyId(family || weaponKindFromItemType(type) || "");
+  const familyLabel = String(WEAPON_FAMILY_DEFS[familyId]?.label ?? "").trim();
+  if (familyLabel) return familyLabel;
+  return "Weapon Strike";
+}
 function weaponAttackProfileForType(type) {
   const template = itemTemplateForType(type);
   if (template?.category !== "weapon") return null;
@@ -4740,7 +4748,12 @@ function weaponAttackProfileForType(type) {
   if (behavior !== "replacer") return null;
   const family = normalizeWeaponFamilyId(template.family);
   const profile = WEAPON_ATTACK_PROFILES[family] ?? null;
-  return profile ? normalizeAttackProfile(profile, UNARMED_ATTACK_PROFILE) : null;
+  return profile
+    ? {
+        ...normalizeAttackProfile(profile, UNARMED_ATTACK_PROFILE),
+        attackName: weaponAttackNameForType(type, family),
+      }
+    : null;
 }
 function classNativeAttackProfile(classId) {
   const cid = normalizeCharacterClassId(classId);
@@ -4758,11 +4771,13 @@ function resolvePlayerAttackProfile(state) {
     if (behavior === "replacer") {
       const weaponProfile = WEAPONS[weaponTypeId]?.attackProfile ?? null;
       if (weaponProfile) {
+        const family = normalizeWeaponFamilyId(weaponTemplate.family);
         return {
           ...normalizeAttackProfile(weaponProfile, UNARMED_ATTACK_PROFILE),
+          attackName: weaponAttackNameForType(weaponTypeId, family),
           source: "replacer",
           weaponType: weaponTypeId,
-          family: normalizeWeaponFamilyId(weaponTemplate.family),
+          family,
         };
       }
     }
@@ -5373,18 +5388,18 @@ function formatMs(ms) {
 }
 
 function getSellableInventory(state) {
-  return state.inv
-    .map((entry, idx) => ({
-      idx,
-      type: entry.type,
-      amount: entry.amount ?? 1,
-      price: shopSellPrice(entry.type),
-    }))
-    .filter((entry) =>
+  return buildGroupedInventoryEntries(
+    state,
+    (entry) =>
       entry.type === "potion" ||
       entry.type.startsWith("weapon_") ||
       entry.type.startsWith("armor_")
-    );
+  ).map((entry) => ({
+    idx: entry.invIndex,
+    type: entry.type,
+    amount: entry.amount,
+    price: shopSellPrice(entry.type),
+  }));
 }
 
 function closeShopOverlay() {
@@ -10420,7 +10435,8 @@ function renderInventory(state) {
       ? canPlayerEquipItemType(state, it.type)
       : { ok: true, reason: "" };
     const unusableBadge = equipValidation.ok ? "" : " [Unusable]";
-    label.textContent = `${idx + 1}. ${nm}${isStackable(it.type) ? ` x${it.amount}` : ""}${unusableBadge}`;
+    const stackedAmount = Math.max(1, Math.floor(Number(entry.amount ?? it.amount ?? 1) || 1));
+    label.textContent = `${idx + 1}. ${nm}${stackedAmount > 1 ? ` x${stackedAmount}` : ""}${unusableBadge}`;
     if (usageMeta) {
       const template = itemTemplateForType(it.type);
       const detailLines = [];
@@ -10453,21 +10469,42 @@ function renderInventory(state) {
   });
 }
 
-function getInventoryDisplayEntries(state) {
-  const entries = state.inv.map((item, invIndex) => ({
-    item,
-    invIndex,
-    priority: item.type === "potion" ? 0 : 1,
-    value: itemMarketValue(item.type),
-    name: ITEM_TYPES[item.type]?.name ?? item.type,
-  }));
-  entries.sort((a, b) =>
+function buildGroupedInventoryEntries(state, filterFn = null) {
+  const grouped = new Map();
+  const source = Array.isArray(state?.inv) ? state.inv : [];
+  for (let invIndex = 0; invIndex < source.length; invIndex++) {
+    const item = source[invIndex];
+    if (!item?.type) continue;
+    if (filterFn && !filterFn(item, invIndex)) continue;
+    const type = String(item.type);
+    const amount = Math.max(1, Math.floor(Number(item.amount ?? 1) || 1));
+    const existing = grouped.get(type);
+    if (existing) {
+      existing.amount += amount;
+      existing.invIndices.push(invIndex);
+      continue;
+    }
+    grouped.set(type, {
+      type,
+      item,
+      invIndex,
+      invIndices: [invIndex],
+      amount,
+      priority: type === "potion" ? 0 : 1,
+      value: itemMarketValue(type),
+      name: ITEM_TYPES[type]?.name ?? type,
+    });
+  }
+  return [...grouped.values()].sort((a, b) =>
     (a.priority - b.priority) ||
     (b.value - a.value) ||
     a.name.localeCompare(b.name) ||
     (a.invIndex - b.invIndex)
   );
-  return entries;
+}
+
+function getInventoryDisplayEntries(state) {
+  return buildGroupedInventoryEntries(state);
 }
 
 function inventoryIconNode(type) {
@@ -12657,7 +12694,8 @@ function pickup(state) {
     if (isLocked) {
       const lockpickEnabled = !!stateDebug(state).lockpick;
       if (!lockpickEnabled && (!keyType || !invConsume(state, keyType, 1))) {
-        pushLog(state, "The chest is locked. You need the correct key to open it.");
+        const keyName = ITEM_TYPES[keyType]?.name ?? "matching key";
+        pushLog(state, `The chest is locked. Need a ${keyName}.`);
         return false;
       }
       if (lockpickEnabled) pushLog(state, "You pick the chest lock.");
@@ -13775,15 +13813,15 @@ const MONSTER_SPRITE_FALLBACKS = {
   singularity_hunter: "wraith",
 };
 const CHEST_LOCK_SPRITE_BY_KEY = {
-  key_red: "chest_red",
-  key_green: "chest_green",
-  key_yellow: "chest_green",
-  key_orange: "chest_red",
-  key_violet: "chest_purple",
-  key_indigo: "chest_blue",
-  key_blue: "chest_blue",
-  key_purple: "chest_purple",
-  key_magenta: "chest_blue",
+  key_red: ["chest_red"],
+  key_green: ["chest_green"],
+  key_yellow: ["chest_green"],
+  key_orange: ["chest_red"],
+  key_violet: ["chest_violet", "chest_purple", "chest_blue"],
+  key_indigo: ["chest_indigo", "chest_blue"],
+  key_blue: ["chest_blue", "chest_indigo"],
+  key_purple: ["chest_purple", "chest_violet", "chest_blue"],
+  key_magenta: ["chest_magenta", "chest_indigo", "chest_blue"],
 };
 const WEAPON_SPRITE_FAMILY_FALLBACK = Object.freeze({
   dagger: ["dagger", "sword", "axe"],
@@ -13866,8 +13904,11 @@ function itemSpriteId(ent) {
   if (type === "chest") {
     const keyType = ent.keyType ?? ent.lockKeyType ?? null;
     const isLocked = !!ent.locked || !!keyType;
-    const lockSprite = isLocked ? (CHEST_LOCK_SPRITE_BY_KEY[keyType] ?? null) : null;
-    if (lockSprite && SPRITE_SOURCES[lockSprite]) return lockSprite;
+    const lockSpriteCandidates = isLocked ? (CHEST_LOCK_SPRITE_BY_KEY[keyType] ?? null) : null;
+    const lockSprite = Array.isArray(lockSpriteCandidates)
+      ? firstAvailableSpriteId(...lockSpriteCandidates)
+      : null;
+    if (lockSprite) return lockSprite;
   }
   for (const spriteId of itemSpriteCandidates(type)) {
     if (!spriteId || !SPRITE_SOURCES[spriteId]) continue;
