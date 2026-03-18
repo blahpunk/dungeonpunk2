@@ -4,6 +4,12 @@ require_once __DIR__ . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'boot
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_db.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_write.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_admin.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'session_manager.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'run_saver.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'sim_engine.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'run_loader.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'diff_builder.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'command_router.php';
 
 @ini_set('upload_max_filesize', '128M');
 @ini_set('post_max_size', '132M');
@@ -2873,6 +2879,125 @@ if ($apiMode === 'analytics') {
     json_response(['ok' => false, 'error' => $e->getMessage()], 409);
   } catch (Throwable $e) {
     json_response(['ok' => false, 'error' => 'Analytics write failed.'], 500);
+  }
+}
+if ($apiMode === 'authoritative') {
+  $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+  if ($method === 'POST' && !app_rate_limit('api_authoritative_post', 240, 60)) {
+    json_response(['ok' => false, 'error' => 'Too many authoritative requests. Please retry shortly.'], 429);
+  }
+  if ($user === null || $userEmail === '') {
+    json_response(['ok' => false, 'error' => 'Please log in to play an authoritative run.'], 401);
+  }
+  $saveSecret = save_signing_secret();
+  if ($saveSecret === '') {
+    json_response(['ok' => false, 'error' => 'Server save signing key is not configured.'], 500);
+  }
+  if ($method !== 'POST') {
+    json_response(['ok' => false, 'error' => 'Method not allowed.'], 405);
+  }
+
+  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+  $csrfValid = $csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader);
+  if (!$csrfValid && !is_same_origin_request()) {
+    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
+  }
+
+  $body = request_json_body();
+  if ($body === null) {
+    json_response(['ok' => false, 'error' => 'Invalid JSON body.'], 400);
+  }
+
+  $action = strtolower(trim((string) ($body['action'] ?? '')));
+  try {
+    if ($action === 'open_session') {
+      $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+      $saveId = trim((string) ($body['save_id'] ?? ''));
+      json_response(authoritative_open_session_for_character($userEmail, $saveSecret, $characterId, [
+        'save_id' => $saveId,
+        'force_entrance' => !empty($body['force_entrance']),
+        'fresh_world' => !empty($body['fresh_world']),
+      ]));
+    }
+    if ($action === 'switch_character') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+      if ($sessionId === '' || $characterId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session or character id.'], 400);
+      }
+      json_response(authoritative_switch_session_character($userEmail, $saveSecret, $sessionId, $characterId, [
+        'force_entrance' => !empty($body['force_entrance']),
+      ]));
+    }
+    if ($action === 'new_dungeon') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      json_response(authoritative_start_new_dungeon($userEmail, $saveSecret, $sessionId));
+    }
+    if ($action === 'command') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      $command = $body['command'] ?? null;
+      $clientCommandSeq = max(0, (int) ($body['client_command_seq'] ?? 0));
+      if ($sessionId === '' || !is_array($command) || $clientCommandSeq <= 0) {
+        json_response(['ok' => false, 'error' => 'Missing session, command, or command sequence.'], 400);
+      }
+      json_response(authoritative_handle_command($userEmail, $saveSecret, $sessionId, $clientCommandSeq, $command));
+    }
+    if ($action === 'request_resync') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
+      json_response(authoritative_build_snapshot_response($loaded['session'], $loaded['snapshot'], [
+        'message' => 'Authoritative session resynced.',
+      ]));
+    }
+    if ($action === 'create_character_and_enter') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      $characterPayload = trim((string) ($body['character_payload'] ?? ''));
+      $characterName = trim_save_name((string) ($body['name'] ?? ''));
+      if ($sessionId === '' || $characterPayload === '') {
+        json_response(['ok' => false, 'error' => 'Missing session or character payload.'], 400);
+      }
+      json_response(authoritative_create_character_and_enter(
+        $userEmail,
+        $saveSecret,
+        $sessionId,
+        $characterPayload,
+        $characterName
+      ));
+    }
+    if ($action === 'manual_save') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      json_response(authoritative_manual_save_current_run(
+        $userEmail,
+        $saveSecret,
+        $sessionId,
+        trim((string) ($body['name'] ?? '')),
+        trim((string) ($body['overwrite_id'] ?? '')),
+        !empty($body['autosave'])
+      ));
+    }
+    if ($action === 'save_and_exit') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      json_response(authoritative_save_and_exit($userEmail, $saveSecret, $sessionId));
+    }
+    json_response(['ok' => false, 'error' => 'Unsupported authoritative action.'], 400);
+  } catch (InvalidArgumentException $e) {
+    json_response(['ok' => false, 'error' => $e->getMessage()], 400);
+  } catch (RuntimeException $e) {
+    json_response(['ok' => false, 'error' => $e->getMessage()], 409);
+  } catch (Throwable $e) {
+    json_response(['ok' => false, 'error' => 'Authoritative action failed.'], 500);
   }
 }
 if ($apiMode === 'savegames') {
@@ -6619,6 +6744,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
   <body
     data-can-admin-controls="<?php echo $isAdminUser ? '1' : '0'; ?>"
     data-is-authenticated="<?php echo $user !== null ? '1' : '0'; ?>"
+    data-authoritative-enabled="<?php echo $user !== null ? '1' : '0'; ?>"
     data-save-csrf="<?php echo h($saveGamesCsrf); ?>"
     data-save-max-slots="<?php echo MAX_SERVER_SAVES; ?>"
     data-character-max-slots="<?php echo MAX_SERVER_CHARACTERS; ?>"
