@@ -4316,7 +4316,11 @@ function monsterDisplayName(monsterOrType, depth = 0) {
     ? depth
     : (monsterOrType?.z ?? depth ?? 0);
   const spec = monsterStatsForDepth(type, z);
-  const baseName = spec?.name ?? MONSTER_TYPES[type]?.name ?? type;
+  const canonicalId = normalizeMonsterTypeId(type);
+  const canonicalName = canonicalId === "rat"
+    ? "Rat"
+    : (canonicalId === "goblin" ? "Goblin" : "");
+  const baseName = canonicalName || spec?.name || MONSTER_TYPES[type]?.name || type;
   const prefix = monsterSizeTierPrefix(spec?.sizeTier);
   return prefix ? `${prefix} ${baseName}` : baseName;
 }
