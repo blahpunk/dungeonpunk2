@@ -12341,6 +12341,7 @@ function updateAreaRespawnSystem(state, now = Date.now()) {
 function computeVisibility(state) {
   updateViewportMetrics();
   const canTrackDiscovery = canMutateGameplayStateLocally();
+  const shouldPrimeSeenForRender = !canTrackDiscovery && (state?.seen?.size ?? 0) === 0;
   const { world, player, seen, visible } = state;
   if (visibilityStateRef !== state) {
     visibilityStateRef = state;
@@ -12363,9 +12364,9 @@ function computeVisibility(state) {
 
       if (!fogEnabled) {
         visible.add(keyXY(wx, wy));
-        if (canTrackDiscovery) {
+        if (canTrackDiscovery || shouldPrimeSeenForRender) {
           const seenKey = keyXYZ(wx, wy, player.z);
-          if (!seen.has(seenKey)) {
+          if (!seen.has(seenKey) && canTrackDiscovery) {
             newlySeenTiles += 1;
             const { cx, cy } = splitWorldToChunk(wx, wy);
             const chunkKey = keyZCXCY(player.z, cx, cy);
@@ -12373,17 +12374,17 @@ function computeVisibility(state) {
               state.exploredChunks.add(chunkKey);
               newlySeenChunks += 1;
             }
-            seen.add(seenKey);
           }
+          seen.add(seenKey);
         }
         continue;
       }
 
       if (hasLineOfSight(world, player.z, player.x, player.y, wx, wy)) {
         visible.add(keyXY(wx, wy));
-        if (canTrackDiscovery) {
+        if (canTrackDiscovery || shouldPrimeSeenForRender) {
           const seenKey = keyXYZ(wx, wy, player.z);
-          if (!seen.has(seenKey)) {
+          if (!seen.has(seenKey) && canTrackDiscovery) {
             newlySeenTiles += 1;
             const { cx, cy } = splitWorldToChunk(wx, wy);
             const chunkKey = keyZCXCY(player.z, cx, cy);
@@ -12391,8 +12392,8 @@ function computeVisibility(state) {
               state.exploredChunks.add(chunkKey);
               newlySeenChunks += 1;
             }
-            seen.add(seenKey);
           }
+          seen.add(seenKey);
         }
       }
     }
