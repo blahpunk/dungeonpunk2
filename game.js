@@ -7069,7 +7069,7 @@ function buildNewDungeonResetSummary(state) {
     `Bound progression kept: Level ${level} (${xp}/${xpNeeded} XP), Gold ${Math.max(0, Math.floor(p.gold ?? 0))}\n` +
     `Bound equipment/inventory kept: ${inv.length} stacks (${invTotal} total), ${equippedCount} equipped\n` +
     `Run progress reset: ${depthLabel}, ${exploredChunks} explored chunks, ${seenTiles} discovered tiles, turn ${turn}\n\n` +
-    "Starting a new dungeon keeps character progression/items and starts a fresh map. Save first if you want to keep this current dungeon instance."
+    "WARNING: Starting a new dungeon permanently discards the current dungeon instance for this account. All characters will have dungeon position reset and will re-enter at the new dungeon entrance."
   );
 }
 
@@ -7121,7 +7121,7 @@ function openCharacterSwitchConfirm(currentSlot = null, targetSlot = null) {
   if (characterSwitchConfirmResolver) return Promise.resolve(false);
   const currentName = String(currentSlot?.profile?.name ?? currentSlot?.name ?? ensureCharacterState(game)?.name ?? DEFAULT_CHARACTER_NAME).trim() || DEFAULT_CHARACTER_NAME;
   const targetName = String(targetSlot?.profile?.name ?? targetSlot?.name ?? DEFAULT_CHARACTER_NAME).trim() || DEFAULT_CHARACTER_NAME;
-  const hasSavedPosition = !!(targetSlot?.hasDungeonPosition || targetSlot?.latestSaveId);
+  const hasSavedPosition = !!targetSlot?.hasDungeonPosition;
   const title = hasSavedPosition ? "Switch Character?" : "Start Character?";
   const body = hasSavedPosition
     ? `You will stop controlling ${currentName} and resume ${targetName} at their saved location.`
@@ -7599,16 +7599,8 @@ async function autosaveIfDirty(reason = "") {
   saveRuntime.saving = true;
   try {
     if (isAuthoritativeSessionActive()) {
-      const response = await authoritativeApi.manualSave({
-        sessionId: authoritativeMirror.sessionId,
-        overwriteId: String(saveRuntime.activeAutosaveSaveId ?? "").trim(),
-        autosave: true,
-      });
-      const applied = applyAuthoritativeSnapshotToGame(response, {
-        clearDirty: true,
-        reason: String(reason || "authoritative-autosave"),
-      });
-      return !!(applied && response?.ok);
+      clearSaveDirty();
+      return true;
     }
     if (isAuthenticatedUser) {
       const overwriteId = String(saveRuntime.activeRunSaveId ?? "").trim();
@@ -7630,25 +7622,8 @@ async function autosaveBeforeCharacterSwitch() {
   if (!game) return true;
   if (isAuthoritativeModeEnabled()) {
     if (isAuthoritativeSessionActive()) {
-      try {
-        const response = await authoritativeApi.manualSave({
-          sessionId: authoritativeMirror.sessionId,
-          overwriteId: String(saveRuntime.activeAutosaveSaveId ?? "").trim(),
-          autosave: true,
-        });
-        const applied = applyAuthoritativeSnapshotToGame(response, {
-          clearDirty: true,
-          reason: "switch-character-autosave",
-        });
-        return !!(applied && response?.ok);
-      } catch {
-        return false;
-      }
-    }
-    if (isAuthenticatedUser) {
-      return saveCurrentGameToServer(String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim(), {
-        autosave: true,
-      });
+      clearSaveDirty();
+      return true;
     }
     return true;
   }
@@ -8613,35 +8588,12 @@ async function saveCurrentGameToServer(overwriteId = "", options = null) {
   renderSaveGameOverlay();
   setSaveGameStatus(targetOverwriteId ? "Overwriting save..." : "Saving game...", false);
   try {
-    if (isAuthoritativeModeEnabled() && !isAuthoritativeSessionActive()) {
-      throw new Error("No authoritative session is active.");
-    }
-    if (isAuthoritativeSessionActive()) {
-      const data = await authoritativeApi.manualSave({
-        sessionId: authoritativeMirror.sessionId,
-        overwriteId: targetOverwriteId,
-        name,
-        autosave: useAutosaveName,
-      });
-      const applied = applyAuthoritativeSnapshotToGame(data, {
-        clearDirty: true,
-        reason: useAutosaveName ? "authoritative-autosave" : "authoritative-save",
-      });
-      if (!applied || !data?.ok) {
-        throw new Error(data?.error ?? "Could not persist authoritative save.");
+    if (isAuthoritativeModeEnabled()) {
+      if (useAutosaveName) {
+        clearSaveDirty();
+        return true;
       }
-      saveMenuUi.saves = Array.isArray(data.saves) ? data.saves : saveMenuUi.saves;
-      if (data?.save?.id) {
-        const savedId = String(data.save.id);
-        if (useAutosaveName) saveRuntime.activeAutosaveSaveId = savedId;
-        else saveRuntime.activeRunSaveId = savedId;
-      }
-      saveResumeSnapshot(game);
-      clearSaveDirty();
-      refreshSaveNameFromLive(true);
-      setSaveGameStatus(data?.message ?? "Game saved.", false);
-      renderSaveGameOverlay();
-      return true;
+      throw new Error("Manual save/load slots are disabled. Character progress is autosaved automatically.");
     }
     const data = await saveApiRequest("POST", {
       action: "save",
@@ -8741,33 +8693,7 @@ async function resolveLatestCharacterSnapshotFromServer(characterId = "") {
   if (!isAuthenticatedUser) return null;
   const targetId = String(characterId ?? "").trim();
   if (!targetId) return null;
-  const directState = await resolveCharacterSnapshotFromServerState(targetId);
-  if (directState) return directState;
-  const list = await saveApiRequest("GET");
-  const characters = Array.isArray(list?.characters) ? list.characters : [];
-  const saves = Array.isArray(list?.saves) ? list.saves : [];
-  let latestSaveId = "";
-  const direct = characters.find((entry) => String(entry?.character_id ?? "") === targetId);
-  if (direct) {
-    latestSaveId = String(direct?.latest_save_id ?? "").trim();
-  }
-  if (!latestSaveId) {
-    let chosenMeta = null;
-    for (const save of saves) {
-      const cid = String(save?.character_id ?? "").trim();
-      if (!cid || cid !== targetId) continue;
-      chosenMeta = chooseNewerCharacterSaveEntry(chosenMeta, {
-        id: String(save?.id ?? ""),
-        updatedAt: String(save?.updated_at ?? ""),
-      });
-    }
-    latestSaveId = String(chosenMeta?.id ?? "").trim();
-  }
-  if (!latestSaveId) return null;
-  const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(latestSaveId)}`);
-  const loaded = importSave(String(detail?.save?.payload ?? ""));
-  if (!loaded) return null;
-  return exportCharacterSnapshot(loaded);
+  return resolveCharacterSnapshotFromServerState(targetId);
 }
 
 async function resolveLatestCharacterSnapshotFromLocal(characterId = "") {
@@ -8806,7 +8732,6 @@ async function resolveLatestCharacterSnapshot(characterId = "") {
 async function fetchCharacterSlotsFromServer() {
   if (!isAuthenticatedUser) return [];
   const base = await saveApiRequest("GET");
-  const characters = Array.isArray(base?.characters) ? base.characters : [];
   const characterStates = Array.isArray(base?.character_states) ? base.character_states : [];
   const slotsByCharacterId = new Map();
   for (const stateMeta of characterStates) {
@@ -8845,50 +8770,6 @@ async function fetchCharacterSlotsFromServer() {
     slotsByCharacterId.set(characterId, slot);
   }
 
-  for (const entry of characters) {
-    const characterId = normalizeCharacterProfileId(entry?.character_id ?? "");
-    if (!characterId) continue;
-    const slotId = characterStateSlotId(characterId);
-    if (!slotId) continue;
-    const profileFallback = normalizeCharacterProfile({
-      id: characterId,
-      name: String(entry?.character_name ?? DEFAULT_CHARACTER_NAME),
-    });
-    const slot = slotsByCharacterId.get(characterId) ?? {
-      id: slotId,
-      name: String(entry?.character_name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
-      updatedAt: String(entry?.updated_at ?? ""),
-      level: Math.max(1, Math.floor(entry?.level ?? 1)),
-      depth: Math.trunc(entry?.depth ?? 0),
-      profile: profileFallback,
-      deepestDepth: Math.max(0, Math.trunc(entry?.depth ?? 0)),
-      latestSaveId: "",
-      hasDungeonPosition: false,
-    };
-    const saveId = String(entry?.latest_save_id ?? "").trim();
-    slot.name = String(entry?.character_name ?? slot.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME);
-    const entryUpdatedAt = String(entry?.updated_at ?? "");
-    if (!slot.updatedAt || entryUpdatedAt > String(slot.updatedAt)) slot.updatedAt = entryUpdatedAt;
-    slot.level = Math.max(1, Math.floor(entry?.level ?? slot.level ?? 1));
-    slot.depth = Math.trunc(entry?.depth ?? slot.depth ?? 0);
-    slot.deepestDepth = Math.max(Math.floor(slot.deepestDepth ?? 0), Math.trunc(entry?.depth ?? 0));
-    slot.latestSaveId = saveId || String(slot.latestSaveId ?? "");
-    slot.hasDungeonPosition = slot.hasDungeonPosition || !!saveId;
-    if (saveId) {
-      try {
-        const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
-        const summary = parseCharacterSummaryPayload(detail?.save?.payload ?? "");
-        if (summary) {
-          slot.profile = summary.profile;
-          slot.level = summary.level;
-          slot.depth = summary.depth;
-          slot.deepestDepth = summary.deepestDepth;
-          slot.hasDungeonPosition = true;
-        }
-      } catch {}
-    }
-    slotsByCharacterId.set(characterId, slot);
-  }
   const out = Array.from(slotsByCharacterId.values());
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   return out;
@@ -9366,7 +9247,7 @@ async function handleCharacterOverlayPrimary() {
       ? await switchCharacter(selectedId, {
         characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(selectedId)),
         latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
-        forceEntrance: true,
+        forceEntrance: false,
       })
       : await loadRunFromCharacterSlot(selectedId, {
         forceEntrance: false,
@@ -9888,12 +9769,6 @@ function mostRecentCharacterSlotIdFromSaveListResponse(listData = null) {
     const slotId = characterStateSlotId(cid);
     if (slotId) return slotId;
   }
-  const characters = Array.isArray(data.characters) ? data.characters : [];
-  for (const entry of characters) {
-    const cid = normalizeCharacterProfileId(entry?.character_id ?? "");
-    const slotId = characterStateSlotId(cid);
-    if (slotId) return slotId;
-  }
   return "";
 }
 
@@ -9906,25 +9781,14 @@ async function loadLatestAccountRunAfterGuestDecline() {
     return false;
   }
   const slotId = mostRecentCharacterSlotIdFromSaveListResponse(data);
-  if (slotId) setActiveCharacterSlotId(slotId);
-
-  const saves = Array.isArray(data?.saves) ? [...data.saves] : [];
-  saves.sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
-  const autosave = saves.find((save) => saveNameLooksLikeAutosave(save?.name ?? ""));
-  const chosenSave = autosave ?? saves[0] ?? null;
-
-  if (chosenSave?.id) {
-    const loaded = await loadSaveFromServer(String(chosenSave.id), {
-      showStatus: false,
-      closeOverlay: false,
-      forceEntrance: false,
-    });
-    if (loaded) return true;
-  }
-
   if (slotId) {
+    setActiveCharacterSlotId(slotId);
+    const characterId = normalizeCharacterProfileIdFromSlotId(slotId);
     clearSaveDirty();
-    const loadedCharacter = await loadRunFromCharacterSlot(slotId, { forceEntrance: false });
+    const loadedCharacter = await loadRunFromCharacterSlot(slotId, {
+      forceEntrance: false,
+      characterId,
+    });
     if (loadedCharacter) return true;
   }
   return false;
@@ -9973,6 +9837,7 @@ function loadLocalAutosaveForRespawn() {
 }
 async function loadLatestAutosaveForRespawn() {
   if (!game?.player?.dead) return false;
+  if (isAuthoritativeModeEnabled()) return false;
 
   if (isAuthenticatedUser) {
     const activeRunSaveId = String(saveRuntime.activeRunSaveId ?? "").trim();
@@ -10068,7 +9933,7 @@ async function maybeHandlePostLoginGuestImport() {
     if (shouldImport) {
       const imported = await importGuestCharacterFromCurrentRun({ closeOverlay: true });
       if (imported) {
-        pushLog(game, "Guest character imported. Use Save Game to store this dungeon run on the server.");
+        pushLog(game, "Guest character imported. Use Choose Character to switch between your account characters.");
       } else {
         pushLog(game, "Could not import guest character.");
       }

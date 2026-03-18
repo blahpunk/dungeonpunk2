@@ -53,29 +53,6 @@ function authoritative_persist_canonical_snapshot(
 }
 
 /**
- * @param array<string, mixed> $session
- * @param array<string, mixed> $snapshot
- */
-function authoritative_maybe_persist_autosave(
-  string $userEmail,
-  string $saveSecret,
-  array $session,
-  array $snapshot,
-  string $reason = ''
-): ?array {
-  $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
-  $level = max(1, (int) ($summary['level'] ?? 1));
-  $depth = (int) ($summary['depth'] ?? 0);
-  $base = default_save_name($level, $depth);
-  $name = trim_save_name(sprintf('Autosave - %s', $base));
-  $result = authoritative_persist_named_save_entry($userEmail, $saveSecret, (string) ($snapshot['payload'] ?? ''), $name, '');
-  if ($reason !== '') {
-    $result['reason'] = $reason;
-  }
-  return $result;
-}
-
-/**
  * @param array<string, mixed> $options
  * @return array<string, mixed>
  */
@@ -197,7 +174,6 @@ function authoritative_switch_session_character(
       (string) ($snapshot['character']['name'] ?? 'Adventurer')
     );
   }
-  authoritative_maybe_persist_autosave($userEmail, $saveSecret, $session, $snapshot, 'character_switch');
 
   $context = authoritative_bootstrap_context($userEmail, $saveSecret, $characterId, []);
   $targetCharacterPayload = trim((string) ($context['character_payload'] ?? ''));
@@ -271,6 +247,11 @@ function authoritative_start_new_dungeon(
 
   $session['character_id'] = normalize_character_profile_id((string) ($nextSnapshot['character']['id'] ?? ($session['character_id'] ?? '')));
   authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $nextSnapshot, $runRecord);
+  authoritative_clear_inactive_character_positions_for_new_dungeon(
+    $userEmail,
+    $saveSecret,
+    (string) ($session['character_id'] ?? '')
+  );
   if (!authoritative_persist_session($session)) {
     throw new RuntimeException('Could not persist authoritative new dungeon session.');
   }
@@ -297,7 +278,6 @@ function authoritative_handle_command(
   $loaded = authoritative_load_session_run_context($userEmail, $sessionId);
   $session = $loaded['session'];
   $runRecord = $loaded['run_record'];
-  $commandType = strtoupper(trim((string) ($command['type'] ?? '')));
   $requiresShopLock = function_exists('authoritative_shop_command_requires_lock')
     ? authoritative_shop_command_requires_lock($command)
     : false;
@@ -341,7 +321,6 @@ function authoritative_handle_command(
     $runRecord,
     $command,
     $clientCommandSeq,
-    $commandType,
     $requiresShopLock
   ): array {
     $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
@@ -368,23 +347,12 @@ function authoritative_handle_command(
       throw new RuntimeException('Could not persist authoritative command session.');
     }
 
-    $autosave = null;
-    if ($commandOk && ($commandType === 'USE_STAIRS' || !empty($snapshot['summary']['dead']))) {
-      $autosave = authoritative_maybe_persist_autosave(
-        $userEmail,
-        $saveSecret,
-        $session,
-        $snapshot,
-        $commandType === 'USE_STAIRS' ? 'stairs' : 'death'
-      );
-    }
-
     return authoritative_build_snapshot_response($session, $snapshot, [
       'ok' => $commandOk,
       'accepted_command_seq' => $clientCommandSeq,
       'error' => $commandOk ? '' : trim((string) ($result['error'] ?? 'Command rejected.')),
-      'save' => is_array($autosave['save'] ?? null) ? $autosave['save'] : null,
-      'saves' => is_array($autosave['saves'] ?? null) ? $autosave['saves'] : null,
+      'save' => null,
+      'saves' => [],
     ]);
   };
 
@@ -452,25 +420,23 @@ function authoritative_manual_save_current_run(
   bool $autosave = false
 ): array {
   $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
+  $session = $loaded['session'];
   $snapshot = $loaded['snapshot'];
-  $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
-  $level = max(1, (int) ($summary['level'] ?? 1));
-  $depth = (int) ($summary['depth'] ?? 0);
-  $name = trim_save_name($nameInput);
-  if ($autosave) {
-    $name = trim_save_name(sprintf('Autosave - %s', default_save_name($level, $depth)));
+  $characterId = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
+  $characterPayload = trim((string) ($snapshot['characterSnapshotPayload'] ?? ''));
+  if ($characterId !== '' && $characterPayload !== '') {
+    authoritative_persist_character_state_payload(
+      $userEmail,
+      $saveSecret,
+      $characterId,
+      $characterPayload,
+      (string) ($snapshot['character']['name'] ?? 'Adventurer')
+    );
   }
-  $result = authoritative_persist_named_save_entry(
-    $userEmail,
-    $saveSecret,
-    (string) ($snapshot['payload'] ?? ''),
-    $name,
-    $overwriteId
-  );
-  return authoritative_build_snapshot_response($loaded['session'], $snapshot, [
-    'message' => $autosave ? 'Autosave updated.' : 'Game saved.',
-    'save' => $result['save'] ?? null,
-    'saves' => $result['saves'] ?? null,
+  return authoritative_build_snapshot_response($session, $snapshot, [
+    'message' => 'Character progress autosaved.',
+    'save' => null,
+    'saves' => [],
   ]);
 }
 
@@ -484,6 +450,6 @@ function authoritative_save_and_exit(
 ): array {
   $response = authoritative_manual_save_current_run($userEmail, $saveSecret, $sessionId, '', '', true);
   authoritative_close_session($sessionId, $userEmail);
-  $response['message'] = 'Run saved and session closed.';
+  $response['message'] = 'Character progress saved and session closed.';
   return $response;
 }

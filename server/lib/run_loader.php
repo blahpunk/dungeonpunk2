@@ -77,6 +77,93 @@ function authoritative_character_snapshot_payload_from_save_payload(string $save
 }
 
 /**
+ * @param array<string, mixed> $snapshot
+ */
+function authoritative_encode_character_snapshot_payload(array $snapshot): string
+{
+  $json = json_encode($snapshot, JSON_UNESCAPED_SLASHES);
+  if (!is_string($json) || $json === '') {
+    return '';
+  }
+  return base64_encode($json);
+}
+
+/**
+ * @param array<string, mixed> $snapshot
+ * @return array<string, mixed>
+ */
+function authoritative_clear_character_snapshot_position(array $snapshot): array
+{
+  $next = $snapshot;
+  $resetPosition = [
+    'x' => null,
+    'y' => null,
+    'depth' => null,
+    'z' => null,
+  ];
+  $next['position'] = $resetPosition;
+  $character = is_array($next['character'] ?? null) ? $next['character'] : [];
+  $character['position'] = $resetPosition;
+  $next['character'] = $character;
+  return $next;
+}
+
+function authoritative_clear_inactive_character_positions_for_new_dungeon(
+  string $userEmail,
+  string $saveSecret,
+  string $activeCharacterId
+): void {
+  $states = load_user_character_states($userEmail, $saveSecret);
+  if (count($states) <= 0) {
+    return;
+  }
+  $activeId = normalize_character_profile_id($activeCharacterId);
+  $updated = false;
+  $nowIso = date('c');
+  foreach ($states as $stateId => $entryRaw) {
+    if (!is_array($entryRaw)) {
+      continue;
+    }
+    $entry = $entryRaw;
+    $characterId = normalize_character_profile_id((string) ($entry['id'] ?? $stateId));
+    if ($characterId === '' || ($activeId !== '' && $characterId === $activeId)) {
+      continue;
+    }
+    $payload = trim((string) ($entry['payload'] ?? ''));
+    if ($payload === '') {
+      continue;
+    }
+    $decoded = authoritative_decode_character_snapshot_payload($payload);
+    if (!is_array($decoded)) {
+      continue;
+    }
+    $resetSnapshot = authoritative_clear_character_snapshot_position($decoded);
+    $resetPayload = authoritative_encode_character_snapshot_payload($resetSnapshot);
+    if ($resetPayload === '' || $resetPayload === $payload) {
+      continue;
+    }
+    $entry['id'] = $characterId;
+    if (trim_save_name((string) ($entry['name'] ?? '')) === '') {
+      $entry['name'] = authoritative_character_name_from_snapshot_payload($resetPayload, 'Adventurer');
+    }
+    $entry['payload'] = $resetPayload;
+    $entry['updated_at'] = $nowIso;
+    $entry['sig'] = '';
+    $states[$characterId] = $entry;
+    if ((string) $stateId !== $characterId) {
+      unset($states[$stateId]);
+    }
+    $updated = true;
+  }
+  if (!$updated) {
+    return;
+  }
+  if (!persist_user_character_states($userEmail, $states, $saveSecret)) {
+    throw new RuntimeException('Could not reset character positions for the new dungeon.');
+  }
+}
+
+/**
  * @param array<string, array<string, mixed>> $characterStates
  * @return array<string, array<string, mixed>>
  */

@@ -3094,30 +3094,11 @@ if ($apiMode === 'savegames') {
     }
     $loadId = trim((string) ($_GET['load'] ?? ''));
     if ($loadId !== '') {
-      $found = null;
-      foreach ($entries as $entry) {
-        if ($entry['id'] === $loadId) {
-          $found = $entry;
-          break;
-        }
-      }
-      if ($found === null) {
-        json_response(['ok' => false, 'error' => 'Save not found.'], 404);
-      }
       json_response([
-        'ok' => true,
-        'save' => [
-          'id' => (string) $found['id'],
-          'character_id' => (string) ($found['character_id'] ?? ''),
-          'character_name' => (string) ($found['character_name'] ?? ''),
-          'name' => (string) $found['name'],
-          'payload' => (string) $found['payload'],
-          'level' => (int) $found['level'],
-          'depth' => (int) $found['depth'],
-          'created_at' => (string) $found['created_at'],
-          'updated_at' => (string) $found['updated_at'],
-        ],
-      ]);
+        'ok' => false,
+        'error' => 'Save/load slots are disabled. Character progress is autosaved automatically.',
+        'code' => 'SAVE_FEATURE_DISABLED',
+      ], 410);
     }
 
     json_response([
@@ -3510,6 +3491,13 @@ if ($apiMode === 'savegames') {
     ]);
   }
 
+  if ($action === 'save') {
+    json_response([
+      'ok' => false,
+      'error' => 'Save/load slots are disabled. Character progress is autosaved automatically.',
+      'code' => 'SAVE_FEATURE_DISABLED',
+    ], 410);
+  }
   if ($action !== 'save') {
     json_response(['ok' => false, 'error' => 'Unsupported action.'], 400);
   }
@@ -6795,8 +6783,6 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
       <?php if ($isAdminUser): ?>
         <button id="btnFog">Toggle fog</button>
       <?php endif; ?>
-      <button id="btnExport">Save Game</button>
-      <button id="btnImport">Load Game</button>
       <?php if ($user === null): ?>
         <button id="btnGuestNewCharacter" type="button">New Character</button>
       <?php endif; ?>
@@ -7280,7 +7266,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
     <div id="newDungeonConfirmOverlay" aria-hidden="true">
       <div id="newDungeonConfirmCard" role="dialog" aria-modal="true" aria-labelledby="newDungeonConfirmTitle">
         <h2 id="newDungeonConfirmTitle">Start New Dungeon?</h2>
-        <p id="newDungeonConfirmText">Starting a new dungeon keeps your character progression and items. Save first if you want to keep this current dungeon instance.</p>
+        <p id="newDungeonConfirmText"><strong>WARNING:</strong> Starting a new dungeon permanently discards the current dungeon instance for this account. All character dungeon positions are wiped, and every character will start at the new dungeon entrance.</p>
         <div id="newDungeonConfirmSummary">Current run summary unavailable.</div>
         <div id="newDungeonConfirmButtons">
           <button id="newDungeonConfirmCancel" type="button">Cancel</button>
@@ -7316,30 +7302,6 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         <div id="guestNewCharacterButtons">
           <button id="guestNewCharacterCancel" type="button">Cancel</button>
           <button id="guestNewCharacterConfirm" type="button">Create New Character</button>
-        </div>
-      </div>
-    </div>
-    <div id="saveGameOverlay" aria-hidden="true">
-      <div id="saveGameCard" role="dialog" aria-modal="true" aria-labelledby="saveGameTitle">
-        <div id="saveGameHeader">
-          <h2 id="saveGameTitle">Load Game</h2>
-          <button id="saveGameCloseBtn" type="button">Close</button>
-        </div>
-        <div id="saveGameMode">Your save slots are stored securely on the server.</div>
-        <div id="saveGameNameRow">
-          <input
-            id="saveGameNameInput"
-            type="text"
-            maxlength="<?php echo SAVE_NAME_MAX_LEN; ?>"
-            placeholder="Lvl 1, Depth 0, 2026-02-23 12:34:56"
-            autocomplete="off"
-          />
-          <button id="saveGameCreateBtn" type="button">Save New Slot</button>
-        </div>
-        <div id="saveGameList"></div>
-        <div id="saveGameFooter">
-          <div id="saveGameStatus"></div>
-          <button id="saveGameRefreshBtn" type="button">Refresh</button>
         </div>
       </div>
     </div>
