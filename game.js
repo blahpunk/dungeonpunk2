@@ -1716,10 +1716,16 @@ let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
 const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
 const authoritativeCommandQueue = [];
+const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 300;
 const authoritativeSessionRuntime = {
   touchTimer: 0,
   touchInFlight: false,
   lastTouchAt: 0,
+};
+const authoritativeRateLimitRuntime = {
+  blockedUntil: 0,
+  drainTimer: 0,
+  lastWarnAt: 0,
 };
 
 function resolveBrowserInstanceId() {
@@ -1799,6 +1805,16 @@ function enqueueAuthoritativeCommand(command, options = null) {
   const cmdType = String(command.type ?? "").trim().toUpperCase();
   const movementSource = String(opts.movementSource ?? "").trim();
   if (cmdType === "MOVE" && movementSource) {
+    // If player changed direction/source, prefer newest direction over stale buffered moves.
+    for (let i = authoritativeCommandQueue.length - 1; i >= 0; i -= 1) {
+      const queued = authoritativeCommandQueue[i];
+      const queuedType = String(queued?.command?.type ?? "").trim().toUpperCase();
+      if (queuedType !== "MOVE") continue;
+      const queuedSource = String(queued?.options?.movementSource ?? "").trim();
+      if (!queuedSource || queuedSource === movementSource) continue;
+      authoritativeCommandQueue.splice(i, 1);
+    }
+    // Keep at most one older move for this same source to avoid long catch-up lag.
     let sameSourceCount = 0;
     for (let i = authoritativeCommandQueue.length - 1; i >= 0; i -= 1) {
       const queued = authoritativeCommandQueue[i];
@@ -1806,7 +1822,7 @@ function enqueueAuthoritativeCommand(command, options = null) {
       if (queuedType !== "MOVE") continue;
       if (String(queued?.options?.movementSource ?? "").trim() !== movementSource) continue;
       sameSourceCount += 1;
-      if (sameSourceCount >= 2) {
+      if (sameSourceCount >= 1) {
         authoritativeCommandQueue.splice(i, 1);
         break;
       }
@@ -1822,12 +1838,50 @@ function enqueueAuthoritativeCommand(command, options = null) {
 function dropQueuedAuthoritativeMovementBySource(source = "") {
   const normalized = String(source ?? "").trim();
   if (!normalized) return 0;
-  return pruneAuthoritativeCommandQueue((entry) => {
-    if (!entry || typeof entry !== "object") return false;
+  return dropQueuedAuthoritativeMovementBySourceKeep(source, 0);
+}
+
+function dropQueuedAuthoritativeMovementBySourceKeep(source = "", keepLast = 0) {
+  const normalized = String(source ?? "").trim();
+  if (!normalized) return 0;
+  const keep = Math.max(0, Math.floor(Number(keepLast) || 0));
+  let removed = 0;
+  let preserved = 0;
+  for (let i = authoritativeCommandQueue.length - 1; i >= 0; i -= 1) {
+    const entry = authoritativeCommandQueue[i];
+    if (!entry || typeof entry !== "object") continue;
     const cmdType = String(entry?.command?.type ?? "").trim().toUpperCase();
-    if (cmdType !== "MOVE") return false;
-    return String(entry?.options?.movementSource ?? "").trim() === normalized;
-  });
+    if (cmdType !== "MOVE") continue;
+    if (String(entry?.options?.movementSource ?? "").trim() !== normalized) continue;
+    if (preserved < keep) {
+      preserved += 1;
+      continue;
+    }
+    authoritativeCommandQueue.splice(i, 1);
+    removed += 1;
+  }
+  return removed;
+}
+
+function clearAuthoritativeRateLimitTimer() {
+  if (!authoritativeRateLimitRuntime.drainTimer) return;
+  clearTimeout(authoritativeRateLimitRuntime.drainTimer);
+  authoritativeRateLimitRuntime.drainTimer = 0;
+}
+
+function scheduleAuthoritativeQueueDrain(delayMs = 0) {
+  const wait = Math.max(0, Math.floor(Number(delayMs) || 0));
+  clearAuthoritativeRateLimitTimer();
+  authoritativeRateLimitRuntime.drainTimer = setTimeout(() => {
+    authoritativeRateLimitRuntime.drainTimer = 0;
+    drainAuthoritativeCommandQueue();
+  }, wait);
+}
+
+function authoritativeRateLimitDelayMs(err) {
+  const explicit = Number(err?.response?.retry_after_ms ?? err?.response?.retryAfterMs ?? err?.retryAfterMs ?? 0);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.min(5000, Math.max(120, Math.floor(explicit)));
+  return AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS;
 }
 
 function shouldDropAuthoritativeCommand(command, options = null) {
@@ -1860,6 +1914,12 @@ function shouldDropAuthoritativeCommand(command, options = null) {
 function drainAuthoritativeCommandQueue() {
   if (!isAuthoritativeSessionActive()) {
     clearAuthoritativeCommandQueue();
+    clearAuthoritativeRateLimitTimer();
+    return false;
+  }
+  const now = Date.now();
+  if (now < authoritativeRateLimitRuntime.blockedUntil) {
+    scheduleAuthoritativeQueueDrain(authoritativeRateLimitRuntime.blockedUntil - now);
     return false;
   }
   if (authoritativeMirror.inFlight) return false;
@@ -1971,6 +2031,12 @@ async function requestAuthoritativeResync(reason = "resync") {
 async function performAuthoritativeCommand(command, options = null) {
   if (!isAuthoritativeSessionActive()) return false;
   if (!command || typeof command !== "object") return false;
+  const now = Date.now();
+  if (now < authoritativeRateLimitRuntime.blockedUntil) {
+    enqueueAuthoritativeCommand(command, options);
+    scheduleAuthoritativeQueueDrain(authoritativeRateLimitRuntime.blockedUntil - now);
+    return Promise.resolve(false);
+  }
   if (shouldDropAuthoritativeCommand(command)) return false;
   if (authoritativeMirror.inFlight) {
     enqueueAuthoritativeCommand(command, options);
@@ -1999,6 +2065,19 @@ async function performAuthoritativeCommand(command, options = null) {
     }
     return !!response?.ok;
   } catch (err) {
+    if (String(err?.response?.status_code ?? "") === "429") {
+      const delayMs = authoritativeRateLimitDelayMs(err);
+      authoritativeRateLimitRuntime.blockedUntil = Date.now() + delayMs;
+      enqueueAuthoritativeCommand(command, options);
+      scheduleAuthoritativeQueueDrain(delayMs + 5);
+      const warnNow = Date.now();
+      if ((warnNow - authoritativeRateLimitRuntime.lastWarnAt) > 2000 && game?.log) {
+        pushLog(game, "Server is busy; buffering your movement.");
+        renderLog(game);
+        authoritativeRateLimitRuntime.lastWarnAt = warnNow;
+      }
+      return false;
+    }
     const message = authoritativeErrorMessage(err, "Authoritative command failed.");
     if (game?.log) {
       pushLog(game, message);
@@ -2061,6 +2140,7 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
   if (!sessionId) return false;
   lifecycleAuthoritativeCloseRequested = true;
   clearAuthoritativeCommandQueue();
+  clearAuthoritativeRateLimitTimer();
   stopAuthoritativeSessionTouchLoop();
   void authoritativeApi.closeSession({
     sessionId,
@@ -2072,6 +2152,8 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
 
 async function openAuthoritativeSessionForSelection(characterId = "", options = null) {
   clearAuthoritativeCommandQueue();
+  clearAuthoritativeRateLimitTimer();
+  authoritativeRateLimitRuntime.blockedUntil = 0;
   const opts = (options && typeof options === "object") ? options : {};
   const response = await authoritativeApi.openSession({
     characterId: String(characterId ?? "").trim(),
@@ -2091,6 +2173,8 @@ async function switchAuthoritativeCharacter(characterId = "", options = null) {
   const targetId = String(characterId ?? "").trim();
   if (!targetId) return false;
   clearAuthoritativeCommandQueue();
+  clearAuthoritativeRateLimitTimer();
+  authoritativeRateLimitRuntime.blockedUntil = 0;
   const opts = (options && typeof options === "object") ? options : {};
   try {
     const response = isAuthoritativeSessionActive()
@@ -20035,7 +20119,7 @@ function onKeyUp(e) {
   if (!movementInput) return;
   const released = releaseKeyboardMovementHold(movementInput.source, String(e.code ?? ""));
   if (!released) return;
-  dropQueuedAuthoritativeMovementBySource(movementInput.source);
+  dropQueuedAuthoritativeMovementBySourceKeep(movementInput.source, 1);
 }
 
 function saveNow(state) {
@@ -21131,7 +21215,7 @@ if (!HEADLESS_RUNTIME) {
             // clear timers
             if (entry.initialTimeout) { clearTimeout(entry.initialTimeout); entry.initialTimeout = null; }
             if (entry.repeatInterval) { clearInterval(entry.repeatInterval); entry.repeatInterval = null; }
-            if (entry.movementSource) dropQueuedAuthoritativeMovementBySource(entry.movementSource);
+            if (entry.movementSource) dropQueuedAuthoritativeMovementBySourceKeep(entry.movementSource, 1);
 
             const elapsed = Date.now() - (entry.start || 0);
             if (entry.type === 'dpad') {
