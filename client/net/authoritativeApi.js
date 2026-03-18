@@ -81,6 +81,12 @@ export function createAuthoritativeApi(options = {}) {
         session_id: sessionId,
       }, { keepalive: true });
     },
+    sessionLockAudit({ sessionId = "" } = {}) {
+      return request({
+        action: "session_lock_audit",
+        session_id: sessionId || undefined,
+      });
+    },
     requestResync({ sessionId = "" } = {}) {
       return request({
         action: "request_resync",

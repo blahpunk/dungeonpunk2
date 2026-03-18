@@ -2969,6 +2969,33 @@ if ($apiMode === 'authoritative') {
       $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
       json_response(authoritative_touch_session($sessionId, $userEmail, $browserInstanceId));
     }
+    if ($action === 'session_lock_audit') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      $audit = authoritative_character_lock_audit($userEmail);
+      $currentCharacterId = '';
+      if ($sessionId !== '') {
+        $session = authoritative_load_session($sessionId, $userEmail);
+        if (is_array($session)) {
+          $currentCharacterId = normalize_character_profile_id((string) ($session['character_id'] ?? ''));
+        }
+      }
+      $currentCharacterDuplicate = false;
+      if ($currentCharacterId !== '') {
+        foreach ((array) ($audit['duplicates'] ?? []) as $dup) {
+          if (normalize_character_profile_id((string) ($dup['character_id'] ?? '')) !== $currentCharacterId) continue;
+          $currentCharacterDuplicate = true;
+          break;
+        }
+      }
+      json_response([
+        'ok' => true,
+        'session_id' => $sessionId,
+        'current_character_id' => $currentCharacterId,
+        'current_character_duplicate' => $currentCharacterDuplicate,
+        'active' => array_values((array) ($audit['active'] ?? [])),
+        'duplicates' => array_values((array) ($audit['duplicates'] ?? [])),
+      ]);
+    }
     if ($action === 'request_resync') {
       $sessionId = trim((string) ($body['session_id'] ?? ''));
       if ($sessionId === '') {

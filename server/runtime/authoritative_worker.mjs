@@ -48,7 +48,8 @@ async function main() {
   if (operation === "command") {
     return engine.headlessExecuteCommandPayload(
       String(input.worldPayload ?? ""),
-      input.command ?? {}
+      input.command ?? {},
+      String(input.characterPayload ?? "")
     );
   }
 

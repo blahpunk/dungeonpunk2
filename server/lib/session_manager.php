@@ -353,3 +353,53 @@ function authoritative_close_session(string $sessionId, string $userEmail): bool
   }
   return @unlink(authoritative_session_file_path($sessionId));
 }
+
+/**
+ * @return array{
+ *   active: array<int, array<string, mixed>>,
+ *   duplicates: array<int, array<string, mixed>>
+ * }
+ */
+function authoritative_character_lock_audit(string $userEmail): array
+{
+  $now = time();
+  $active = [];
+  $byCharacter = [];
+  foreach (authoritative_list_user_sessions($userEmail, true) as $session) {
+    $sessionId = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
+    if ($sessionId === '') continue;
+    if (!authoritative_session_is_recent_for_character_lock($session, $now)) continue;
+    $characterId = trim((string) ($session['character_id'] ?? ''));
+    if ($characterId === '') continue;
+    $entry = [
+      'session_id' => $sessionId,
+      'character_id' => $characterId,
+      'browser_instance_id' => authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? '')),
+      'updated_at' => (string) ($session['updated_at'] ?? ''),
+    ];
+    $active[] = $entry;
+    if (!isset($byCharacter[$characterId]) || !is_array($byCharacter[$characterId])) {
+      $byCharacter[$characterId] = [];
+    }
+    $byCharacter[$characterId][] = $entry;
+  }
+
+  $duplicates = [];
+  foreach ($byCharacter as $characterId => $rows) {
+    if (!is_array($rows) || count($rows) <= 1) continue;
+    $browserIds = [];
+    foreach ($rows as $row) {
+      $browserIds[(string) ($row['browser_instance_id'] ?? '')] = true;
+    }
+    $duplicates[] = [
+      'character_id' => (string) $characterId,
+      'count' => count($rows),
+      'browser_count' => count($browserIds),
+      'sessions' => array_values($rows),
+    ];
+  }
+  return [
+    'active' => array_values($active),
+    'duplicates' => array_values($duplicates),
+  ];
+}

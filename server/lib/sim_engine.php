@@ -37,9 +37,44 @@ function authoritative_worker_log_path(): string
   return authoritative_worker_runtime_dir() . DIRECTORY_SEPARATOR . 'worker.log';
 }
 
+function authoritative_worker_version_path(): string
+{
+  return authoritative_worker_runtime_dir() . DIRECTORY_SEPARATOR . 'worker.version';
+}
+
 function authoritative_worker_socket_uri(): string
 {
   return 'unix://' . authoritative_worker_socket_path();
+}
+
+function authoritative_worker_code_version(): string
+{
+  $paths = [
+    authoritative_worker_script_path(),
+    authoritative_worker_daemon_script_path(),
+    authoritative_worker_cwd() . DIRECTORY_SEPARATOR . 'game.js',
+  ];
+  $parts = [];
+  foreach ($paths as $path) {
+    $mtime = @filemtime($path);
+    $parts[] = is_int($mtime) && $mtime > 0 ? (string) $mtime : '0';
+  }
+  return implode(':', $parts);
+}
+
+function authoritative_worker_stored_version(): string
+{
+  $path = authoritative_worker_version_path();
+  if (!is_file($path)) return '';
+  $raw = @file_get_contents($path);
+  return is_string($raw) ? trim($raw) : '';
+}
+
+function authoritative_worker_store_version(string $version): void
+{
+  $path = authoritative_worker_version_path();
+  if ($version === '') return;
+  @file_put_contents($path, $version . "\n", LOCK_EX);
 }
 
 function authoritative_worker_runtime_dir_ready(): bool
@@ -125,11 +160,21 @@ function authoritative_worker_daemon_start(): bool
     return false;
   }
 
+  $currentVersion = authoritative_worker_code_version();
+  $storedVersion = authoritative_worker_stored_version();
   $socketPath = authoritative_worker_socket_path();
+  if ($currentVersion !== '' && $storedVersion !== '' && !hash_equals($storedVersion, $currentVersion)) {
+    @unlink($socketPath);
+  }
   $existing = authoritative_worker_socket_connect(0.1);
   if (is_resource($existing)) {
     fclose($existing);
-    return true;
+    if ($currentVersion !== '' && ($storedVersion === '' || !hash_equals($storedVersion, $currentVersion))) {
+      // Socket reachable but code changed; force daemon recycle.
+      @unlink($socketPath);
+    } else {
+      return true;
+    }
   }
   if (is_file($socketPath) || file_exists($socketPath)) {
     @unlink($socketPath);
@@ -143,6 +188,7 @@ function authoritative_worker_daemon_start(): bool
     $probe = authoritative_worker_socket_connect(0.15);
     if (is_resource($probe)) {
       fclose($probe);
+      authoritative_worker_store_version($currentVersion);
       return true;
     }
   }
@@ -276,11 +322,12 @@ function authoritative_worker_switch_character(string $worldPayload, string $cha
  * @param array<string, mixed> $command
  * @return array<string, mixed>
  */
-function authoritative_worker_execute_command(string $worldPayload, array $command): array
+function authoritative_worker_execute_command(string $worldPayload, array $command, string $characterPayload = ''): array
 {
   return authoritative_worker_call([
     'operation' => 'command',
     'worldPayload' => $worldPayload,
+    'characterPayload' => trim($characterPayload),
     'command' => $command,
   ]);
 }

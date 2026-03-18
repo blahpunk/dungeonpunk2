@@ -1717,10 +1717,16 @@ const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
 const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
 const authoritativeCommandQueue = [];
 const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 300;
+const AUTHORITATIVE_LOCK_AUDIT_INTERVAL_MS = 20000;
 const authoritativeSessionRuntime = {
   touchTimer: 0,
   touchInFlight: false,
   lastTouchAt: 0,
+};
+const authoritativeLockAuditRuntime = {
+  inFlight: false,
+  lastAt: 0,
+  lastWarnAt: 0,
 };
 const authoritativeRateLimitRuntime = {
   blockedUntil: 0,
@@ -1732,7 +1738,7 @@ function resolveBrowserInstanceId() {
   const fallback = () => `browser_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
   let id = "";
   try {
-    id = String(localStorage.getItem(BROWSER_INSTANCE_ID_STORAGE_KEY) ?? "").trim().toLowerCase();
+    id = String(sessionStorage.getItem(BROWSER_INSTANCE_ID_STORAGE_KEY) ?? "").trim().toLowerCase();
   } catch {}
   if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
     id = fallback().replace(/[^a-z0-9_\-]/g, "");
@@ -1740,7 +1746,7 @@ function resolveBrowserInstanceId() {
       id = `browser_${Math.random().toString(36).slice(2, 14)}`.replace(/[^a-z0-9_\-]/g, "");
     }
     try {
-      localStorage.setItem(BROWSER_INSTANCE_ID_STORAGE_KEY, id);
+      sessionStorage.setItem(BROWSER_INSTANCE_ID_STORAGE_KEY, id);
     } catch {}
   }
   return id;
@@ -2121,16 +2127,46 @@ async function touchAuthoritativeSession(reason = "interval") {
   }
 }
 
+async function runAuthoritativeLockAudit(reason = "interval") {
+  if (!isAuthoritativeSessionActive()) return false;
+  if (authoritativeLockAuditRuntime.inFlight) return false;
+  const now = Date.now();
+  if ((now - authoritativeLockAuditRuntime.lastAt) < AUTHORITATIVE_LOCK_AUDIT_INTERVAL_MS) return false;
+  authoritativeLockAuditRuntime.inFlight = true;
+  try {
+    const response = await authoritativeApi.sessionLockAudit({
+      sessionId: authoritativeMirror.sessionId,
+    });
+    authoritativeLockAuditRuntime.lastAt = Date.now();
+    if (!response?.current_character_duplicate) return true;
+    if ((Date.now() - authoritativeLockAuditRuntime.lastWarnAt) > 5000 && game?.log) {
+      pushLog(game, "Duplicate active character detected across browser instances. Choose a different character.");
+      renderLog(game);
+      authoritativeLockAuditRuntime.lastWarnAt = Date.now();
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    authoritativeLockAuditRuntime.inFlight = false;
+  }
+}
+
 function restartAuthoritativeSessionTouchLoop() {
   stopAuthoritativeSessionTouchLoop();
   authoritativeSessionRuntime.touchInFlight = false;
   authoritativeSessionRuntime.lastTouchAt = 0;
+  authoritativeLockAuditRuntime.inFlight = false;
+  authoritativeLockAuditRuntime.lastAt = 0;
+  authoritativeLockAuditRuntime.lastWarnAt = 0;
   if (HEADLESS_RUNTIME) return;
   if (!isAuthoritativeModeEnabled()) return;
   authoritativeSessionRuntime.touchTimer = setInterval(() => {
     void touchAuthoritativeSession("interval");
+    void runAuthoritativeLockAudit("interval");
   }, AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS);
   void touchAuthoritativeSession("startup");
+  void runAuthoritativeLockAudit("startup");
 }
 
 function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
@@ -8102,6 +8138,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   if (!id) return false;
   const opts = (options && typeof options === "object") ? options : {};
   const forceEntrance = opts.forceEntrance === true;
+  const silent = opts.silent === true;
   const providedCharacterId = normalizeCharacterProfileId(opts.characterId ?? "");
   const providedLatestSaveId = String(opts.latestSaveId ?? "").trim();
   const currentId = String(getActiveCharacterSlotId() ?? "");
@@ -8130,7 +8167,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
       return true;
     } catch (err) {
       const message = String(err?.message ?? "").trim();
-      if (message) {
+      if (message && !silent) {
         if (isCharacterOverlayOpen()) setCharacterOverlayStatus(message, true);
         else if (game?.log) {
           pushLog(game, message);
@@ -9759,20 +9796,41 @@ async function startCharacterFlow() {
       characterUi.selectionPurpose = "load_run";
       characterUi.mode = hasSlots ? "select" : "create";
       if (isAuthoritativeModeEnabled() && hasSlots && characterUi.selectedSaveId) {
-        const resumeSlot = characterUi.slots.find((slot) => slot.id === characterUi.selectedSaveId) ?? null;
-        const loaded = await loadRunFromCharacterSlot(characterUi.selectedSaveId, {
-          forceEntrance: false,
-          characterId: normalizeCharacterProfileId(
-            resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(characterUi.selectedSaveId)
-          ),
-          latestSaveId: String(resumeSlot?.latestSaveId ?? "").trim(),
-        });
-        if (loaded) {
-          if (!activeSlotExists) setActiveCharacterSlotId(characterUi.selectedSaveId);
+        const preferredSlotId = characterUi.selectedSaveId;
+        const orderedSlots = [
+          ...(preferredSlotId ? characterUi.slots.filter((slot) => slot.id === preferredSlotId) : []),
+          ...characterUi.slots.filter((slot) => slot.id !== preferredSlotId),
+        ];
+        for (const resumeSlot of orderedSlots) {
+          const resumeSlotId = String(resumeSlot?.id ?? "").trim();
+          if (!resumeSlotId) continue;
+          const loaded = await loadRunFromCharacterSlot(resumeSlotId, {
+            forceEntrance: false,
+            characterId: normalizeCharacterProfileId(
+              resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
+            ),
+            latestSaveId: String(resumeSlot?.latestSaveId ?? "").trim(),
+            silent: true,
+          });
+          if (!loaded) continue;
+          characterUi.selectedSaveId = resumeSlotId;
+          if (!activeSlotExists || preferredSlotId !== resumeSlotId) setActiveCharacterSlotId(resumeSlotId);
           requiresCharacterCreation = false;
           setCharacterOverlayStatus("");
           allowResumeWithoutOverlay = true;
           return;
+        }
+        if ((characterUi.slots?.length ?? 0) < 5) {
+          characterUi.mode = "create";
+          characterUi.selectionPurpose = "load_run";
+          setCharacterOverlayStatus(
+            "All existing characters are active in other browser windows. Create a new character to continue.",
+            true
+          );
+          resetCharacterCreationDraft(null, { step: "welcome" });
+        } else {
+          characterUi.mode = "select";
+          setCharacterOverlayStatus("No available character slot could be resumed. Choose a different character.", true);
         }
       }
       // On refresh, keep the in-progress run if the account still has at least one slot.
@@ -20456,7 +20514,7 @@ function headlessSwitchCharacterPayload(worldPayload = "", characterPayload = ""
   return buildHeadlessStateSnapshot(state);
 }
 
-function headlessExecuteCommandPayload(worldPayload = "", command = null) {
+function headlessExecuteCommandPayload(worldPayload = "", command = null, characterPayload = "") {
   const state = headlessStateFromPayload(worldPayload);
   if (!state) {
     return {
@@ -20465,6 +20523,14 @@ function headlessExecuteCommandPayload(worldPayload = "", command = null) {
       turnSpent: false,
       snapshot: null,
     };
+  }
+  const payload = String(characterPayload ?? "").trim();
+  if (payload) {
+    const snapshot = decodeCharacterSnapshotPayload(payload);
+    if (snapshot) {
+      applyCharacterSnapshot(state, snapshot);
+      placePlayerFromCharacterSnapshot(state, snapshot, { resetVision: false });
+    }
   }
   return executeAuthoritativeCommandOnState(state, command);
 }

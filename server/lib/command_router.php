@@ -278,6 +278,14 @@ function authoritative_handle_command(
   $loaded = authoritative_load_session_run_context($userEmail, $sessionId);
   $session = $loaded['session'];
   $runRecord = $loaded['run_record'];
+  $sessionCharacterId = normalize_character_profile_id((string) ($session['character_id'] ?? ''));
+  $sessionCharacterPayload = '';
+  if ($sessionCharacterId !== '') {
+    $states = load_user_character_states($userEmail, $saveSecret);
+    if (isset($states[$sessionCharacterId])) {
+      $sessionCharacterPayload = trim((string) ($states[$sessionCharacterId]['payload'] ?? ''));
+    }
+  }
   $requiresShopLock = function_exists('authoritative_shop_command_requires_lock')
     ? authoritative_shop_command_requires_lock($command)
     : false;
@@ -294,6 +302,26 @@ function authoritative_handle_command(
     }
     return $snapshot;
   };
+
+  $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
+  $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
+  if ($sessionCharacterId !== '') {
+    $conflict = authoritative_find_character_session_conflict(
+      $userEmail,
+      $sessionCharacterId,
+      $sessionBrowserInstanceId,
+      $sessionIdNorm
+    );
+    if (is_array($conflict)) {
+      $snapshot = $snapshotFromCanonicalPayload($runRecord);
+      return authoritative_build_snapshot_response($session, $snapshot, [
+        'ok' => false,
+        'accepted_command_seq' => max(0, (int) ($session['last_command_seq'] ?? 0)),
+        'error' => 'This character is active in another browser instance. Choose a different character.',
+        'ui_hints' => ['resyncRecommended' => true],
+      ]);
+    }
+  }
 
   $lastSeq = max(0, (int) ($session['last_command_seq'] ?? 0));
   if ($clientCommandSeq < $lastSeq) {
@@ -321,13 +349,14 @@ function authoritative_handle_command(
     $runRecord,
     $command,
     $clientCommandSeq,
-    $requiresShopLock
+    $requiresShopLock,
+    $sessionCharacterPayload
   ): array {
     $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
     if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
       $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
     }
-    $result = authoritative_worker_execute_command($worldPayload, $command);
+    $result = authoritative_worker_execute_command($worldPayload, $command, $sessionCharacterPayload);
     $snapshot = is_array($result['snapshot'] ?? null) ? $result['snapshot'] : null;
     if (!is_array($snapshot)) {
       throw new RuntimeException('Authoritative command returned no snapshot.');
