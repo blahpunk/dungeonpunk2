@@ -1565,7 +1565,6 @@ const deathOverlayEl = document.getElementById("deathOverlay");
 const btnRespawnEl = document.getElementById("btnRespawn");
 const btnNewDungeonEl = document.getElementById("btnNewDungeon");
 const newDungeonConfirmOverlayEl = document.getElementById("newDungeonConfirmOverlay");
-const newDungeonConfirmSummaryEl = document.getElementById("newDungeonConfirmSummary");
 const newDungeonConfirmStartEl = document.getElementById("newDungeonConfirmStart");
 const newDungeonConfirmCancelEl = document.getElementById("newDungeonConfirmCancel");
 const characterSwitchConfirmOverlayEl = document.getElementById("characterSwitchConfirmOverlay");
@@ -1715,6 +1714,8 @@ const authoritativeMirror = createServerMirror();
 const authoritativePendingAction = createPendingActionState();
 let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
+const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
+const authoritativeCommandQueue = [];
 const authoritativeSessionRuntime = {
   touchTimer: 0,
   touchInFlight: false,
@@ -1769,6 +1770,107 @@ function setAuthoritativeInputLock(locked = false, descriptor = null) {
   if (locked) startPendingAction(authoritativePendingAction, descriptor);
   else clearPendingAction(authoritativePendingAction);
   setServerMirrorInFlight(authoritativeMirror, locked);
+}
+
+function clearAuthoritativeCommandQueue() {
+  authoritativeCommandQueue.length = 0;
+}
+
+function pruneAuthoritativeCommandQueue(predicate) {
+  if (typeof predicate !== "function") return 0;
+  if (!authoritativeCommandQueue.length) return 0;
+  const kept = [];
+  let removed = 0;
+  for (const entry of authoritativeCommandQueue) {
+    if (predicate(entry)) {
+      removed += 1;
+      continue;
+    }
+    kept.push(entry);
+  }
+  authoritativeCommandQueue.length = 0;
+  authoritativeCommandQueue.push(...kept);
+  return removed;
+}
+
+function enqueueAuthoritativeCommand(command, options = null) {
+  if (!command || typeof command !== "object") return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const cmdType = String(command.type ?? "").trim().toUpperCase();
+  const movementSource = String(opts.movementSource ?? "").trim();
+  if (cmdType === "MOVE" && movementSource) {
+    let sameSourceCount = 0;
+    for (let i = authoritativeCommandQueue.length - 1; i >= 0; i -= 1) {
+      const queued = authoritativeCommandQueue[i];
+      const queuedType = String(queued?.command?.type ?? "").trim().toUpperCase();
+      if (queuedType !== "MOVE") continue;
+      if (String(queued?.options?.movementSource ?? "").trim() !== movementSource) continue;
+      sameSourceCount += 1;
+      if (sameSourceCount >= 2) {
+        authoritativeCommandQueue.splice(i, 1);
+        break;
+      }
+    }
+  }
+  if (authoritativeCommandQueue.length >= AUTHORITATIVE_COMMAND_QUEUE_MAX) {
+    authoritativeCommandQueue.shift();
+  }
+  authoritativeCommandQueue.push({ command, options: opts });
+  return true;
+}
+
+function dropQueuedAuthoritativeMovementBySource(source = "") {
+  const normalized = String(source ?? "").trim();
+  if (!normalized) return 0;
+  return pruneAuthoritativeCommandQueue((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const cmdType = String(entry?.command?.type ?? "").trim().toUpperCase();
+    if (cmdType !== "MOVE") return false;
+    return String(entry?.options?.movementSource ?? "").trim() === normalized;
+  });
+}
+
+function shouldDropAuthoritativeCommand(command, options = null) {
+  if (!command || typeof command !== "object") return false;
+  if (String(command.type ?? "").trim().toUpperCase() !== "MOVE") return false;
+  if (!game?.player || !game?.world) return false;
+  const dir = String(command.dir ?? "").trim().toUpperCase();
+  let dx = 0;
+  let dy = 0;
+  if (dir === "N") dy = -1;
+  else if (dir === "S") dy = 1;
+  else if (dir === "W") dx = -1;
+  else if (dir === "E") dx = 1;
+  else return false;
+  const p = game.player;
+  const nx = p.x + dx;
+  const ny = p.y + dy;
+  const nz = p.z;
+  hydrateNearby(game);
+  if (game.world.isPassable(nx, ny, nz)) return false;
+  const tile = game.world.getTile(nx, ny, nz);
+  if (tile === DOOR_CLOSED || tileIsLocked(tile)) return false;
+  if (options?.suppressWallLog !== true && game?.log) {
+    pushLog(game, "You bump into a wall.");
+    renderLog(game);
+  }
+  return true;
+}
+
+function drainAuthoritativeCommandQueue() {
+  if (!isAuthoritativeSessionActive()) {
+    clearAuthoritativeCommandQueue();
+    return false;
+  }
+  if (authoritativeMirror.inFlight) return false;
+  while (authoritativeCommandQueue.length > 0 && !authoritativeMirror.inFlight) {
+    const next = authoritativeCommandQueue.shift();
+    if (!next?.command || typeof next.command !== "object") continue;
+    if (shouldDropAuthoritativeCommand(next.command, { suppressWallLog: true })) continue;
+    void performAuthoritativeCommand(next.command, next.options);
+    return true;
+  }
+  return false;
 }
 
 function authoritativeErrorMessage(err, fallback = "Authoritative action failed.") {
@@ -1869,7 +1971,11 @@ async function requestAuthoritativeResync(reason = "resync") {
 async function performAuthoritativeCommand(command, options = null) {
   if (!isAuthoritativeSessionActive()) return false;
   if (!command || typeof command !== "object") return false;
-  if (authoritativeMirror.inFlight) return false;
+  if (shouldDropAuthoritativeCommand(command)) return false;
+  if (authoritativeMirror.inFlight) {
+    enqueueAuthoritativeCommand(command, options);
+    return Promise.resolve(false);
+  }
   const opts = (options && typeof options === "object") ? options : {};
     setAuthoritativeInputLock(true, {
       type: String(command.type ?? "").trim().toUpperCase(),
@@ -1905,6 +2011,7 @@ async function performAuthoritativeCommand(command, options = null) {
   } finally {
     setAuthoritativeInputLock(false);
     updateContextActionButton(game);
+    drainAuthoritativeCommandQueue();
   }
 }
 
@@ -1953,6 +2060,7 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
   const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
   if (!sessionId) return false;
   lifecycleAuthoritativeCloseRequested = true;
+  clearAuthoritativeCommandQueue();
   stopAuthoritativeSessionTouchLoop();
   void authoritativeApi.closeSession({
     sessionId,
@@ -1963,6 +2071,7 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
 }
 
 async function openAuthoritativeSessionForSelection(characterId = "", options = null) {
+  clearAuthoritativeCommandQueue();
   const opts = (options && typeof options === "object") ? options : {};
   const response = await authoritativeApi.openSession({
     characterId: String(characterId ?? "").trim(),
@@ -1981,6 +2090,7 @@ async function openAuthoritativeSessionForSelection(characterId = "", options = 
 async function switchAuthoritativeCharacter(characterId = "", options = null) {
   const targetId = String(characterId ?? "").trim();
   if (!targetId) return false;
+  clearAuthoritativeCommandQueue();
   const opts = (options && typeof options === "object") ? options : {};
   try {
     const response = isAuthoritativeSessionActive()
@@ -7046,37 +7156,6 @@ function setNewDungeonConfirmOpen(open) {
   if (show) newDungeonConfirmStartEl?.focus();
 }
 
-function buildNewDungeonResetSummary(state) {
-  const character = ensureCharacterState(state);
-  const p = state?.player ?? {};
-  const level = Math.max(1, Math.floor(p.level ?? 1));
-  const xp = Math.max(0, Math.floor(p.xp ?? 0));
-  const xpNeeded = Math.max(1, Math.floor(xpToNext(level)));
-  const inv = Array.isArray(state?.inv) ? state.inv : [];
-  let invTotal = 0;
-  for (const entry of inv) {
-    const count = Math.max(1, Math.floor(entry?.amount ?? entry?.count ?? 1));
-    invTotal += count;
-  }
-  const equippedCount = ["weapon", "head", "chest", "legs"]
-    .map((slot) => p?.equip?.[slot])
-    .filter((it) => !!it)
-    .length;
-  const depth = Math.trunc(p.z ?? 0);
-  const depthLabel = depth === SURFACE_LEVEL ? "Surface" : `Depth ${depth}`;
-  const exploredChunks = state?.exploredChunks?.size ?? 0;
-  const seenTiles = state?.seen?.size ?? 0;
-  const turn = Math.max(0, Math.floor(state?.turn ?? 0));
-
-  return (
-    `Character: ${character?.name ?? DEFAULT_CHARACTER_NAME} (${character?.classId ?? DEFAULT_CHARACTER_CLASS_ID}/${character?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID})\n` +
-    `Bound progression kept: Level ${level} (${xp}/${xpNeeded} XP), Gold ${Math.max(0, Math.floor(p.gold ?? 0))}\n` +
-    `Bound equipment/inventory kept: ${inv.length} stacks (${invTotal} total), ${equippedCount} equipped\n` +
-    `Run progress reset: ${depthLabel}, ${exploredChunks} explored chunks, ${seenTiles} discovered tiles, turn ${turn}\n\n` +
-    "WARNING: Starting a new dungeon permanently discards the current dungeon instance for this account. All characters will have dungeon position reset and will re-enter at the new dungeon entrance."
-  );
-}
-
 function resolveNewDungeonConfirm(confirmed) {
   const resolver = newDungeonConfirmResolver;
   newDungeonConfirmResolver = null;
@@ -7086,11 +7165,14 @@ function resolveNewDungeonConfirm(confirmed) {
 
 function openNewDungeonConfirm(state) {
   if (newDungeonConfirmResolver) return Promise.resolve(false);
-  const summary = buildNewDungeonResetSummary(state);
-  if (!newDungeonConfirmOverlayEl || !newDungeonConfirmSummaryEl) {
-    return Promise.resolve(confirm(`Start a NEW DUNGEON?\n\n${summary}`));
+  if (!newDungeonConfirmOverlayEl) {
+    return Promise.resolve(confirm(
+      "Start a NEW DUNGEON?\n\n" +
+      "WARNING: Starting a new dungeon permanently discards the current dungeon instance for this account. " +
+      "All character dungeon positions are wiped and every character will start at the new dungeon entrance.\n\n" +
+      "Character progression is preserved: level/XP, gold, inventory, and equipment."
+    ));
   }
-  newDungeonConfirmSummaryEl.textContent = summary;
   setNewDungeonConfirmOpen(true);
   return new Promise((resolve) => {
     newDungeonConfirmResolver = resolve;
@@ -13829,10 +13911,16 @@ function markDisengageGraceFromStep(state, fromX, fromY, toX, toY, z) {
   }
 }
 
-function playerMoveOrAttack(state, dx, dy) {
+function playerMoveOrAttack(state, dx, dy, options = null) {
   if (isAuthoritativeSessionActive()) {
+    const opts = (options && typeof options === "object") ? options : {};
     const command = moveCommand(dx, dy);
-    return command ? performAuthoritativeCommand(command, { reason: "move" }) : false;
+    return command
+      ? performAuthoritativeCommand(command, {
+        reason: "move",
+        movementSource: String(opts.movementSource ?? "").trim(),
+      })
+      : false;
   }
   const p = state.player;
   if (p.dead) return false;
@@ -19076,6 +19164,54 @@ function shouldIgnoreGameHotkeys(e) {
   return false;
 }
 
+const keyboardMovementHolds = new Map();
+
+function keyboardMovementFromEvent(e) {
+  const code = String(e?.code ?? "").trim();
+  if (code === "ArrowUp" || code === "KeyW") return { dx: 0, dy: -1, source: "kbd:n" };
+  if (code === "ArrowDown" || code === "KeyS") return { dx: 0, dy: 1, source: "kbd:s" };
+  if (code === "ArrowLeft" || code === "KeyA") return { dx: -1, dy: 0, source: "kbd:w" };
+  if (code === "ArrowRight" || code === "KeyD") return { dx: 1, dy: 0, source: "kbd:e" };
+  const key = String(e?.key ?? "").toLowerCase();
+  if (key === "arrowup" || key === "w") return { dx: 0, dy: -1, source: "kbd:n" };
+  if (key === "arrowdown" || key === "s") return { dx: 0, dy: 1, source: "kbd:s" };
+  if (key === "arrowleft" || key === "a") return { dx: -1, dy: 0, source: "kbd:w" };
+  if (key === "arrowright" || key === "d") return { dx: 1, dy: 0, source: "kbd:e" };
+  return null;
+}
+
+function markKeyboardMovementHeld(source = "", code = "") {
+  const sourceKey = String(source ?? "").trim();
+  if (!sourceKey) return;
+  const codeKey = String(code ?? "").trim();
+  if (!codeKey) return;
+  let held = keyboardMovementHolds.get(sourceKey);
+  if (!held) {
+    held = new Set();
+    keyboardMovementHolds.set(sourceKey, held);
+  }
+  held.add(codeKey);
+}
+
+function releaseKeyboardMovementHold(source = "", code = "") {
+  const sourceKey = String(source ?? "").trim();
+  if (!sourceKey) return false;
+  const held = keyboardMovementHolds.get(sourceKey);
+  if (!held) return true;
+  const codeKey = String(code ?? "").trim();
+  if (codeKey) held.delete(codeKey);
+  if (held.size > 0) return false;
+  keyboardMovementHolds.delete(sourceKey);
+  return true;
+}
+
+function clearHeldKeyboardMovement() {
+  for (const source of keyboardMovementHolds.keys()) {
+    dropQueuedAuthoritativeMovementBySource(source);
+  }
+  keyboardMovementHolds.clear();
+}
+
 function onKey(state, e) {
   const k = e.key.toLowerCase();
   if (shouldIgnoreGameHotkeys(e)) return;
@@ -19144,10 +19280,6 @@ function onKey(state, e) {
     if (k === "escape") closeShopOverlay();
     return;
   }
-  if (isAuthoritativeSessionActive() && authoritativeMirror.inFlight) {
-    e.preventDefault();
-    return;
-  }
   const digitShiftDrop = /^Digit[1-9]$/.test(e.code) && e.shiftKey;
 
   if (digitShiftDrop) {
@@ -19166,10 +19298,12 @@ function onKey(state, e) {
     return;
   }
 
-  if (k === "arrowup" || k === "w") { e.preventDefault(); takeTurn(state, playerMoveOrAttack(state, 0, -1)); }
-  else if (k === "arrowdown" || k === "s") { e.preventDefault(); takeTurn(state, playerMoveOrAttack(state, 0, 1)); }
-  else if (k === "arrowleft" || k === "a") { e.preventDefault(); takeTurn(state, playerMoveOrAttack(state, -1, 0)); }
-  else if (k === "arrowright" || k === "d") { e.preventDefault(); takeTurn(state, playerMoveOrAttack(state, 1, 0)); }
+  const movementInput = keyboardMovementFromEvent(e);
+  if (movementInput) {
+    e.preventDefault();
+    markKeyboardMovementHeld(movementInput.source, String(e.code ?? ""));
+    takeTurn(state, playerMoveOrAttack(state, movementInput.dx, movementInput.dy, { movementSource: movementInput.source }));
+  }
   else if (k === "." || k === " " || k === "spacebar") { e.preventDefault(); takeTurn(state, waitTurn(state)); }
   else if (k === "q") {
     e.preventDefault();
@@ -19894,6 +20028,14 @@ function importSave(saveStr) {
   } catch {
     return null;
   }
+}
+
+function onKeyUp(e) {
+  const movementInput = keyboardMovementFromEvent(e);
+  if (!movementInput) return;
+  const released = releaseKeyboardMovementHold(movementInput.source, String(e.code ?? ""));
+  if (!released) return;
+  dropQueuedAuthoritativeMovementBySource(movementInput.source);
 }
 
 function saveNow(state) {
@@ -20918,6 +21060,8 @@ if (!HEADLESS_RUNTIME) {
     });
     window.addEventListener("beforeunload", () => flushAutosaveLifecycle({ closeRun: true }));
     document.addEventListener("keydown", (e) => onKey(game, e));
+    document.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", () => clearHeldKeyboardMovement());
     window.addEventListener("resize", () => syncMobileUi(true));
     // Initialize touch controls (mobile): wire on-screen buttons to existing actions
     function initTouchControls() {
@@ -20925,20 +21069,21 @@ if (!HEADLESS_RUNTIME) {
         const tc = document.getElementById('touchControls');
         if (!tc) return;
 
-        const handleDpad = (dx, dy) => {
+        const handleDpad = (dx, dy, options = null) => {
           if (!game) return;
           if (dx === 0 && dy === 0) {
             const action = currentContextAction ?? resolveContextAction(game);
             if (action) takeTurn(game, action.run());
           } else {
-            takeTurn(game, playerMoveOrAttack(game, dx, dy));
+            const opts = (options && typeof options === "object") ? options : {};
+            takeTurn(game, playerMoveOrAttack(game, dx, dy, opts));
           }
         };
 
         // Pointer-based input handling with tap-vs-hold semantics for reliable touch
         const activePointers = new Map();
-        const initialDelay = 300; // ms before repeating starts
-        const repeatInterval = 120; // ms between repeats
+        const initialDelay = 140; // ms before repeating starts
+        const repeatInterval = 75; // ms between repeats
 
         tc.addEventListener('pointerdown', (ev) => {
           try {
@@ -20950,12 +21095,28 @@ if (!HEADLESS_RUNTIME) {
             if (btn.classList.contains('dpad-btn')) {
               const dx = Number(btn.dataset.dx || 0);
               const dy = Number(btn.dataset.dy || 0);
-              const entry = { btn, type: 'dpad', start: Date.now(), dx, dy, firedRepeat: false };
+              const movementSource = (dx === 0 && dy === 0) ? "" : `touch:${ev.pointerId}:${dx},${dy}`;
+              const entry = {
+                btn,
+                type: 'dpad',
+                start: Date.now(),
+                dx,
+                dy,
+                movementSource,
+                firedRepeat: false,
+                firedInitial: false,
+              };
+              // Fire immediately on press to remove tap latency.
+              try {
+                handleDpad(dx, dy, { movementSource: entry.movementSource });
+                entry.firedInitial = true;
+              } catch {}
               entry.initialTimeout = setTimeout(() => {
-                // initial delay elapsed: fire first move and start repeating
-                try { handleDpad(dx, dy); } catch {}
+                // initial delay elapsed: start repeating
                 entry.firedRepeat = true;
-                entry.repeatInterval = setInterval(() => { try { handleDpad(dx, dy); } catch {} }, repeatInterval);
+                entry.repeatInterval = setInterval(() => {
+                  try { handleDpad(dx, dy, { movementSource: entry.movementSource }); } catch {}
+                }, repeatInterval);
               }, initialDelay);
               activePointers.set(ev.pointerId, entry);
             }
@@ -20970,12 +21131,13 @@ if (!HEADLESS_RUNTIME) {
             // clear timers
             if (entry.initialTimeout) { clearTimeout(entry.initialTimeout); entry.initialTimeout = null; }
             if (entry.repeatInterval) { clearInterval(entry.repeatInterval); entry.repeatInterval = null; }
+            if (entry.movementSource) dropQueuedAuthoritativeMovementBySource(entry.movementSource);
 
             const elapsed = Date.now() - (entry.start || 0);
             if (entry.type === 'dpad') {
-              // If the initial delay did not elapse, treat as tap on release
-              if (!entry.firedRepeat && elapsed < initialDelay && invokeOnTap) {
-                try { handleDpad(entry.dx, entry.dy); } catch {}
+              // Backward-compat tap behavior only if initial press action did not fire.
+              if (!entry.firedInitial && !entry.firedRepeat && elapsed < initialDelay && invokeOnTap) {
+                try { handleDpad(entry.dx, entry.dy, { movementSource: entry.movementSource }); } catch {}
               }
             }
             activePointers.delete(ev.pointerId);

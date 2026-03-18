@@ -4149,23 +4149,20 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
       }
       #newDungeonConfirmTitle {
         margin: 0 0 8px 0;
-        font-size: 22px;
-        font-weight: 800;
+        font-size: 30px;
+        font-weight: 900;
         color: #ffffff;
       }
       #newDungeonConfirmText {
         margin: 0 0 10px 0;
-        font-size: 13px;
+        font-size: 16px;
+        font-weight: 800;
         color: #c9d4e8;
       }
-      #newDungeonConfirmSummary {
-        border: 1px solid #2b3956;
-        border-radius: 10px;
-        background: #0b1322;
-        padding: 10px;
-        font-size: 13px;
-        line-height: 1.35;
-        white-space: pre-wrap;
+      #newDungeonConfirmPreserve {
+        margin: 0 0 2px 0;
+        font-size: 12px;
+        color: #9fb2d6;
       }
       #newDungeonConfirmButtons {
         margin-top: 12px;
@@ -7266,8 +7263,8 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
     <div id="newDungeonConfirmOverlay" aria-hidden="true">
       <div id="newDungeonConfirmCard" role="dialog" aria-modal="true" aria-labelledby="newDungeonConfirmTitle">
         <h2 id="newDungeonConfirmTitle">Start New Dungeon?</h2>
-        <p id="newDungeonConfirmText"><strong>WARNING:</strong> Starting a new dungeon permanently discards the current dungeon instance for this account. All character dungeon positions are wiped, and every character will start at the new dungeon entrance.</p>
-        <div id="newDungeonConfirmSummary">Current run summary unavailable.</div>
+        <p id="newDungeonConfirmText"><strong>WARNING:</strong> Starting a new dungeon permanently discards the current dungeon instance for this account. All character dungeon positions are wiped and every character will start at the new dungeon entrance.</p>
+        <p id="newDungeonConfirmPreserve">Character progression is preserved: level/XP, gold, inventory, and equipment.</p>
         <div id="newDungeonConfirmButtons">
           <button id="newDungeonConfirmCancel" type="button">Cancel</button>
           <button id="newDungeonConfirmStart" type="button">Start New Dungeon</button>
