@@ -7628,7 +7628,30 @@ async function autosaveIfDirty(reason = "") {
 
 async function autosaveBeforeCharacterSwitch() {
   if (!game) return true;
-  if (isAuthoritativeSessionActive()) return true;
+  if (isAuthoritativeModeEnabled()) {
+    if (isAuthoritativeSessionActive()) {
+      try {
+        const response = await authoritativeApi.manualSave({
+          sessionId: authoritativeMirror.sessionId,
+          overwriteId: String(saveRuntime.activeAutosaveSaveId ?? "").trim(),
+          autosave: true,
+        });
+        const applied = applyAuthoritativeSnapshotToGame(response, {
+          clearDirty: true,
+          reason: "switch-character-autosave",
+        });
+        return !!(applied && response?.ok);
+      } catch {
+        return false;
+      }
+    }
+    if (isAuthenticatedUser) {
+      return saveCurrentGameToServer(String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim(), {
+        autosave: true,
+      });
+    }
+    return true;
+  }
   if (!isAuthenticatedUser) return autosaveIfDirty("switch-character");
   const hasServerRunSave = !!String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim();
   if (saveRuntime.dirty || !hasServerRunSave) {
@@ -8069,6 +8092,11 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
 async function switchCharacter(slotId, options = null) {
   if (isAuthoritativeModeEnabled()) {
     const opts = (options && typeof options === "object") ? options : {};
+    const saved = await autosaveBeforeCharacterSwitch();
+    if (!saved && game) {
+      const proceed = confirm("Could not auto-save current character. Switch anyway?");
+      if (!proceed) return false;
+    }
     const id = String(slotId ?? "").trim();
     const characterId = normalizeCharacterProfileId(opts.characterId ?? "") || normalizeCharacterProfileIdFromSlotId(id);
     if (!characterId) return false;
