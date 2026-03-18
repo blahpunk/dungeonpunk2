@@ -1508,6 +1508,11 @@ const newDungeonConfirmOverlayEl = document.getElementById("newDungeonConfirmOve
 const newDungeonConfirmSummaryEl = document.getElementById("newDungeonConfirmSummary");
 const newDungeonConfirmStartEl = document.getElementById("newDungeonConfirmStart");
 const newDungeonConfirmCancelEl = document.getElementById("newDungeonConfirmCancel");
+const characterSwitchConfirmOverlayEl = document.getElementById("characterSwitchConfirmOverlay");
+const characterSwitchConfirmTitleEl = document.getElementById("characterSwitchConfirmTitle");
+const characterSwitchConfirmTextEl = document.getElementById("characterSwitchConfirmText");
+const characterSwitchConfirmConfirmEl = document.getElementById("characterSwitchConfirmConfirm");
+const characterSwitchConfirmCancelEl = document.getElementById("characterSwitchConfirmCancel");
 const guestNewCharacterOverlayEl = document.getElementById("guestNewCharacterOverlay");
 const guestNewCharacterCurrentCardEl = document.getElementById("guestNewCharacterCurrentCard");
 const guestNewCharacterConfirmEl = document.getElementById("guestNewCharacterConfirm");
@@ -1663,6 +1668,7 @@ function syncBodyModalLock() {
     !!spriteEditorOverlayEl?.classList.contains("show") ||
     !!monsterEditorOverlayEl?.classList.contains("show") ||
     !!newDungeonConfirmOverlayEl?.classList.contains("show") ||
+    !!characterSwitchConfirmOverlayEl?.classList.contains("show") ||
     !!guestNewCharacterOverlayEl?.classList.contains("show") ||
     !!guestLoginImportOverlayEl?.classList.contains("show") ||
     !!levelUpOverlayEl?.classList.contains("show");
@@ -1735,6 +1741,7 @@ let contextPotionButtonSignature = "";
 let currentContextAction = null;
 let currentAbilityContextAction = null;
 let newDungeonConfirmResolver = null;
+let characterSwitchConfirmResolver = null;
 let guestNewCharacterResolver = null;
 let guestLoginImportResolver = null;
 let newDungeonResetPending = false;
@@ -6414,6 +6421,50 @@ function openNewDungeonConfirm(state) {
   });
 }
 
+function isCharacterSwitchConfirmOpen() {
+  return !!characterSwitchConfirmOverlayEl?.classList.contains("show");
+}
+
+function setCharacterSwitchConfirmOpen(open) {
+  if (!characterSwitchConfirmOverlayEl) return;
+  const show = !!open;
+  if (show) {
+    closeMobilePanels();
+    setDebugMenuOpen(false);
+  }
+  characterSwitchConfirmOverlayEl.classList.toggle("show", show);
+  characterSwitchConfirmOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
+  syncBodyModalLock();
+  if (show) characterSwitchConfirmConfirmEl?.focus();
+}
+
+function resolveCharacterSwitchConfirm(confirmed) {
+  const resolver = characterSwitchConfirmResolver;
+  characterSwitchConfirmResolver = null;
+  setCharacterSwitchConfirmOpen(false);
+  if (resolver) resolver(!!confirmed);
+}
+
+function openCharacterSwitchConfirm(currentSlot = null, targetSlot = null) {
+  if (characterSwitchConfirmResolver) return Promise.resolve(false);
+  const currentName = String(currentSlot?.profile?.name ?? currentSlot?.name ?? ensureCharacterState(game)?.name ?? DEFAULT_CHARACTER_NAME).trim() || DEFAULT_CHARACTER_NAME;
+  const targetName = String(targetSlot?.profile?.name ?? targetSlot?.name ?? DEFAULT_CHARACTER_NAME).trim() || DEFAULT_CHARACTER_NAME;
+  const hasSavedPosition = !!(targetSlot?.hasDungeonPosition || targetSlot?.latestSaveId);
+  const title = hasSavedPosition ? "Switch Character?" : "Start Character?";
+  const body = hasSavedPosition
+    ? `You will stop controlling ${currentName} and resume ${targetName} at their saved location.`
+    : `${targetName} will enter the dungeon at the entrance.\nYour current character will remain saved.`;
+  if (!characterSwitchConfirmOverlayEl || !characterSwitchConfirmTitleEl || !characterSwitchConfirmTextEl) {
+    return Promise.resolve(confirm(body));
+  }
+  characterSwitchConfirmTitleEl.textContent = title;
+  characterSwitchConfirmTextEl.textContent = body;
+  setCharacterSwitchConfirmOpen(true);
+  return new Promise((resolve) => {
+    characterSwitchConfirmResolver = resolve;
+  });
+}
+
 function buildGuestCharacterCardMarkup(state) {
   const run = state && typeof state === "object" ? state : game;
   const profile = ensureCharacterState(run);
@@ -6773,6 +6824,8 @@ async function fetchCharacterSlotsFromLocal() {
       depth,
       profile,
       deepestDepth,
+      latestSaveId: slotMeta.id,
+      hasDungeonPosition: true,
     });
   }
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
@@ -6847,12 +6900,29 @@ async function autosaveIfDirty(reason = "") {
   }
 }
 
+async function autosaveBeforeCharacterSwitch() {
+  if (!game) return true;
+  if (!isAuthenticatedUser) return autosaveIfDirty("switch-character");
+  const hasServerRunSave = !!String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim();
+  if (saveRuntime.dirty || !hasServerRunSave) {
+    return saveCurrentGameToServer(String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim(), {
+      autosave: true,
+    });
+  }
+  return true;
+}
+
 function exportCharacterSnapshot(state) {
   const src = state && typeof state === "object" ? state : {};
   const p = src.player ?? {};
   const profile = normalizeCharacterProfile(src.character ?? null);
   return {
     character: profile,
+    position: {
+      x: Number.isFinite(Number(p.x)) ? Math.floor(Number(p.x)) : null,
+      y: Number.isFinite(Number(p.y)) ? Math.floor(Number(p.y)) : null,
+      depth: Number.isFinite(Number(p.z)) ? Math.floor(Number(p.z)) : null,
+    },
     player: {
       level: Math.max(1, Math.floor(p.level ?? 1)),
       xp: Math.max(0, Math.floor(p.xp ?? 0)),
@@ -6907,6 +6977,7 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
     const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
     return {
       character: profile,
+      position: normalizeCharacterSnapshotPosition(decoded?.position ?? decoded?.character?.position ?? null),
       player: {
         level: Math.max(1, Math.floor(decoded?.player?.level ?? 1)),
         xp: Math.max(0, Math.floor(decoded?.player?.xp ?? 0)),
@@ -6948,6 +7019,7 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
   const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
   return {
     character: profile,
+    position: normalizeCharacterSnapshotPosition(decoded?.position ?? decoded?.character?.position ?? null),
     player: {
       level: Math.max(1, Math.floor(decoded?.player?.level ?? 1)),
       xp: Math.max(0, Math.floor(decoded?.player?.xp ?? 0)),
@@ -6967,6 +7039,56 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
       speciesId,
     },
   };
+}
+
+function buildCharacterSnapshotFromCarryover(profile, carryover = null) {
+  const normalizedProfile = normalizeCharacterProfile(profile ?? carryover?.character ?? null);
+  const level = Math.max(1, Math.floor(carryover?.level ?? 1));
+  const maxHp = Math.max(1, Math.floor(carryover?.maxHp ?? maxHpForLevel(level, normalizedProfile)));
+  return {
+    character: normalizedProfile,
+    position: { x: null, y: null, depth: null },
+    player: {
+      level,
+      xp: Math.max(0, Math.floor(carryover?.xp ?? 0)),
+      hp: maxHp,
+      maxHp,
+      gold: Math.max(0, Math.floor(carryover?.gold ?? 0)),
+      inv: normalizeInventoryEntries(carryover?.inv ?? [], {
+        speciesId: normalizedProfile.speciesId,
+        classId: normalizedProfile.classId,
+        ownerId: normalizedProfile.id,
+      }),
+      equip: normalizeEquip(carryover?.equip ?? { weapon: null, head: null, chest: null, legs: null }, {
+        speciesId: normalizedProfile.speciesId,
+        classId: normalizedProfile.classId,
+      }),
+      classId: normalizedProfile.classId,
+      speciesId: normalizedProfile.speciesId,
+    },
+  };
+}
+
+async function persistCharacterSnapshot(snapshot, profile = null) {
+  const normalizedProfile = normalizeCharacterProfile(profile ?? snapshot?.character ?? null);
+  if (!normalizedProfile?.id) return false;
+  const payload = encodeCharacterSnapshotPayload(snapshot);
+  if (!payload) return false;
+  if (isAuthenticatedUser) {
+    await saveApiRequest("POST", {
+      action: "character_sync",
+      character_id: normalizedProfile.id,
+      name: normalizedProfile.name,
+      payload,
+    });
+    return true;
+  }
+  try {
+    localStorage.setItem(characterStatePayloadKey(normalizedProfile.id), payload);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function syncCharacterStateIfDirty(reason = "") {
@@ -7075,47 +7197,62 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   if (!id) return false;
   const opts = (options && typeof options === "object") ? options : {};
   const forceEntrance = opts.forceEntrance === true;
+  const providedCharacterId = normalizeCharacterProfileId(opts.characterId ?? "");
+  const providedLatestSaveId = String(opts.latestSaveId ?? "").trim();
   const currentId = String(getActiveCharacterSlotId() ?? "");
   // In Quick Switch mode we must still reload even if slot id matches,
   // otherwise the temporary test class cannot be reverted.
   if (currentId && currentId === id && !isQuickSwitchCharacterActive(game)) return true;
 
-  const saved = await autosaveIfDirty("switch-character");
-  if (!saved && game) {
-    const proceed = confirm("Could not auto-save current character. Switch anyway?");
-    if (!proceed) return false;
-  }
-
   if (isAuthenticatedUser) {
-    const characterOnlyId = normalizeCharacterProfileIdFromSlotId(id);
+    const characterOnlyId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
     if (characterOnlyId) {
+      const latestSaveId = providedLatestSaveId || await resolveLatestSaveIdForCharacter(characterOnlyId);
+      if (latestSaveId) {
+        const loaded = await loadSaveFromServer(latestSaveId, { showStatus: false, closeOverlay: false, forceEntrance });
+        if (!loaded) return false;
+        clearSaveDirty();
+        markCharacterStateDirty(game, "load-run");
+        void syncCharacterStateIfDirty("load-run");
+        return true;
+      }
       const snapshot = await resolveCharacterSnapshotFromServerState(characterOnlyId);
       if (!snapshot) return false;
       const profile = normalizeCharacterProfile(snapshot.character ?? { id: characterOnlyId });
-      const carryover = {
-        character: profile,
-        level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
-        xp: Math.max(0, Math.floor(snapshot?.player?.xp ?? 0)),
-        gold: Math.max(0, Math.floor(snapshot?.player?.gold ?? 0)),
-        inv: normalizeInventoryEntries(snapshot?.player?.inv ?? [], {
-          speciesId: profile.speciesId,
-          classId: profile.classId,
-          ownerId: profile.id,
-        }),
-        equip: normalizeEquip(snapshot?.player?.equip ?? {}, {
-          speciesId: profile.speciesId,
-          classId: profile.classId,
-        }),
-        maxHp: Math.max(1, Math.floor(snapshot?.player?.maxHp ?? maxHpForLevel(1, profile))),
-      };
-      game = makeNewGame(randomSeedString(), { carryover });
+      const seededRun = game ? createCharacterRunFromCurrentDungeon(game, snapshot) : null;
+      if (seededRun) {
+        game = seededRun;
+      } else {
+        const carryover = {
+          character: profile,
+          level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
+          xp: Math.max(0, Math.floor(snapshot?.player?.xp ?? 0)),
+          gold: Math.max(0, Math.floor(snapshot?.player?.gold ?? 0)),
+          inv: normalizeInventoryEntries(snapshot?.player?.inv ?? [], {
+            speciesId: profile.speciesId,
+            classId: profile.classId,
+            ownerId: profile.id,
+          }),
+          equip: normalizeEquip(snapshot?.player?.equip ?? {}, {
+            speciesId: profile.speciesId,
+            classId: profile.classId,
+          }),
+          maxHp: Math.max(1, Math.floor(snapshot?.player?.maxHp ?? maxHpForLevel(1, profile))),
+        };
+        game = makeNewGame(randomSeedString(), { carryover });
+      }
+      if (forceEntrance) {
+        respawnAtStart(game);
+      }
+      const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
+      const savedRun = await saveStateToServerSlot(game, "", slotName);
       enforceAdminControlPolicy(game);
       updateDebugMenuUi(game);
       setDebugMenuOpen(false);
       updateContextActionButton(game);
       updateDeathOverlay(game);
       setActiveCharacterSlotId(id);
-      saveRuntime.activeRunSaveId = "";
+      saveRuntime.activeRunSaveId = String(savedRun?.save?.id ?? "").trim();
       saveRuntime.activeAutosaveSaveId = "";
       refreshSaveNameFromLive(true);
       saveNow(game);
@@ -7160,15 +7297,49 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   return true;
 }
 
-async function swapCharacterFromSlotIntoCurrentRun(slotId) {
+async function switchCharacter(slotId, options = null) {
+  return swapCharacterFromSlotIntoCurrentRun(slotId, options);
+}
+
+function placePlayerFromCharacterSnapshot(state, snapshot, options = null) {
+  if (!state?.player) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const pos = normalizeCharacterSnapshotPosition(snapshot?.position ?? snapshot?.character?.position ?? null);
+  if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.depth)) {
+    return placePlayerAtDungeonEntrance(state, {
+      message: String(opts.entranceMessage ?? "").trim(),
+      resetVision: opts.resetVision === true,
+    });
+  }
+  const p = state.player;
+  p.x = pos.x;
+  p.y = pos.y;
+  p.z = pos.depth;
+  if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
+  setLastLadderLanding(state, p);
+  ensureSurfaceLinkTile(state);
+  ensureShopState(state);
+  updateAreaRespawnTracking(state, Date.now());
+  hydrateNearby(state);
+  renderInventory(state);
+  renderEquipment(state);
+  renderEffects(state);
+  updateContextActionButton(state);
+  updateDeathOverlay(state);
+  return true;
+}
+
+async function swapCharacterFromSlotIntoCurrentRun(slotId, options = null) {
   const id = String(slotId ?? "").trim();
   if (!id || !game) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const providedCharacterId = normalizeCharacterProfileId(opts.characterId ?? "");
   const currentId = String(getActiveCharacterSlotId() ?? "");
   // In Quick Switch mode we must still reload even if slot id matches,
   // otherwise the temporary test class cannot be reverted.
   if (currentId && currentId === id && !isQuickSwitchCharacterActive(game)) return true;
 
-  const saved = await autosaveIfDirty("swap-character");
+  const saved = await autosaveBeforeCharacterSwitch();
   if (!saved && game) {
     const proceed = confirm("Could not auto-save current character. Switch anyway?");
     if (!proceed) return false;
@@ -7177,7 +7348,7 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId) {
   let loaded = null;
   let loadedCharacterId = "";
   if (isAuthenticatedUser) {
-    const characterOnlyId = normalizeCharacterProfileIdFromSlotId(id);
+    const characterOnlyId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
     if (characterOnlyId) {
       loadedCharacterId = characterOnlyId;
     } else {
@@ -7204,13 +7375,23 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId) {
   }
   if (!snapshot) return false;
   if (!applyCharacterSnapshot(game, snapshot)) return false;
-  relocatePlayerToLastLadderLanding(game);
+  placePlayerFromCharacterSnapshot(game, snapshot, {
+    entranceMessage: "You enter the dungeon...",
+  });
   if (isAuthenticatedUser) {
     const nextSlotId = characterStateSlotId(loadedCharacterId);
     setActiveCharacterSlotId(nextSlotId || id);
   } else {
     setActiveCharacterSlotId(id);
   }
+  if (isAuthenticatedUser) {
+    saveRuntime.activeRunSaveId = "";
+    saveRuntime.activeAutosaveSaveId = await resolveAutosaveOverwriteIdFromServer(game);
+  } else {
+    saveRuntime.activeRunSaveId = "";
+    saveRuntime.activeAutosaveSaveId = "";
+  }
+  resetItemAuthorityRuntime(itemAuthorityCharacterIdForState(game));
   refreshSaveNameFromLive(true);
   saveNow(game);
   clearSaveDirty();
@@ -7220,7 +7401,7 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId) {
 }
 
 async function switchToCharacterSlot(slotId, options = null) {
-  return loadRunFromCharacterSlot(slotId, options);
+  return switchCharacter(slotId, options);
 }
 
 async function saveApiRequest(method = "GET", body = null, query = "") {
@@ -7516,7 +7697,7 @@ async function loadSaveFromServer(saveId, options = null) {
       throw new Error("Autosave is from a dead state.");
     }
     game = loaded;
-    const targetCharacterId = activeCharacterId || normalizeCharacterProfileId(loaded?.character?.id ?? "");
+    const targetCharacterId = normalizeCharacterProfileId(loaded?.character?.id ?? "") || activeCharacterId;
     if (targetCharacterId) {
       const latestSnapshot = await resolveLatestCharacterSnapshot(targetCharacterId);
       if (latestSnapshot) applyCharacterSnapshot(game, latestSnapshot);
@@ -7631,7 +7812,9 @@ function setCharacterOverlayOpen(open) {
     closeSpriteEditorOverlay();
     closeMonsterEditorOverlay();
     if (isNewDungeonConfirmOpen()) resolveNewDungeonConfirm(false);
+    if (isCharacterSwitchConfirmOpen()) resolveCharacterSwitchConfirm(false);
   }
+  if (!show && isCharacterSwitchConfirmOpen()) resolveCharacterSwitchConfirm(false);
   characterUi.open = show;
   characterOverlayEl.classList.toggle("show", show);
   characterOverlayEl.setAttribute("aria-hidden", show ? "false" : "true");
@@ -7745,11 +7928,10 @@ async function fetchCharacterSlotsFromServer() {
   const base = await saveApiRequest("GET");
   const characters = Array.isArray(base?.characters) ? base.characters : [];
   const characterStates = Array.isArray(base?.character_states) ? base.character_states : [];
-  const out = [];
-  const knownCharacterIds = new Set();
+  const slotsByCharacterId = new Map();
   for (const stateMeta of characterStates) {
     const characterId = normalizeCharacterProfileId(stateMeta?.id ?? "");
-    if (!characterId || knownCharacterIds.has(characterId)) continue;
+    if (!characterId) continue;
     const slotId = characterStateSlotId(characterId);
     if (!slotId) continue;
     const profileFallback = normalizeCharacterProfile({
@@ -7757,7 +7939,7 @@ async function fetchCharacterSlotsFromServer() {
       name: String(stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
     });
     const snapshot = await resolveCharacterSnapshotFromServerState(characterId);
-    const slot = {
+    const slot = slotsByCharacterId.get(characterId) ?? {
       id: slotId,
       name: String(stateMeta?.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
       updatedAt: String(stateMeta?.updated_at ?? ""),
@@ -7768,21 +7950,31 @@ async function fetchCharacterSlotsFromServer() {
         0,
         Math.floor(snapshot?.character?.deepestDepth ?? profileFallback.deepestDepth ?? 0)
       ),
+      latestSaveId: "",
+      hasDungeonPosition: characterSnapshotHasDungeonPosition(snapshot),
     };
-    out.push(slot);
-    knownCharacterIds.add(characterId);
+    slot.name = String(stateMeta?.name ?? slot.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME);
+    slot.updatedAt = String(stateMeta?.updated_at ?? slot.updatedAt ?? "");
+    if (snapshot?.character) slot.profile = normalizeCharacterProfile(snapshot.character);
+    slot.level = Math.max(1, Math.floor(snapshot?.player?.level ?? slot.level ?? 1));
+    slot.deepestDepth = Math.max(
+      Math.floor(slot.deepestDepth ?? 0),
+      Math.floor(snapshot?.character?.deepestDepth ?? slot.profile?.deepestDepth ?? 0)
+    );
+    slot.hasDungeonPosition = slot.hasDungeonPosition || characterSnapshotHasDungeonPosition(snapshot);
+    slotsByCharacterId.set(characterId, slot);
   }
 
   for (const entry of characters) {
     const characterId = normalizeCharacterProfileId(entry?.character_id ?? "");
-    if (!characterId || knownCharacterIds.has(characterId)) continue;
+    if (!characterId) continue;
     const slotId = characterStateSlotId(characterId);
     if (!slotId) continue;
     const profileFallback = normalizeCharacterProfile({
       id: characterId,
       name: String(entry?.character_name ?? DEFAULT_CHARACTER_NAME),
     });
-    const slot = {
+    const slot = slotsByCharacterId.get(characterId) ?? {
       id: slotId,
       name: String(entry?.character_name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
       updatedAt: String(entry?.updated_at ?? ""),
@@ -7790,8 +7982,18 @@ async function fetchCharacterSlotsFromServer() {
       depth: Math.trunc(entry?.depth ?? 0),
       profile: profileFallback,
       deepestDepth: Math.max(0, Math.trunc(entry?.depth ?? 0)),
+      latestSaveId: "",
+      hasDungeonPosition: false,
     };
     const saveId = String(entry?.latest_save_id ?? "").trim();
+    slot.name = String(entry?.character_name ?? slot.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME);
+    const entryUpdatedAt = String(entry?.updated_at ?? "");
+    if (!slot.updatedAt || entryUpdatedAt > String(slot.updatedAt)) slot.updatedAt = entryUpdatedAt;
+    slot.level = Math.max(1, Math.floor(entry?.level ?? slot.level ?? 1));
+    slot.depth = Math.trunc(entry?.depth ?? slot.depth ?? 0);
+    slot.deepestDepth = Math.max(Math.floor(slot.deepestDepth ?? 0), Math.trunc(entry?.depth ?? 0));
+    slot.latestSaveId = saveId || String(slot.latestSaveId ?? "");
+    slot.hasDungeonPosition = slot.hasDungeonPosition || !!saveId;
     if (saveId) {
       try {
         const detail = await saveApiRequest("GET", null, `load=${encodeURIComponent(saveId)}`);
@@ -7801,12 +8003,13 @@ async function fetchCharacterSlotsFromServer() {
           slot.level = summary.level;
           slot.depth = summary.depth;
           slot.deepestDepth = summary.deepestDepth;
+          slot.hasDungeonPosition = true;
         }
       } catch {}
     }
-    out.push(slot);
-    knownCharacterIds.add(characterId);
+    slotsByCharacterId.set(characterId, slot);
   }
+  const out = Array.from(slotsByCharacterId.values());
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   return out;
 }
@@ -7963,7 +8166,7 @@ function renderCharacterSelectBody() {
   characterOverlayTitleEl.textContent = purpose === "swap_character" ? "Switch Character" : "Choose Character";
   const slotCap = isAuthenticatedUser ? characterSlotMax : LOCAL_SLOT_MAX;
   characterOverlaySubtitleEl.textContent = purpose === "swap_character"
-    ? "Switch character while staying in the current dungeon."
+    ? "Switch to another character while keeping the current dungeon state."
     : `Load an existing run or start a new one (${slots.length}/${slotCap} slots used).`;
   characterOverlayBodyEl.innerHTML = characterStatusMarkup();
   for (const slot of slots) {
@@ -7977,6 +8180,7 @@ function renderCharacterSelectBody() {
     row.style.background = selected ? "rgba(28, 45, 73, 0.92)" : "rgba(12, 18, 30, 0.9)";
     const classLabel = characterClassDef(slot.profile?.classId ?? "").name;
     const speciesLabel = characterSpeciesDef(slot.profile?.speciesId ?? "").name;
+    const depthLabel = slot.hasDungeonPosition ? String(slot.depth) : "Entrance";
     const spriteDisplay = resolveCharacterSpriteDisplay(slot.profile?.speciesId ?? "", slot.profile?.classId ?? "");
     const visual = spriteDisplay.src
       ? `<img class="charSlotSprite" src="${spriteDisplay.src}" alt="${escapeHtmlText(speciesLabel)} ${escapeHtmlText(classLabel)} sprite" />`
@@ -7986,7 +8190,7 @@ function renderCharacterSelectBody() {
       `<div class="charSlotInfo">` +
       `<div class="charSlotTitle">${escapeHtmlText(slot.profile?.name ?? slot.name)}</div>` +
       `<div class="charSlotMeta">Species: ${speciesLabel}  |  Class: ${classLabel}\n` +
-      `Level ${slot.level}  |  Last depth ${slot.depth}  |  Deepest ${slot.deepestDepth}\n` +
+      `Level ${slot.level}  |  Last depth ${depthLabel}  |  Deepest ${slot.deepestDepth}\n` +
       `Updated ${formatSaveTimestamp(slot.updatedAt)}</div>` +
       `</div>`;
     row.addEventListener("click", () => {
@@ -7998,7 +8202,7 @@ function renderCharacterSelectBody() {
   }
 
   characterOverlayPrimaryEl.textContent = purpose === "swap_character"
-    ? "Switch to Selected Character (Stay Here)"
+    ? "Switch to Selected Character"
     : "Load Selected Run";
   characterOverlayPrimaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId;
   characterOverlayPrimaryEl.style.display = "";
@@ -8027,7 +8231,7 @@ function renderCharacterCreateBody() {
 
   characterOverlayTitleEl.textContent = "Create Character";
   characterOverlaySubtitleEl.textContent = isAuthenticatedUser
-    ? "Build a persistent runner. Character data and dungeon state are bound to this slot."
+    ? "Build a persistent runner. Character data is bound to this slot."
     : "Guest mode: one local character is cached on this device.";
 
   if (step === "welcome") {
@@ -8266,16 +8470,31 @@ async function handleCharacterOverlayPrimary() {
   if (characterUi.loading) return;
   if (characterUi.mode === "select") {
     if (!characterUi.selectedSaveId) return;
+    const selectedId = String(characterUi.selectedSaveId ?? "");
+    const purpose = normalizeCharacterSelectionPurpose(characterUi.selectionPurpose);
+    const targetSlot = (Array.isArray(characterUi.slots) ? characterUi.slots : []).find((slot) => slot.id === selectedId) ?? null;
+    const activeSlotId = String(getActiveCharacterSlotId() ?? "");
+    const currentSlot = (Array.isArray(characterUi.slots) ? characterUi.slots : []).find((slot) => slot.id === activeSlotId) ?? null;
+    if (purpose === "swap_character" && activeSlotId && activeSlotId !== selectedId) {
+      const confirmed = await openCharacterSwitchConfirm(currentSlot, targetSlot);
+      if (!confirmed) return;
+    }
     setCharacterOverlayStatus("");
     characterUi.loading = true;
     renderCharacterOverlay();
-    const purpose = normalizeCharacterSelectionPurpose(characterUi.selectionPurpose);
     const loaded = purpose === "swap_character"
-      ? await swapCharacterFromSlotIntoCurrentRun(characterUi.selectedSaveId)
-      : await loadRunFromCharacterSlot(characterUi.selectedSaveId, { forceEntrance: false });
+      ? await switchCharacter(selectedId, {
+        characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(selectedId)),
+        latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
+      })
+      : await loadRunFromCharacterSlot(selectedId, {
+        forceEntrance: false,
+        characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(selectedId)),
+        latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
+      });
     characterUi.loading = false;
     if (loaded) {
-      setActiveCharacterSlotId(characterUi.selectedSaveId);
+      setActiveCharacterSlotId(selectedId);
       requiresCharacterCreation = false;
       setCharacterOverlayOpen(false);
     } else {
@@ -8323,32 +8542,55 @@ async function handleCharacterOverlayPrimary() {
     equip: starter.equip ?? { weapon: null, head: null, chest: null, legs: null },
     maxHp: maxHpForLevel(1, profile),
   };
-  game = makeNewGame(randomSeedString(), { carryover });
-  enforceAdminControlPolicy(game);
-  updateDebugMenuUi(game);
-  updateContextActionButton(game);
-  updateDeathOverlay(game);
-  refreshSaveNameFromLive(true);
-  saveNow(game);
-  clearSaveDirty();
 
   if (isAuthenticatedUser) {
+    const activeCharacterIdBeforeCreate = normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId());
+    const shouldUseCurrentDungeon = !!(activeCharacterIdBeforeCreate && game);
+    const shouldAutoEnterNewCharacter = shouldUseCurrentDungeon || normalizeCharacterSelectionPurpose(characterUi.selectionPurpose) === "load_run";
     characterUi.loading = true;
     setCharacterOverlayStatus("Creating character slot...", false);
     renderCharacterOverlay();
     try {
-      const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
-      await saveStateToServerSlot(game, "", slotName);
-      markCharacterStateDirty(game, "character-create");
-      await syncCharacterStateIfDirty("character-create");
+      if (shouldUseCurrentDungeon) {
+        const saved = await autosaveBeforeCharacterSwitch();
+        if (!saved && game) {
+          const proceed = confirm("Could not auto-save current character. Create the new character in this dungeon anyway?");
+          if (!proceed) throw new Error("Character creation cancelled.");
+        }
+      }
+      const snapshot = buildCharacterSnapshotFromCarryover(profile, carryover);
+      const ok = await persistCharacterSnapshot(snapshot, profile);
+      if (!ok) throw new Error("Could not persist new character state.");
+      let seededRun = null;
+      if (shouldUseCurrentDungeon) {
+        seededRun = createCharacterRunFromCurrentDungeon(game, snapshot);
+        if (!seededRun) throw new Error("Could not prepare the new character in the current dungeon.");
+      }
+      let firstSaveId = "";
+      if (seededRun) {
+        const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
+        const savedRun = await saveStateToServerSlot(seededRun, "", slotName);
+        firstSaveId = String(savedRun?.save?.id ?? "").trim();
+      }
       characterUi.slots = await fetchCharacterSlotsFromServer();
       const preferredSlotId = characterStateSlotId(profile.id);
       const preferredExists = !!(preferredSlotId && characterUi.slots.some((slot) => slot.id === preferredSlotId));
       characterUi.selectedSaveId = preferredExists ? preferredSlotId : (characterUi.slots[0]?.id || "");
-      setActiveCharacterSlotId(characterUi.selectedSaveId);
-      requiresCharacterCreation = false;
-      setCharacterOverlayStatus("");
-      setCharacterOverlayOpen(false);
+      if (shouldAutoEnterNewCharacter && characterUi.selectedSaveId) {
+        const loaded = await loadRunFromCharacterSlot(characterUi.selectedSaveId, {
+          characterId: profile.id,
+          latestSaveId: firstSaveId,
+        });
+        if (!loaded) throw new Error("Character created, but the first load failed.");
+        setActiveCharacterSlotId(characterUi.selectedSaveId);
+        requiresCharacterCreation = false;
+        setCharacterOverlayStatus("");
+        setCharacterOverlayOpen(false);
+      } else {
+        characterUi.mode = "select";
+        requiresCharacterCreation = false;
+        setCharacterOverlayStatus("Character created. Select it to start at the entrance.", false);
+      }
     } catch (err) {
       setCharacterOverlayStatus(err?.message ?? "Could not create character slot.", true);
     } finally {
@@ -8357,6 +8599,15 @@ async function handleCharacterOverlayPrimary() {
     }
     return;
   }
+
+  game = makeNewGame(randomSeedString(), { carryover });
+  enforceAdminControlPolicy(game);
+  updateDebugMenuUi(game);
+  updateContextActionButton(game);
+  updateDeathOverlay(game);
+  refreshSaveNameFromLive(true);
+  saveNow(game);
+  clearSaveDirty();
 
   saveNow(game);
   const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
@@ -8490,7 +8741,11 @@ async function handleCharacterOverlayTertiary() {
       resetCharacterCreationDraft(null, { step: "welcome" });
     } else {
       if (deletedActiveCharacter && characterUi.selectedSaveId) {
-        const switched = await swapCharacterFromSlotIntoCurrentRun(characterUi.selectedSaveId);
+        const targetSlot = characterUi.slots.find((s) => s.id === characterUi.selectedSaveId) ?? null;
+        const switched = await loadRunFromCharacterSlot(characterUi.selectedSaveId, {
+          characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(characterUi.selectedSaveId)),
+          latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
+        });
         if (!switched) {
           setActiveCharacterSlotId(characterUi.selectedSaveId);
           setCharacterOverlayStatus("Character deleted, but auto-switch to the next character failed.", true);
@@ -8625,6 +8880,14 @@ function saveEntryCharacterId(entry = null) {
 function activeCharacterProfileIdFromGameState(state = null) {
   return normalizeCharacterProfileId(state?.character?.id ?? "");
 }
+function pickMostRecentSaveIdForCharacter(saves = [], characterId = "") {
+  const cid = normalizeCharacterProfileId(characterId);
+  const matching = (Array.isArray(saves) ? saves : [])
+    .filter((entry) => !cid || saveEntryCharacterId(entry) === cid)
+    .slice()
+    .sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
+  return String(matching[0]?.id ?? "").trim();
+}
 function pickMostRecentAutosaveIdForCharacter(saves = [], characterId = "") {
   const cid = normalizeCharacterProfileId(characterId);
   const autosaves = (Array.isArray(saves) ? saves : [])
@@ -8633,6 +8896,35 @@ function pickMostRecentAutosaveIdForCharacter(saves = [], characterId = "") {
     .slice()
     .sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
   return String(autosaves[0]?.id ?? "").trim();
+}
+async function resolveLatestSaveIdForCharacter(characterId = "") {
+  const cid = normalizeCharacterProfileId(characterId);
+  if (!cid) return "";
+  const cached = pickMostRecentSaveIdForCharacter(saveMenuUi?.saves ?? [], cid);
+  if (cached) return cached;
+  try {
+    const data = await saveApiRequest("GET");
+    const saves = Array.isArray(data?.saves) ? data.saves : [];
+    saveMenuUi.saves = saves;
+    return pickMostRecentSaveIdForCharacter(saves, cid);
+  } catch {
+    return "";
+  }
+}
+function normalizeCharacterSnapshotPosition(src = null) {
+  const raw = (src && typeof src === "object") ? src : {};
+  const x = Number(raw.x ?? null);
+  const y = Number(raw.y ?? null);
+  const depth = Number(raw.depth ?? raw.z ?? null);
+  return {
+    x: Number.isFinite(x) ? Math.floor(x) : null,
+    y: Number.isFinite(y) ? Math.floor(y) : null,
+    depth: Number.isFinite(depth) ? Math.floor(depth) : null,
+  };
+}
+function characterSnapshotHasDungeonPosition(snapshot = null) {
+  const pos = normalizeCharacterSnapshotPosition(snapshot?.position ?? snapshot?.character?.position ?? null);
+  return Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.depth);
 }
 async function resolveAutosaveOverwriteIdFromServer(state = null) {
   const characterId = activeCharacterProfileIdFromGameState(state);
@@ -10648,6 +10940,47 @@ function respawnAtStart(state) {
   updateContextActionButton(state);
   updateDeathOverlay(state);
   saveNow(state);
+}
+
+function placePlayerAtDungeonEntrance(state, { message = "", resetVision = false } = {}) {
+  const p = state?.player;
+  if (!state || !p) return false;
+  const sp = state.startSpawn ?? computeInitialDepth0Spawn(state.world);
+  state.startSpawn = sp;
+  p.x = sp.x;
+  p.y = sp.y;
+  p.z = sp.z;
+  setLastLadderLanding(state, sp);
+  if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
+  ensureSurfaceLinkTile(state);
+  ensureShopState(state);
+  updateAreaRespawnTracking(state, Date.now());
+  hydrateNearby(state);
+  if (resetVision) {
+    state.seen = new Set();
+    state.visible = new Set();
+    state.exploredChunks = new Set();
+  }
+  if (message) pushLog(state, message);
+  renderInventory(state);
+  renderEquipment(state);
+  renderEffects(state);
+  updateContextActionButton(state);
+  updateDeathOverlay(state);
+  return true;
+}
+
+function createCharacterRunFromCurrentDungeon(baseState, snapshot) {
+  if (!baseState || !snapshot) return null;
+  const cloned = importSave(exportSave(baseState));
+  if (!cloned) return null;
+  if (!applyCharacterSnapshot(cloned, snapshot)) return null;
+  cloned.log = [];
+  placePlayerAtDungeonEntrance(cloned, {
+    message: "You enter the dungeon...",
+    resetVision: true,
+  });
+  return cloned;
 }
 
 function makeNewGame(seedStr = randomSeedString(), options = null) {
@@ -17785,6 +18118,7 @@ function takeTurn(state, didSpendTurn) {
   if (enforceCharacterCreationGate()) return;
   if (isGuestNewCharacterOverlayOpen()) return;
   if (isGuestLoginImportOverlayOpen()) return;
+  if (isCharacterSwitchConfirmOpen()) return;
   if (isLevelUpOverlayOpen()) return;
   if (isCharacterOverlayOpen()) return;
   if (!didSpendTurn) return;
@@ -17850,6 +18184,11 @@ function onKey(state, e) {
   if (isGuestLoginImportOverlayOpen()) {
     e.preventDefault();
     if (k === "escape") resolveGuestLoginImportChoice(false);
+    return;
+  }
+  if (isCharacterSwitchConfirmOpen()) {
+    e.preventDefault();
+    if (k === "escape") resolveCharacterSwitchConfirm(false);
     return;
   }
   if (enforceCharacterCreationGate()) {
@@ -18883,8 +19222,17 @@ newDungeonConfirmStartEl?.addEventListener("click", () => {
 newDungeonConfirmCancelEl?.addEventListener("click", () => {
   resolveNewDungeonConfirm(false);
 });
+characterSwitchConfirmConfirmEl?.addEventListener("click", () => {
+  resolveCharacterSwitchConfirm(true);
+});
+characterSwitchConfirmCancelEl?.addEventListener("click", () => {
+  resolveCharacterSwitchConfirm(false);
+});
 newDungeonConfirmOverlayEl?.addEventListener("click", (e) => {
   if (e.target === newDungeonConfirmOverlayEl) resolveNewDungeonConfirm(false);
+});
+characterSwitchConfirmOverlayEl?.addEventListener("click", (e) => {
+  if (e.target === characterSwitchConfirmOverlayEl) resolveCharacterSwitchConfirm(false);
 });
 guestNewCharacterConfirmEl?.addEventListener("click", () => {
   resolveGuestNewCharacterChoice(true);
@@ -18934,6 +19282,11 @@ document.addEventListener("keydown", (e) => {
   if (isLevelUpOverlayOpen()) {
     e.preventDefault();
     closeLevelUpOverlay();
+    return;
+  }
+  if (isCharacterSwitchConfirmOpen()) {
+    e.preventDefault();
+    resolveCharacterSwitchConfirm(false);
     return;
   }
   if (isCharacterOverlayOpen()) {

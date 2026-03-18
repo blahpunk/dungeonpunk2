@@ -4028,6 +4028,51 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         background: #25406f;
         border-color: #3f68a3;
       }
+      #characterSwitchConfirmOverlay {
+        position: fixed;
+        inset: 0;
+        z-index: 1785;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 12px;
+        background: rgba(0, 0, 0, 0.62);
+      }
+      #characterSwitchConfirmOverlay.show {
+        display: flex;
+      }
+      #characterSwitchConfirmCard {
+        width: min(560px, 94vw);
+        border: 1px solid var(--ui-border);
+        border-radius: 12px;
+        background: linear-gradient(180deg, rgba(15, 23, 35, 0.99) 0%, rgba(8, 12, 20, 0.99) 100%);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+        padding: 18px 16px;
+      }
+      #characterSwitchConfirmTitle {
+        margin: 0 0 8px 0;
+        font-size: 22px;
+        font-weight: 800;
+        color: #ffffff;
+      }
+      #characterSwitchConfirmText {
+        margin: 0;
+        font-size: 13px;
+        color: #c9d4e8;
+        line-height: 1.45;
+        white-space: pre-wrap;
+      }
+      #characterSwitchConfirmButtons {
+        margin-top: 12px;
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+      #characterSwitchConfirmConfirm {
+        background: #25406f;
+        border-color: #3f68a3;
+      }
       #guestLoginImportOverlay {
         position: fixed;
         inset: 0;
@@ -6239,6 +6284,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         #spriteEditorOverlay,
         #monsterEditorOverlay,
         #newDungeonConfirmOverlay,
+        #characterSwitchConfirmOverlay,
         #guestNewCharacterOverlay,
         #guestLoginImportOverlay,
         #levelUpOverlay {
@@ -6259,6 +6305,11 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
           margin-top: 2px;
         }
         #newDungeonConfirmCard {
+          width: min(560px, calc(100vw - 20px));
+          max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
+          overflow: auto;
+        }
+        #characterSwitchConfirmCard {
           width: min(560px, calc(100vw - 20px));
           max-height: calc(100dvh - 16px - max(14px, env(safe-area-inset-bottom)));
           overflow: auto;
@@ -7071,6 +7122,16 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         <div id="newDungeonConfirmButtons">
           <button id="newDungeonConfirmCancel" type="button">Cancel</button>
           <button id="newDungeonConfirmStart" type="button">Start New Dungeon</button>
+        </div>
+      </div>
+    </div>
+    <div id="characterSwitchConfirmOverlay" aria-hidden="true">
+      <div id="characterSwitchConfirmCard" role="dialog" aria-modal="true" aria-labelledby="characterSwitchConfirmTitle">
+        <h2 id="characterSwitchConfirmTitle">Switch Character?</h2>
+        <p id="characterSwitchConfirmText">You will resume the selected character.</p>
+        <div id="characterSwitchConfirmButtons">
+          <button id="characterSwitchConfirmCancel" type="button">Cancel</button>
+          <button id="characterSwitchConfirmConfirm" type="button">Confirm</button>
         </div>
       </div>
     </div>
