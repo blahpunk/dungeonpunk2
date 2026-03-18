@@ -83,8 +83,14 @@ export function unequipItemCommand(slot = "") {
   return { type: "UNEQUIP_ITEM", slot: String(slot ?? "").trim() };
 }
 
-export function buyShopItemCommand(index = -1) {
-  const normalized = Math.floor(Number(index) || 0);
+export function buyShopItemCommand(input = -1) {
+  if (input && typeof input === "object") {
+    const itemId = String(input.itemId ?? input.id ?? "").trim();
+    const normalized = Math.floor(Number(input.index ?? input.slot ?? 0) || 0);
+    if (itemId) return { type: "BUY_SHOP_ITEM", itemId, index: Math.max(0, normalized) };
+    return normalized >= 0 ? { type: "BUY_SHOP_ITEM", index: normalized } : null;
+  }
+  const normalized = Math.floor(Number(input) || 0);
   return normalized >= 0 ? { type: "BUY_SHOP_ITEM", index: normalized } : null;
 }
 

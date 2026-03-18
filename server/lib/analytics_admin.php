@@ -3,6 +3,17 @@ declare(strict_types=1);
 
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'analytics_db.php';
 
+function analytics_active_run_window_seconds(): int
+{
+  $raw = getenv('DUNGEON25_ANALYTICS_ACTIVE_WINDOW_SECONDS');
+  $seconds = is_string($raw) ? (int) floor((float) $raw) : 0;
+  if ($seconds <= 0) {
+    // Heartbeats are sent every 15s; 45 seconds tracks truly live browser sessions.
+    $seconds = 45;
+  }
+  return max(30, min(86400, $seconds));
+}
+
 function is_analytics_admin(?string $userEmail): bool
 {
   $email = strtolower(trim((string) ($userEmail ?? '')));
@@ -30,15 +41,22 @@ function is_analytics_admin(?string $userEmail): bool
  */
 function analytics_admin_overview(PDO $db): array
 {
+  $activeWindowSeconds = analytics_active_run_window_seconds();
   $summary = [
     'active_runs' => 0,
     'runs_today' => 0,
     'average_run_seconds' => 0,
     'average_deepest_depth' => 0,
   ];
-  $summaryRow = $db->query(
+  $summaryStmt = $db->prepare(
     "SELECT
-      SUM(CASE WHEN status = 'active' AND (ended_at = '' OR ended_at IS NULL) THEN 1 ELSE 0 END) AS active_runs,
+      SUM(CASE
+        WHEN status = 'active'
+          AND (ended_at = '' OR ended_at IS NULL)
+          AND last_heartbeat_at <> ''
+          AND strftime('%s', last_heartbeat_at) >= (strftime('%s', 'now') - :active_window)
+        THEN 1 ELSE 0 END
+      ) AS active_runs,
       SUM(CASE WHEN date(started_at) = date('now') THEN 1 ELSE 0 END) AS runs_today,
       AVG(CASE
         WHEN started_at = '' THEN NULL
@@ -48,7 +66,10 @@ function analytics_admin_overview(PDO $db): array
       END) AS average_run_seconds,
       AVG(deepest_depth) AS average_deepest_depth
     FROM analytics_runs"
-  )->fetch() ?: [];
+  );
+  $summaryStmt->bindValue(':active_window', $activeWindowSeconds, PDO::PARAM_INT);
+  $summaryStmt->execute();
+  $summaryRow = $summaryStmt->fetch() ?: [];
   foreach ($summary as $key => $value) {
     $summary[$key] = (int) round((float) ($summaryRow[$key] ?? $value));
   }
@@ -104,6 +125,7 @@ function analytics_admin_overview(PDO $db): array
  */
 function analytics_admin_live_sessions(PDO $db, int $limit = 30): array
 {
+  $activeWindowSeconds = analytics_active_run_window_seconds();
   $stmt = $db->prepare(
     "SELECT
       r.run_id,
@@ -124,11 +146,46 @@ function analytics_admin_live_sessions(PDO $db, int $limit = 30): array
         LIMIT 1
       ) AS latest_event
     FROM analytics_runs r
-    WHERE r.status = 'active' AND (r.ended_at = '' OR r.ended_at IS NULL)
+    WHERE r.status = 'active'
+      AND (r.ended_at = '' OR r.ended_at IS NULL)
+      AND r.last_heartbeat_at <> ''
+      AND strftime('%s', r.last_heartbeat_at) >= (strftime('%s', 'now') - :active_window)
     ORDER BY r.last_heartbeat_at DESC, r.started_at DESC
     LIMIT :limit"
   );
+  $stmt->bindValue(':active_window', $activeWindowSeconds, PDO::PARAM_INT);
   $stmt->bindValue(':limit', max(1, min(100, $limit)), PDO::PARAM_INT);
+  $stmt->execute();
+  return $stmt->fetchAll() ?: [];
+}
+
+/**
+ * @return array<int, array<string, mixed>>
+ */
+function analytics_admin_users(PDO $db, int $limit = 200): array
+{
+  $activeWindowSeconds = analytics_active_run_window_seconds();
+  $stmt = $db->prepare(
+    "SELECT
+      user_email,
+      COUNT(*) AS total_runs,
+      SUM(CASE
+        WHEN status = 'active'
+          AND (ended_at = '' OR ended_at IS NULL)
+          AND last_heartbeat_at <> ''
+          AND strftime('%s', last_heartbeat_at) >= (strftime('%s', 'now') - :active_window)
+        THEN 1 ELSE 0 END
+      ) AS active_runs,
+      MAX(last_heartbeat_at) AS last_heartbeat_at,
+      MAX(started_at) AS last_started_at
+    FROM analytics_runs
+    WHERE user_email <> ''
+    GROUP BY user_email
+    ORDER BY active_runs DESC, last_heartbeat_at DESC, total_runs DESC, user_email ASC
+    LIMIT :limit"
+  );
+  $stmt->bindValue(':active_window', $activeWindowSeconds, PDO::PARAM_INT);
+  $stmt->bindValue(':limit', max(1, min(2000, $limit)), PDO::PARAM_INT);
   $stmt->execute();
   return $stmt->fetchAll() ?: [];
 }
@@ -205,5 +262,42 @@ function analytics_admin_player(PDO $db, string $userEmail): array
     'class_usage' => $classStmt->fetchAll() ?: [],
     'death_causes' => $deathStmt->fetchAll() ?: [],
     'recent_runs' => $runStmt->fetchAll() ?: [],
+  ];
+}
+
+/**
+ * @return array{backup_path: string, deleted_runs: int, deleted_depths: int, deleted_events: int, deleted_totals: int}
+ */
+function analytics_admin_reset_all(PDO $db): array
+{
+  $backupPath = '';
+  $dbPath = analytics_db_path();
+  if (is_file($dbPath)) {
+    $stamp = gmdate('Ymd_His');
+    $backupPath = preg_replace('/\.sqlite$/', '', $dbPath) . '.backup_' . $stamp . '.sqlite';
+    if (!is_string($backupPath) || $backupPath === '' || !@copy($dbPath, $backupPath)) {
+      throw new RuntimeException('Could not create analytics backup before reset.');
+    }
+  }
+
+  $db->beginTransaction();
+  try {
+    $deletedEvents = (int) $db->exec('DELETE FROM analytics_events');
+    $deletedDepths = (int) $db->exec('DELETE FROM analytics_run_depths');
+    $deletedRuns = (int) $db->exec('DELETE FROM analytics_runs');
+    $deletedTotals = (int) $db->exec('DELETE FROM analytics_player_totals');
+    $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('analytics_events')");
+    $db->commit();
+  } catch (Throwable $err) {
+    $db->rollBack();
+    throw $err;
+  }
+
+  return [
+    'backup_path' => $backupPath,
+    'deleted_runs' => $deletedRuns,
+    'deleted_depths' => $deletedDepths,
+    'deleted_events' => $deletedEvents,
+    'deleted_totals' => $deletedTotals,
   ];
 }

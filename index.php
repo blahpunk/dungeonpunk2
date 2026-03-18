@@ -5,6 +5,7 @@ require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'l
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_write.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'analytics_admin.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'session_manager.php';
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'shop_manager.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'run_saver.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'sim_engine.php';
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'server' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'run_loader.php';
@@ -2818,6 +2819,7 @@ if ($apiMode === 'analytics') {
         'ok' => true,
         'overview' => analytics_admin_overview($db),
         'live_sessions' => analytics_admin_live_sessions($db),
+        'users' => analytics_admin_users($db),
       ]);
     }
     if ($action === 'run') {
@@ -2833,8 +2835,8 @@ if ($apiMode === 'analytics') {
     }
     if ($action === 'player') {
       $targetUser = strtolower(trim((string) ($_GET['user'] ?? '')));
-      if ($targetUser === '' || filter_var($targetUser, FILTER_VALIDATE_EMAIL) === false) {
-        json_response(['ok' => false, 'error' => 'Missing or invalid player email.'], 400);
+      if ($targetUser === '') {
+        json_response(['ok' => false, 'error' => 'Missing user id.'], 400);
       }
       json_response(['ok' => true, 'player' => analytics_admin_player($db, $targetUser)]);
     }
@@ -2844,33 +2846,44 @@ if ($apiMode === 'analytics') {
   if ($method !== 'POST') {
     json_response(['ok' => false, 'error' => 'Method not allowed.'], 405);
   }
-  if ($user === null || $userEmail === '') {
-    json_response(['ok' => false, 'error' => 'Please log in to submit analytics.'], 401);
-  }
-
-  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
-  $csrfValid = $csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader);
-  if (!$csrfValid && !is_same_origin_request()) {
-    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
-  }
 
   $body = request_json_body();
   if ($body === null) {
     json_response(['ok' => false, 'error' => 'Invalid JSON body.'], 400);
   }
+  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+  $csrfBody = trim((string) ($body['_csrf'] ?? ''));
+  $csrfValid = ($csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader))
+    || ($csrfBody !== '' && hash_equals($saveGamesCsrf, $csrfBody));
+  if (!$csrfValid && !is_same_origin_request()) {
+    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
+  }
+  $analyticsActorId = strtolower(trim((string) ($userEmail ?? '')));
+  if ($analyticsActorId === '') {
+    $bodyActorId = strtolower(trim((string) ($body['actor_id'] ?? '')));
+    if ($bodyActorId !== '' && preg_match('/^guest:[a-z0-9_\-]{8,120}$/', $bodyActorId) === 1) {
+      $analyticsActorId = $bodyActorId;
+    } else {
+      $guestSessionId = trim((string) session_id());
+      if ($guestSessionId === '') {
+        $guestSessionId = bin2hex(random_bytes(16));
+      }
+      $analyticsActorId = 'guest:' . substr(hash('sha256', $guestSessionId), 0, 24);
+    }
+  }
   $action = strtolower(trim((string) ($body['action'] ?? '')));
   try {
     if ($action === 'run_start') {
-      json_response(['ok' => true, 'run' => analytics_write_run_start($db, $userEmail, $body)]);
+      json_response(['ok' => true, 'run' => analytics_write_run_start($db, $analyticsActorId, $body)]);
     }
     if ($action === 'heartbeat') {
-      json_response(['ok' => true, 'heartbeat' => analytics_write_heartbeat($db, $userEmail, $body)]);
+      json_response(['ok' => true, 'heartbeat' => analytics_write_heartbeat($db, $analyticsActorId, $body)]);
     }
     if ($action === 'event_batch') {
-      json_response(['ok' => true, 'batch' => analytics_write_event_batch($db, $userEmail, $body)]);
+      json_response(['ok' => true, 'batch' => analytics_write_event_batch($db, $analyticsActorId, $body)]);
     }
     if ($action === 'run_end') {
-      json_response(['ok' => true, 'run' => analytics_write_run_end($db, $userEmail, $body)]);
+      json_response(['ok' => true, 'run' => analytics_write_run_end($db, $analyticsActorId, $body)]);
     }
     json_response(['ok' => false, 'error' => 'Unsupported analytics action.'], 400);
   } catch (InvalidArgumentException $e) {
@@ -2897,15 +2910,16 @@ if ($apiMode === 'authoritative') {
     json_response(['ok' => false, 'error' => 'Method not allowed.'], 405);
   }
 
-  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
-  $csrfValid = $csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader);
-  if (!$csrfValid && !is_same_origin_request()) {
-    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
-  }
-
   $body = request_json_body();
   if ($body === null) {
     json_response(['ok' => false, 'error' => 'Invalid JSON body.'], 400);
+  }
+  $csrfHeader = trim((string) ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+  $csrfBody = trim((string) ($body['_csrf'] ?? ''));
+  $csrfValid = ($csrfHeader !== '' && hash_equals($saveGamesCsrf, $csrfHeader))
+    || ($csrfBody !== '' && hash_equals($saveGamesCsrf, $csrfBody));
+  if (!$csrfValid && !is_same_origin_request()) {
+    json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
   }
 
   $action = strtolower(trim((string) ($body['action'] ?? '')));
@@ -2913,10 +2927,12 @@ if ($apiMode === 'authoritative') {
     if ($action === 'open_session') {
       $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
       $saveId = trim((string) ($body['save_id'] ?? ''));
+      $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
       json_response(authoritative_open_session_for_character($userEmail, $saveSecret, $characterId, [
         'save_id' => $saveId,
         'force_entrance' => !empty($body['force_entrance']),
         'fresh_world' => !empty($body['fresh_world']),
+        'browser_instance_id' => $browserInstanceId,
       ]));
     }
     if ($action === 'switch_character') {
@@ -2944,6 +2960,14 @@ if ($apiMode === 'authoritative') {
         json_response(['ok' => false, 'error' => 'Missing session, command, or command sequence.'], 400);
       }
       json_response(authoritative_handle_command($userEmail, $saveSecret, $sessionId, $clientCommandSeq, $command));
+    }
+    if ($action === 'touch_session') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
+      json_response(authoritative_touch_session($sessionId, $userEmail, $browserInstanceId));
     }
     if ($action === 'request_resync') {
       $sessionId = trim((string) ($body['session_id'] ?? ''));
@@ -2990,6 +3014,19 @@ if ($apiMode === 'authoritative') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
       }
       json_response(authoritative_save_and_exit($userEmail, $saveSecret, $sessionId));
+    }
+    if ($action === 'close_session') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      $closed = authoritative_close_session($sessionId, $userEmail);
+      json_response([
+        'ok' => true,
+        'closed' => $closed,
+        'sessionId' => $sessionId,
+        'message' => $closed ? 'Authoritative session closed.' : 'Session already closed.',
+      ]);
     }
     json_response(['ok' => false, 'error' => 'Unsupported authoritative action.'], 400);
   } catch (InvalidArgumentException $e) {

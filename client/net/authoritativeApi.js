@@ -1,9 +1,34 @@
 export function createAuthoritativeApi(options = {}) {
   const baseUrl = String(options.baseUrl ?? "./index.php").trim() || "./index.php";
   const csrfToken = String(options.csrfToken ?? "").trim();
+  const browserInstanceId = String(options.browserInstanceId ?? "").trim();
   const cacheBust = typeof options.cacheBust === "function" ? options.cacheBust : ((url) => url);
 
-  async function request(body = null) {
+  function buildPayload(body = null) {
+    const payload = (body && typeof body === "object")
+      ? { ...body }
+      : {};
+    if (browserInstanceId) payload.browser_instance_id = browserInstanceId;
+    if (csrfToken) payload._csrf = csrfToken;
+    return payload;
+  }
+
+  function sendBeaconPayload(payload = null) {
+    if (typeof navigator === "undefined" || typeof navigator.sendBeacon !== "function") return false;
+    const body = (payload && typeof payload === "object") ? payload : {};
+    try {
+      const encoded = JSON.stringify(body);
+      if (!encoded) return false;
+      const blob = new Blob([encoded], { type: "application/json" });
+      return navigator.sendBeacon(cacheBust(`${baseUrl}?api=authoritative`), blob);
+    } catch {
+      return false;
+    }
+  }
+
+  async function request(body = null, requestOptions = null) {
+    const opts = (requestOptions && typeof requestOptions === "object") ? requestOptions : {};
+    const payload = buildPayload(body);
     const headers = {
       Accept: "application/json",
       "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -16,7 +41,8 @@ export function createAuthoritativeApi(options = {}) {
       credentials: "same-origin",
       headers,
       cache: "no-store",
-      body: JSON.stringify(body ?? {}),
+      keepalive: opts.keepalive === true,
+      body: JSON.stringify(payload),
     });
     let data = null;
     try {
@@ -48,6 +74,12 @@ export function createAuthoritativeApi(options = {}) {
         client_command_seq: clientCommandSeq,
         command,
       });
+    },
+    touchSession({ sessionId = "" } = {}) {
+      return request({
+        action: "touch_session",
+        session_id: sessionId,
+      }, { keepalive: true });
     },
     requestResync({ sessionId = "" } = {}) {
       return request({
@@ -91,6 +123,22 @@ export function createAuthoritativeApi(options = {}) {
         action: "save_and_exit",
         session_id: sessionId,
       });
+    },
+    closeSession({ sessionId = "", reason = "", bestEffort = false } = {}) {
+      const payload = {
+        action: "close_session",
+        session_id: sessionId,
+        reason: String(reason ?? "").trim() || undefined,
+      };
+      if (bestEffort) {
+        const beaconSent = sendBeaconPayload(buildPayload(payload));
+        return request(payload, { keepalive: true }).catch(() => ({
+          ok: beaconSent,
+          closed: beaconSent,
+          via: beaconSent ? "beacon" : "failed",
+        }));
+      }
+      return request(payload, { keepalive: true });
     },
   };
 }

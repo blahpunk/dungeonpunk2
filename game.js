@@ -3,7 +3,7 @@ import {
   LOCAL_SLOT_MAX,
   createLocalSlotStore,
 } from "./client/save/saveManager.js?v=20260315a";
-import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260318a";
+import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260318d";
 import {
   abilityCommand,
   attackCommand,
@@ -21,7 +21,7 @@ import {
   useItemCommand,
   useShrineCommand,
   waitCommand,
-} from "./client/input/authoritativeCommands.js?v=20260317b";
+} from "./client/input/authoritativeCommands.js?v=20260318c";
 import {
   drawCellHighlight,
   drawFootShadow,
@@ -55,7 +55,7 @@ import {
   trapFamilyDef,
   trapRevealStyle,
 } from "./client/gameplay/traps.js?v=20260315a";
-import { createAnalyticsApi } from "./client/telemetry/analyticsApi.js?v=20260315a";
+import { createAnalyticsApi } from "./client/telemetry/analyticsApi.js?v=20260318e";
 import {
   HEARTBEAT_INTERVAL_MS,
   accumulateAnalyticsTime,
@@ -1480,10 +1480,36 @@ const canAdminControls = document.body?.dataset?.canAdminControls === "1";
 const isAuthenticatedUser = document.body?.dataset?.isAuthenticated === "1";
 const authoritativeEnabled = document.body?.dataset?.authoritativeEnabled === "1";
 const saveApiCsrfToken = document.body?.dataset?.saveCsrf ?? "";
-const analyticsApi = createAnalyticsApi({ baseUrl: "./index.php", csrfToken: saveApiCsrfToken });
 const saveSlotMax = Math.max(1, Number.parseInt(document.body?.dataset?.saveMaxSlots ?? "10", 10) || 10);
 const characterSlotMax = Math.max(1, Number.parseInt(document.body?.dataset?.characterMaxSlots ?? "5", 10) || 5);
 const saveNameMaxLen = Math.max(1, Number.parseInt(document.body?.dataset?.saveNameMaxLen ?? "48", 10) || 48);
+const BROWSER_INSTANCE_ID_STORAGE_KEY = "d25_browser_instance_id";
+const ANALYTICS_ACTOR_ID_STORAGE_KEY = "d25_analytics_actor_id";
+
+function resolveAnalyticsActorId() {
+  if (isAuthenticatedUser) return "";
+  const fallback = () => `guest:${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+  let id = "";
+  try {
+    id = String(localStorage.getItem(ANALYTICS_ACTOR_ID_STORAGE_KEY) ?? "").trim().toLowerCase();
+  } catch {}
+  if (!/^guest:[a-z0-9_\-]{12,120}$/.test(id)) {
+    id = fallback().replace(/[^a-z0-9:_\-]/g, "");
+    if (!/^guest:[a-z0-9_\-]{12,120}$/.test(id)) {
+      id = `guest:${Math.random().toString(36).slice(2, 14)}`.replace(/[^a-z0-9:_\-]/g, "");
+    }
+    try {
+      localStorage.setItem(ANALYTICS_ACTOR_ID_STORAGE_KEY, id);
+    } catch {}
+  }
+  return id;
+}
+
+const analyticsApi = createAnalyticsApi({
+  baseUrl: "./index.php",
+  csrfToken: saveApiCsrfToken,
+  actorId: resolveAnalyticsActorId(),
+});
 const localSlotStore = createLocalSlotStore({
   storage: localStorage,
   normalizeId: (value) => normalizeCharacterSlotId(value ?? ""),
@@ -1687,6 +1713,31 @@ const rightColEl = document.getElementById("rightCol");
 let cacheBustCounter = 0;
 const authoritativeMirror = createServerMirror();
 const authoritativePendingAction = createPendingActionState();
+let lifecycleAuthoritativeCloseRequested = false;
+const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
+const authoritativeSessionRuntime = {
+  touchTimer: 0,
+  touchInFlight: false,
+  lastTouchAt: 0,
+};
+
+function resolveBrowserInstanceId() {
+  const fallback = () => `browser_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+  let id = "";
+  try {
+    id = String(localStorage.getItem(BROWSER_INSTANCE_ID_STORAGE_KEY) ?? "").trim().toLowerCase();
+  } catch {}
+  if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
+    id = fallback().replace(/[^a-z0-9_\-]/g, "");
+    if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
+      id = `browser_${Math.random().toString(36).slice(2, 14)}`.replace(/[^a-z0-9_\-]/g, "");
+    }
+    try {
+      localStorage.setItem(BROWSER_INSTANCE_ID_STORAGE_KEY, id);
+    } catch {}
+  }
+  return id;
+}
 
 function withCacheBust(url) {
   const sep = url.includes("?") ? "&" : "?";
@@ -1698,6 +1749,7 @@ function withCacheBust(url) {
 const authoritativeApi = createAuthoritativeApi({
   baseUrl: "./index.php",
   csrfToken: saveApiCsrfToken,
+  browserInstanceId: resolveBrowserInstanceId(),
   cacheBust: withCacheBust,
 });
 
@@ -1767,6 +1819,8 @@ function activateLoadedGameState(nextGame, reason = "load") {
   }
   if (isAuthoritativeSessionActive()) clearSaveDirty();
   else saveNow(game);
+  restartAnalyticsHeartbeatLoop(game);
+  void flushAnalyticsIfNeeded(game, `${reason}-load`);
   return true;
 }
 
@@ -1791,6 +1845,8 @@ function applyAuthoritativeSnapshotToGame(response, options = null) {
     saveRuntime.dirtyReason = String(opts.dirtyReason ?? "authoritative");
     saveRuntime.lastDirtyAt = Date.now();
   }
+  lifecycleAuthoritativeCloseRequested = false;
+  restartAuthoritativeSessionTouchLoop();
   return true;
 }
 
@@ -1850,6 +1906,60 @@ async function performAuthoritativeCommand(command, options = null) {
     setAuthoritativeInputLock(false);
     updateContextActionButton(game);
   }
+}
+
+function stopAuthoritativeSessionTouchLoop() {
+  if (!authoritativeSessionRuntime.touchTimer) return;
+  clearInterval(authoritativeSessionRuntime.touchTimer);
+  authoritativeSessionRuntime.touchTimer = 0;
+}
+
+async function touchAuthoritativeSession(reason = "interval") {
+  if (!isAuthoritativeSessionActive()) return false;
+  if (authoritativeSessionRuntime.touchInFlight) return false;
+  const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
+  if (!sessionId) return false;
+  const now = Date.now();
+  if ((now - authoritativeSessionRuntime.lastTouchAt) < (AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS - 500)) {
+    return false;
+  }
+  authoritativeSessionRuntime.touchInFlight = true;
+  try {
+    await authoritativeApi.touchSession({ sessionId });
+    authoritativeSessionRuntime.lastTouchAt = Date.now();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    authoritativeSessionRuntime.touchInFlight = false;
+  }
+}
+
+function restartAuthoritativeSessionTouchLoop() {
+  stopAuthoritativeSessionTouchLoop();
+  authoritativeSessionRuntime.touchInFlight = false;
+  authoritativeSessionRuntime.lastTouchAt = 0;
+  if (HEADLESS_RUNTIME) return;
+  if (!isAuthoritativeModeEnabled()) return;
+  authoritativeSessionRuntime.touchTimer = setInterval(() => {
+    void touchAuthoritativeSession("interval");
+  }, AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS);
+  void touchAuthoritativeSession("startup");
+}
+
+function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
+  if (lifecycleAuthoritativeCloseRequested) return false;
+  if (!isAuthoritativeSessionActive()) return false;
+  const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
+  if (!sessionId) return false;
+  lifecycleAuthoritativeCloseRequested = true;
+  stopAuthoritativeSessionTouchLoop();
+  void authoritativeApi.closeSession({
+    sessionId,
+    reason: String(reason ?? "").trim() || "lifecycle-close",
+    bestEffort: true,
+  });
+  return true;
 }
 
 async function openAuthoritativeSessionForSelection(characterId = "", options = null) {
@@ -1966,7 +2076,7 @@ mini.height = (MINI_RADIUS * 2 + 1) * MINI_SCALE;
 
 let fogEnabled = true;
 let minimapEnabled = true;
-const shopUi = { open: false, mode: "buy", selectedBuy: 0, selectedSell: 0 };
+const shopUi = { open: false, mode: "buy", selectedBuy: 0, selectedSell: 0, lastRefreshRequestAt: 0 };
 const overlaySections = { equipmentCollapsed: false, inventoryCollapsed: false };
 const mobileUi = { gearOpen: false, logExpanded: false };
 let mobileUiSig = "";
@@ -2075,6 +2185,25 @@ const analyticsRuntime = {
   flushing: false,
   lastError: "",
 };
+
+function stopAnalyticsHeartbeatLoop() {
+  if (!analyticsRuntime.heartbeatTimer) return;
+  clearInterval(analyticsRuntime.heartbeatTimer);
+  analyticsRuntime.heartbeatTimer = 0;
+}
+
+function restartAnalyticsHeartbeatLoop(state = null) {
+  stopAnalyticsHeartbeatLoop();
+  if (HEADLESS_RUNTIME || !FEATURE_FLAGS.telemetryUpload) return;
+  const nextState = state ?? game;
+  if (!nextState?.player || !nextState?.world) return;
+  const intervalMs = Math.max(5000, Math.floor(HEARTBEAT_INTERVAL_MS / 2));
+  analyticsRuntime.heartbeatTimer = setInterval(() => {
+    if (!game?.player || !game?.world) return;
+    void flushAnalyticsIfNeeded(game, "interval");
+  }, intervalMs);
+  void flushAnalyticsIfNeeded(nextState, "startup");
+}
 let infoTierSignature = "";
 let spriteEditorSignature = "";
 let monsterEditorSignature = "";
@@ -5474,159 +5603,291 @@ function itemMarketValue(type) {
   return 20;
 }
 
-function shopBuyPrice(type, depth) {
+const SHOP_CORE_SLOT_LAYOUT = Object.freeze([
+  "low_gear", "low_gear", "low_gear", "low_gear",
+  "mid_gear", "mid_gear", "mid_gear", "mid_gear",
+  "high_gear", "high_gear", "high_gear", "high_gear",
+  "potions", "potions",
+  "wildcard", "wildcard",
+]);
+const SHOP_CORE_SIZE = SHOP_CORE_SLOT_LAYOUT.length;
+const SHOP_OVERFLOW_MAX = 32;
+const SHOP_REFRESH_INTERVAL_MS = 25 * 60 * 1000;
+const SHOP_PURCHASE_COOLDOWN_MS = 2500;
+
+function shopBuildItemId(prefix = "itm") {
+  const safePrefix = String(prefix ?? "itm").replace(/[^a-z0-9_]/gi, "").toLowerCase() || "itm";
+  return `${safePrefix}_${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36).slice(-6)}`;
+}
+
+function normalizeShopType(value = "") {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (raw === "weaponsmith" || raw === "armorer" || raw === "general") return raw;
+  return "general";
+}
+
+function shopTierForItemType(type = "") {
+  const template = itemTemplateForType(type);
+  const materialId = template?.materialTierId ?? materialIdFromItemType(type);
+  const tierIdx = materialId ? METAL_TIERS.findIndex((tier) => tier.id === materialId) : -1;
+  if (tierIdx < 0) return "mid";
+  if (tierIdx <= 5) return "low";
+  if (tierIdx <= 11) return "mid";
+  return "high";
+}
+
+function shopTierForSlotType(slotType = "", rng = Math.random) {
+  const slot = String(slotType ?? "").trim().toLowerCase();
+  if (slot === "low_gear" || slot === "potions") return "low";
+  if (slot === "mid_gear") return "mid";
+  if (slot === "high_gear") return "high";
+  if (slot === "wildcard") return rng() < 0.6 ? "mid" : "high";
+  return "mid";
+}
+
+function shopCategoryForSlot(shopType = "general", slotType = "", rng = Math.random) {
+  if (slotType === "potions") return "";
+  const type = normalizeShopType(shopType);
+  if (type === "weaponsmith") return rng() < 0.78 ? "weapon" : "armor";
+  if (type === "armorer") return rng() < 0.78 ? "armor" : "weapon";
+  return rng() < 0.5 ? "weapon" : "armor";
+}
+
+function shopDepthBandForTier(tier = "mid") {
+  if (tier === "low") return { min: 0, max: 8 };
+  if (tier === "high") return { min: 18, max: 48 };
+  return { min: 8, max: 24 };
+}
+
+function shopBuyPrice(type, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const tier = opts.tier || shopTierForItemType(type);
   const base = itemMarketValue(type);
-  const markup = type === "potion" ? 1.2 : (1.25 + Math.min(0.25, depth * 0.01));
+  if (type === "potion") return Math.max(5, Math.floor(base * 1.22));
+  const markup = tier === "low" ? 1.12 : (tier === "high" ? 1.52 : 1.28);
   return Math.max(5, Math.floor(base * markup));
 }
 
 function shopSellPrice(type) {
-  return Math.max(1, Math.floor(itemMarketValue(type) * 0.25));
+  return Math.max(1, Math.floor(itemMarketValue(type) * 0.35));
 }
 
-function shopProgressScore(state) {
-  const depthScore = Math.max(0, state.player.z);
-  const levelScore = Math.max(0, Math.floor((state.player.level - 1) * 0.9));
-  return depthScore + levelScore;
+function shopOverflowBuyPrice(type) {
+  return Math.max(1, Math.floor(itemMarketValue(type) * 0.7));
 }
 
 function shopRefreshIntervalMsForLevel(levelRaw) {
-  const level = Math.max(1, Math.floor(levelRaw ?? 1));
-  // Lower levels refresh faster, rising toward 7 minutes at high levels.
-  const t = clamp((level - 1) / 49, 0, 1);
-  const sec = Math.round(30 + (420 - 30) * t);
-  return sec * 1000;
+  void levelRaw;
+  return SHOP_REFRESH_INTERVAL_MS;
 }
 
 function randomPotionStockAmount(rng = Math.random) {
   return randInt(rng, 8, 15);
 }
 
-function targetShopCountsForLevel(levelRaw) {
-  const level = Math.max(1, Math.floor(levelRaw ?? 1));
-  const total = clamp(10 + Math.floor(level / 8), 10, 14);
-  const gear = Math.max(4, total - 1);
-  return { total, gear };
+function canSellItemType(type = "") {
+  return type === "potion" || type.startsWith("weapon_") || type.startsWith("armor_");
 }
 
-function buildShopGearTypesForLevel(levelRaw, rng = Math.random) {
-  const level = Math.max(1, Math.floor(levelRaw ?? 1));
-  const depthBase = Math.max(0, level - 1);
-  const { gear: gearTarget } = targetShopCountsForLevel(levelRaw);
-  const taken = new Set();
-  const out = [];
-  let attempts = 0;
-  while (out.length < gearTarget && attempts < gearTarget * 24) {
-    attempts += 1;
-    const depthRoll = clamp(depthBase + randInt(rng, -1, 4), 0, 160);
-    const category = rng() < 0.58 ? "weapon" : "armor";
-    const type = equipmentTypeForDepth(depthRoll, rng, {
+function buildShopCoreItemForSlot(state, slotType, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const rng = typeof opts.rng === "function" ? opts.rng : Math.random;
+  const nowMs = Number.isFinite(opts.nowMs) ? Math.max(0, Math.floor(opts.nowMs)) : Date.now();
+  const shopType = normalizeShopType(state?.shop?.shopType ?? "general");
+  const slot = String(slotType ?? "").trim().toLowerCase();
+  if (slot === "potions") {
+    const amount = randomPotionStockAmount(rng);
+    return {
+      itemId: shopBuildItemId("core"),
+      templateId: "potion",
+      type: "potion",
+      tier: "low",
+      price: shopBuyPrice("potion", { tier: "low" }),
+      generatedAt: nowMs,
+      slotType: "potions",
+      amount,
+      source: "core",
+    };
+  }
+
+  const targetTier = shopTierForSlotType(slot, rng);
+  const category = shopCategoryForSlot(shopType, slot, rng);
+  const band = shopDepthBandForTier(targetTier);
+  let chosenType = "";
+  for (let attempt = 0; attempt < 36; attempt += 1) {
+    const depthRoll = randInt(rng, band.min, band.max);
+    const rollType = equipmentTypeForDepth(depthRoll, rng, {
       source: "shop",
-      category,
+      category: category || undefined,
     });
-    if (!type || taken.has(type)) continue;
-    taken.add(type);
-    out.push(type);
-  }
-  if (out.length < gearTarget) {
-    const fallbackTypes = [
-      ...Object.keys(WEAPONS),
-      ...Object.keys(ARMOR_PIECES),
-    ];
-    while (out.length < gearTarget && fallbackTypes.length > 0) {
-      const idx = randInt(rng, 0, fallbackTypes.length - 1);
-      const type = fallbackTypes.splice(idx, 1)[0];
-      if (!type || taken.has(type)) continue;
-      taken.add(type);
-      out.push(type);
+    if (!rollType) continue;
+    const rolledTier = shopTierForItemType(rollType);
+    if (slot === "wildcard" || rolledTier === targetTier || (targetTier === "high" && rolledTier === "mid")) {
+      chosenType = rollType;
+      break;
     }
   }
-  return out.slice(0, gearTarget);
-}
-
-function ensurePotionStockEntry(stock, depth, rng = Math.random) {
-  if (!Array.isArray(stock)) return;
-  const idx = stock.findIndex((entry) => entry?.type === "potion");
-  const refill = randomPotionStockAmount(rng);
-  if (idx < 0) {
-    stock.unshift({ type: "potion", price: shopBuyPrice("potion", depth), amount: refill });
-    return;
+  if (!chosenType) {
+    const fallbackType = equipmentTypeForDepth(randInt(rng, band.min, band.max), rng, {
+      source: "shop",
+      category: category || undefined,
+    });
+    chosenType = fallbackType || Object.keys(WEAPONS)[0] || "potion";
   }
-  const entry = stock[idx];
-  entry.price = shopBuyPrice("potion", depth);
-  const cur = Math.max(0, Math.floor(entry.amount ?? 0));
-  if (cur < 4) entry.amount = refill;
-  else if (cur > 15) entry.amount = 15;
-  else entry.amount = cur;
+  const resolvedTier = shopTierForItemType(chosenType);
+  return {
+    itemId: shopBuildItemId("core"),
+    templateId: chosenType,
+    type: chosenType,
+    tier: resolvedTier,
+    price: shopBuyPrice(chosenType, { tier: resolvedTier }),
+    generatedAt: nowMs,
+    slotType: slot || "mid_gear",
+    amount: 1,
+    source: "core",
+  };
 }
 
-function shopCatalogForDepth(depth) {
-  const d = Math.max(0, depth);
-  const items = [{ type: "potion", w: Math.max(6, 14 - Math.floor(d / 16)) }];
-  for (let i = 0; i < 18; i++) {
-    const rollDepth = clamp(d + randInt(Math.random, -1, 3), 0, 160);
-    const type = equipmentTypeForDepth(rollDepth, Math.random, { source: "shop" });
-    if (!type) continue;
-    items.push({ type, w: Math.max(1, Math.round(itemMarketValue(type) / 40)) });
+function normalizeShopCoreItem(raw, slotType, state, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const rng = typeof opts.rng === "function" ? opts.rng : Math.random;
+  const nowMs = Number.isFinite(opts.nowMs) ? Math.max(0, Math.floor(opts.nowMs)) : Date.now();
+  const allowGenerate = opts.allowGenerate !== false;
+  const slot = String(slotType ?? "").trim().toLowerCase() || "mid_gear";
+  const entry = (raw && typeof raw === "object") ? raw : null;
+  const normalizedType = normalizeItemType(entry?.templateId ?? entry?.type ?? "");
+  if (!entry || !normalizedType || !ITEM_TYPES[normalizedType]) {
+    return allowGenerate ? buildShopCoreItemForSlot(state, slot, { rng, nowMs }) : null;
   }
-  return items;
+  const amount = normalizedType === "potion"
+    ? clamp(Math.floor(Number(entry.amount ?? 1) || 1), 1, 20)
+    : 1;
+  const tier = normalizedType === "potion" ? "low" : shopTierForItemType(normalizedType);
+  return {
+    itemId: String(entry.itemId ?? "").trim() || shopBuildItemId("core"),
+    templateId: normalizedType,
+    type: normalizedType,
+    tier: String(entry.tier ?? "").trim().toLowerCase() || tier,
+    price: Math.max(1, Math.floor(Number(entry.price ?? shopBuyPrice(normalizedType, { tier })) || 1)),
+    generatedAt: Math.max(0, Math.floor(Number(entry.generatedAt ?? Date.now()) || Date.now())),
+    slotType: slot,
+    amount,
+    source: "core",
+  };
 }
 
-function drawUniqueWeightedItems(rng, weightedItems, count) {
-  const pool = weightedItems.map((x) => ({ ...x }));
-  const out = [];
-  while (pool.length && out.length < count) {
-    const total = pool.reduce((s, x) => s + Math.max(0, x.w), 0);
-    if (total <= 0) break;
-    let r = rng() * total;
-    let pickIndex = 0;
-    for (let i = 0; i < pool.length; i++) {
-      r -= Math.max(0, pool[i].w);
-      if (r <= 0) {
-        pickIndex = i;
-        break;
-      }
-    }
-    out.push(pool[pickIndex].type);
-    pool.splice(pickIndex, 1);
-  }
-  return out;
-}
-
-function buildShopStockEntry(type, depth) {
-  const amount = type === "potion" ? randomPotionStockAmount(Math.random) : 1;
-  return { type, price: shopBuyPrice(type, depth), amount };
+function normalizeShopOverflowItem(raw) {
+  const entry = (raw && typeof raw === "object") ? raw : null;
+  const type = normalizeItemType(entry?.templateId ?? entry?.type ?? "");
+  if (!entry || !type || !ITEM_TYPES[type]) return null;
+  return {
+    itemId: String(entry.itemId ?? "").trim() || shopBuildItemId("overflow"),
+    templateId: type,
+    type,
+    tier: String(entry.tier ?? "").trim().toLowerCase() || shopTierForItemType(type),
+    price: Math.max(1, Math.floor(Number(entry.price ?? shopOverflowBuyPrice(type)) || 1)),
+    listedAt: Math.max(0, Math.floor(Number(entry.listedAt ?? Date.now()) || Date.now())),
+    soldByPlayerId: String(entry.soldByPlayerId ?? "").trim(),
+    source: "overflow",
+  };
 }
 
 function ensureShopState(state) {
-  if (state.shop) return;
-  const now = Date.now();
-  const depth = shopProgressScore(state);
-  const { total } = targetShopCountsForLevel(state.player.level);
-  const gearTypes = buildShopGearTypesForLevel(state.player.level, Math.random);
-  const types = ["potion", ...gearTypes].slice(0, total);
-  state.shop = {
-    stock: types.map((type) => buildShopStockEntry(type, depth)),
-    lastRefreshMs: now,
-    nextRefreshMs: now + shopRefreshIntervalMsForLevel(state.player.level),
+  if (!state || typeof state !== "object") return;
+  const nowMs = Date.now();
+  const allowGenerate = canMutateShopStateLocally();
+  const existing = (state.shop && typeof state.shop === "object") ? state.shop : {};
+  const shop = {
+    shopId: String(existing.shopId ?? "shop_01").trim() || "shop_01",
+    shopType: normalizeShopType(existing.shopType ?? "general"),
+    coreStock: Array.isArray(existing.coreStock) ? existing.coreStock.slice() : [],
+    overflowStock: Array.isArray(existing.overflowStock) ? existing.overflowStock.slice() : [],
+    lastRefreshMs: Number.isFinite(existing.lastRefreshMs) ? Math.max(0, Math.floor(existing.lastRefreshMs)) : nowMs,
+    nextRefreshMs: Number.isFinite(existing.nextRefreshMs) ? Math.max(0, Math.floor(existing.nextRefreshMs)) : (nowMs + shopRefreshIntervalMsForLevel(state?.player?.level ?? 1)),
+    refreshSeed: Number.isFinite(existing.refreshSeed) ? Math.max(0, Math.floor(existing.refreshSeed)) : randInt(Math.random, 1000000, 999999999),
   };
-  ensurePotionStockEntry(state.shop.stock, depth, Math.random);
+
+  if (!shop.coreStock.length && Array.isArray(existing.stock)) {
+    // Legacy migration path from the previous single stock pool.
+    shop.coreStock = existing.stock.map((entry, idx) => {
+      const slotType = SHOP_CORE_SLOT_LAYOUT[idx] ?? "mid_gear";
+      return normalizeShopCoreItem(entry, slotType, state, { nowMs, allowGenerate });
+    });
+  }
+
+  const nextCore = [];
+  for (let i = 0; i < SHOP_CORE_SIZE; i += 1) {
+    const slotType = SHOP_CORE_SLOT_LAYOUT[i];
+    const normalized = normalizeShopCoreItem(shop.coreStock[i] ?? null, slotType, state, { nowMs, allowGenerate });
+    if (normalized) nextCore.push(normalized);
+  }
+  shop.coreStock = nextCore;
+
+  const nextOverflow = [];
+  for (const entry of shop.overflowStock) {
+    const normalized = normalizeShopOverflowItem(entry);
+    if (normalized) nextOverflow.push(normalized);
+  }
+  shop.overflowStock = nextOverflow.slice(-SHOP_OVERFLOW_MAX);
+  if (!Number.isFinite(shop.nextRefreshMs) || shop.nextRefreshMs <= 0) {
+    shop.nextRefreshMs = nowMs + shopRefreshIntervalMsForLevel(state?.player?.level ?? 1);
+  }
+  state.shop = shop;
+}
+
+function shouldRefreshShopSlot(slotType, force, rng = Math.random) {
+  if (force) return true;
+  const slot = String(slotType ?? "").trim().toLowerCase();
+  if (slot === "low_gear" || slot === "potions") return true;
+  if (slot === "mid_gear") return rng() < 0.75;
+  if (slot === "high_gear") return rng() < 0.35;
+  if (slot === "wildcard") return rng() < 0.5;
+  return rng() < 0.5;
 }
 
 function refreshShopStock(state, force = false) {
   ensureShopState(state);
-  const now = Date.now();
-  if (!force && now < (state.shop?.nextRefreshMs ?? 0)) return false;
+  const shop = state?.shop;
+  if (!shop) return false;
+  const nowMs = Date.now();
+  if (!force && nowMs < (shop.nextRefreshMs ?? 0)) return false;
+  let changed = false;
+  for (let i = 0; i < SHOP_CORE_SIZE; i += 1) {
+    const slotType = SHOP_CORE_SLOT_LAYOUT[i];
+    if (!shouldRefreshShopSlot(slotType, force, Math.random)) continue;
+    shop.coreStock[i] = buildShopCoreItemForSlot(state, slotType, { nowMs, rng: Math.random });
+    changed = true;
+  }
+  shop.lastRefreshMs = nowMs;
+  shop.nextRefreshMs = nowMs + shopRefreshIntervalMsForLevel(state?.player?.level ?? 1);
+  return changed;
+}
 
-  const depth = shopProgressScore(state);
-  const { total } = targetShopCountsForLevel(state.player.level);
-  const gearTypes = buildShopGearTypesForLevel(state.player.level, Math.random);
-  const nextTypes = ["potion", ...gearTypes].slice(0, total);
-  state.shop.stock = nextTypes.map((type) => buildShopStockEntry(type, depth));
-  ensurePotionStockEntry(state.shop.stock, depth, Math.random);
-  state.shop.lastRefreshMs = now;
-  state.shop.nextRefreshMs = now + shopRefreshIntervalMsForLevel(state.player.level);
-  return true;
+function shopBuyEntries(state) {
+  ensureShopState(state);
+  const core = Array.isArray(state?.shop?.coreStock) ? state.shop.coreStock.map((entry, coreIndex) => ({
+    ...entry,
+    source: "core",
+    coreIndex,
+  })) : [];
+  const overflow = Array.isArray(state?.shop?.overflowStock) ? state.shop.overflowStock.map((entry, overflowIndex) => ({
+    ...entry,
+    source: "overflow",
+    overflowIndex,
+  })) : [];
+  return [...core, ...overflow];
+}
+
+function resolveShopBuyEntry(state, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const entries = shopBuyEntries(state);
+  const itemId = String(opts.itemId ?? "").trim();
+  if (itemId) {
+    const found = entries.find((entry) => String(entry.itemId ?? "").trim() === itemId) ?? null;
+    return found;
+  }
+  const idx = Math.max(0, Math.floor(Number(opts.index ?? 0) || 0));
+  return entries[idx] ?? null;
 }
 
 function canMutateShopStateLocally() {
@@ -5647,10 +5908,7 @@ function formatMs(ms) {
 function getSellableInventory(state) {
   return buildGroupedInventoryEntries(
     state,
-    (entry) =>
-      entry.type === "potion" ||
-      entry.type.startsWith("weapon_") ||
-      entry.type.startsWith("armor_")
+    (entry) => canSellItemType(entry.type)
   ).map((entry) => ({
     idx: entry.invIndex,
     type: entry.type,
@@ -5659,18 +5917,35 @@ function getSellableInventory(state) {
   }));
 }
 
-function buyShopItemByIndex(state, index) {
+function buyShopItemByIndex(state, indexOrOptions = 0) {
   if (!state?.player || state.player.dead) return false;
   ensureShopState(state);
-  const stock = state.shop?.stock ?? [];
-  const entry = stock[Math.max(0, Math.floor(Number(index) || 0))] ?? null;
+  refreshShopStock(state, false);
+
+  const opts = (indexOrOptions && typeof indexOrOptions === "object")
+    ? indexOrOptions
+    : { index: Math.max(0, Math.floor(Number(indexOrOptions) || 0)) };
+  const entry = resolveShopBuyEntry(state, opts);
   if (!entry) {
     pushLog(state, "That shop item is no longer available.");
     return false;
   }
-  const itemName = ITEM_TYPES[entry.type]?.name ?? entry.type;
+
+  const nowMs = Date.now();
+  const lastPurchaseAt = Math.max(0, Math.floor(Number(state.player.lastShopPurchaseAt ?? 0) || 0));
+  if ((nowMs - lastPurchaseAt) < SHOP_PURCHASE_COOLDOWN_MS) {
+    pushLog(state, "Slow down. The shopkeeper needs a moment to process that purchase.");
+    return false;
+  }
+
+  const type = normalizeItemType(entry.templateId ?? entry.type ?? "");
+  if (!type || !ITEM_TYPES[type]) {
+    pushLog(state, "That shop item is no longer available.");
+    return false;
+  }
+  const itemName = ITEM_TYPES[type]?.name ?? type;
   const freeShopping = !!stateDebug(state).freeShopping;
-  if (entry.type === "potion") {
+  if (type === "potion") {
     const potionCount = invCount(state, "potion");
     const potionCap = potionCapacityForState(state);
     if (potionCount >= potionCap) {
@@ -5678,21 +5953,44 @@ function buyShopItemByIndex(state, index) {
       return false;
     }
   }
-  if (!freeShopping && state.player.gold < entry.price) {
+  const price = Math.max(1, Math.floor(Number(entry.price ?? 1) || 1));
+  if (!freeShopping && state.player.gold < price) {
     pushLog(state, "Not enough gold.");
     return false;
   }
-  if (!freeShopping) state.player.gold -= entry.price;
-  invAdd(state, entry.type, 1);
-  const remaining = Math.max(0, Math.floor(Number(entry.amount ?? 1) || 1) - 1);
-  entry.amount = remaining;
-  if (remaining <= 0) stock.splice(Math.max(0, Math.floor(Number(index) || 0)), 1);
-  ensurePotionStockEntry(stock, shopProgressScore(state), Math.random);
+
+  if (!freeShopping) state.player.gold -= price;
+  invAdd(state, type, 1);
+  state.player.lastShopPurchaseAt = nowMs;
+
+  if (entry.source === "overflow") {
+    const overflow = state.shop?.overflowStock ?? [];
+    const overflowIdx = Math.max(0, Math.floor(Number(entry.overflowIndex ?? -1)));
+    if (overflowIdx >= 0 && overflowIdx < overflow.length) overflow.splice(overflowIdx, 1);
+  } else {
+    const coreIdx = Math.max(0, Math.floor(Number(entry.coreIndex ?? -1)));
+    const slotType = SHOP_CORE_SLOT_LAYOUT[coreIdx] ?? String(entry.slotType ?? "mid_gear");
+    const core = state.shop?.coreStock ?? [];
+    if (coreIdx >= 0 && coreIdx < core.length) {
+      const current = core[coreIdx];
+      const currentAmount = Math.max(1, Math.floor(Number(current?.amount ?? 1) || 1));
+      if (type === "potion" && currentAmount > 1) {
+        core[coreIdx] = {
+          ...current,
+          amount: currentAmount - 1,
+          price: shopBuyPrice("potion", { tier: "low" }),
+        };
+      } else {
+        core[coreIdx] = buildShopCoreItemForSlot(state, slotType, { nowMs });
+      }
+    }
+  }
+
   pushLog(
     state,
     freeShopping
       ? `Bought ${itemName} for free.`
-      : `Bought ${itemName} for ${entry.price} gold.`
+      : `Bought ${itemName} for ${price} gold.`
   );
   recalcDerivedStats(state);
   renderInventory(state);
@@ -5702,6 +6000,7 @@ function buyShopItemByIndex(state, index) {
 
 function sellShopInventoryIndex(state, invIndex) {
   if (!state?.player || state.player.dead) return false;
+  ensureShopState(state);
   const idx = Math.max(0, Math.floor(Number(invIndex) || 0));
   const item = state.inv?.[idx] ?? null;
   const type = normalizeItemType(item?.type ?? "");
@@ -5709,19 +6008,35 @@ function sellShopInventoryIndex(state, invIndex) {
     pushLog(state, "That inventory item is no longer available.");
     return false;
   }
-  const sellable = type === "potion" || type.startsWith("weapon_") || type.startsWith("armor_");
-  if (!sellable) {
+  if (!canSellItemType(type)) {
     pushLog(state, "That item can't be sold.");
     return false;
   }
-  const price = shopSellPrice(type);
+
+  const payout = shopSellPrice(type);
+  const buyback = shopOverflowBuyPrice(type);
   const itemName = ITEM_TYPES[type]?.name ?? type;
   if (!invConsume(state, type, 1)) {
     pushLog(state, "Couldn't complete that sale.");
     return false;
   }
-  state.player.gold += price;
-  pushLog(state, `Sold ${itemName} for ${price} gold.`);
+  state.player.gold += payout;
+  const sellerId = String(state?.character?.id ?? state?.player?.id ?? "").trim();
+  const overflowEntry = {
+    itemId: shopBuildItemId("overflow"),
+    templateId: type,
+    type,
+    tier: shopTierForItemType(type),
+    price: buyback,
+    soldByPlayerId: sellerId,
+    listedAt: Date.now(),
+    source: "overflow",
+  };
+  const overflow = state.shop?.overflowStock ?? [];
+  overflow.push(overflowEntry);
+  while (overflow.length > SHOP_OVERFLOW_MAX) overflow.shift();
+
+  pushLog(state, `Sold ${itemName} for ${payout} gold.`);
   recalcDerivedStats(state);
   renderInventory(state);
   renderEquipment(state);
@@ -5730,6 +6045,7 @@ function sellShopInventoryIndex(state, invIndex) {
 
 function closeShopOverlay() {
   shopUi.open = false;
+  shopUi.lastRefreshRequestAt = 0;
   if (!shopOverlayEl) return;
   shopOverlayEl.classList.remove("show");
   shopOverlayEl.setAttribute("aria-hidden", "true");
@@ -5740,9 +6056,29 @@ function updateShopOverlayMeta(state) {
   if (!shopUi.open) return;
   const now = Date.now();
   if (shopGoldEl) shopGoldEl.textContent = `Gold: ${state.player.gold}`;
+  const remaining = (state.shop?.nextRefreshMs ?? now) - now;
   if (shopRefreshEl) {
-    const remaining = (state.shop?.nextRefreshMs ?? now) - now;
-    shopRefreshEl.textContent = `Refresh in ${formatMs(remaining)}`;
+    if (remaining > 0) {
+      shopRefreshEl.textContent = `Refresh in ${formatMs(remaining)}`;
+    } else if (isAuthoritativeSessionActive()) {
+      shopRefreshEl.textContent = "Refreshing...";
+    } else {
+      shopRefreshEl.textContent = "Refresh in 0:00";
+    }
+  }
+
+  if (remaining <= 0) {
+    if (canMutateShopStateLocally()) {
+      if (refreshShopStock(state, false)) renderShopOverlay(state);
+      return;
+    }
+    if (isAuthoritativeSessionActive() && !authoritativeMirror.inFlight) {
+      const lastRequestAt = Math.max(0, Math.floor(Number(shopUi.lastRefreshRequestAt ?? 0) || 0));
+      if ((now - lastRequestAt) >= 1500) {
+        shopUi.lastRefreshRequestAt = now;
+        void performAuthoritativeCommand(interactCommand(), { reason: "shop-refresh" });
+      }
+    }
   }
 }
 
@@ -5760,6 +6096,7 @@ function openShopOverlay(state, mode = "buy") {
     refreshShopStock(state, false);
   }
   shopUi.open = true;
+  shopUi.lastRefreshRequestAt = 0;
   shopUi.mode = mode === "sell" ? "sell" : "buy";
   if (shopUi.selectedBuy < 0) shopUi.selectedBuy = 0;
   if (shopUi.selectedSell < 0) shopUi.selectedSell = 0;
@@ -5773,10 +6110,11 @@ function openShopOverlay(state, mode = "buy") {
 function renderShopOverlay(state) {
   if (!shopUi.open || !shopOverlayEl || !shopListEl) return;
 
-  const stock = state.shop?.stock ?? [];
+  ensureShopState(state);
+  const buyEntries = shopBuyEntries(state);
   const sellable = getSellableInventory(state);
   const isBuyMode = shopUi.mode === "buy";
-  const entries = isBuyMode ? stock : sellable;
+  const entries = isBuyMode ? buyEntries : sellable;
 
   if (isBuyMode) shopUi.selectedBuy = clamp(shopUi.selectedBuy, 0, Math.max(0, entries.length - 1));
   else shopUi.selectedSell = clamp(shopUi.selectedSell, 0, Math.max(0, entries.length - 1));
@@ -5830,7 +6168,7 @@ function renderShopOverlay(state) {
     empty.textContent = isBuyMode ? "(no stock available)" : "(nothing sellable in inventory)";
     shopListEl.appendChild(empty);
   } else {
-    entries.forEach((entry, idx) => {
+    const renderEntryButton = (entry, idx) => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = `shopItemBtn${idx === selectedIdx ? " active" : ""}`;
@@ -5839,15 +6177,49 @@ function renderShopOverlay(state) {
         ? canPlayerEquipItemType(state, entry.type)
         : { ok: true, reason: "" };
       const unusableBadge = equipValidation.ok ? "" : " [Unusable]";
-      if (isBuyMode) btn.textContent = `${idx + 1}. ${nm}${unusableBadge} x${Math.max(1, entry.amount ?? 1)} - ${entry.price}g`;
-      else btn.textContent = `${idx + 1}. ${nm}${unusableBadge} x${entry.amount} - ${entry.price}g`;
+      const playerSoldBadge = isBuyMode && entry.source === "overflow" ? " [Player Sold]" : "";
+      const amount = Math.max(1, Math.floor(Number(entry.amount ?? 1) || 1));
+      if (isBuyMode) btn.textContent = `${idx + 1}. ${nm}${playerSoldBadge}${unusableBadge} x${amount} - ${entry.price}g`;
+      else btn.textContent = `${idx + 1}. ${nm}${unusableBadge} x${amount} - ${entry.price}g`;
+      if (isBuyMode && entry.source === "overflow") {
+        btn.style.borderColor = "#6a8db6";
+      }
       btn.addEventListener("click", () => {
         if (isBuyMode) shopUi.selectedBuy = idx;
         else shopUi.selectedSell = idx;
         renderShopOverlay(state);
       });
       shopListEl.appendChild(btn);
-    });
+    };
+
+    if (!isBuyMode) {
+      entries.forEach((entry, idx) => renderEntryButton(entry, idx));
+    } else {
+      const coreEntries = entries.filter((entry) => entry.source !== "overflow");
+      const overflowEntries = entries.filter((entry) => entry.source === "overflow");
+      let cursor = 0;
+      const appendSection = (title) => {
+        const label = document.createElement("div");
+        label.className = "muted";
+        label.style.padding = "4px 2px";
+        label.textContent = title;
+        shopListEl.appendChild(label);
+      };
+      if (coreEntries.length > 0) {
+        appendSection("Shop Inventory");
+        for (const entry of coreEntries) {
+          renderEntryButton(entry, cursor);
+          cursor += 1;
+        }
+      }
+      if (overflowEntries.length > 0) {
+        appendSection("Recently Sold");
+        for (const entry of overflowEntries) {
+          renderEntryButton(entry, cursor);
+          cursor += 1;
+        }
+      }
+    }
   }
 
   if (!selected) {
@@ -5910,6 +6282,8 @@ function renderShopOverlay(state) {
   if (!atk && !def && selected.type === "potion") details.push("Consumable healing item.");
   if (!atk && !def && selected.type !== "potion") details.push("Utility item.");
   if (!equipValidation.ok && equipValidation.reason) details.push(`Cannot equip now: ${equipValidation.reason}`);
+  if (isBuyMode && selected.source === "overflow") details.push("Source: Player Sold");
+  if (isBuyMode && selected.source !== "overflow") details.push("Source: Core Stock");
   if (isBuyMode) details.push(`Stock: ${Math.max(1, selected.amount ?? 1)}`);
   if (!isBuyMode) details.push(`Inventory: ${selected.amount}`);
   details.push(`Value: ${itemMarketValue(selected.type)}g`);
@@ -5929,7 +6303,7 @@ function renderShopOverlay(state) {
     (!isBuyMode && selected.amount <= 0) ||
     (isAuthoritativeSessionActive() && authoritativeMirror.inFlight);
   shopActionBtnEl.onclick = () => {
-    const currentStock = state.shop?.stock ?? [];
+    const currentStock = shopBuyEntries(state);
     const currentSellable = getSellableInventory(state);
     const liveIsBuyMode = shopUi.mode === "buy";
     const liveEntries = liveIsBuyMode ? currentStock : currentSellable;
@@ -5939,7 +6313,7 @@ function renderShopOverlay(state) {
 
     if (isAuthoritativeSessionActive()) {
       const command = liveIsBuyMode
-        ? buyShopItemCommand(liveIndex)
+        ? buyShopItemCommand({ itemId: liveSelected.itemId, index: liveIndex })
         : sellShopItemCommand(liveSelected.idx);
       if (!command) return;
       void performAuthoritativeCommand(command, {
@@ -5949,7 +6323,7 @@ function renderShopOverlay(state) {
     }
 
     if (liveIsBuyMode) {
-      buyShopItemByIndex(state, liveIndex);
+      buyShopItemByIndex(state, { itemId: liveSelected.itemId, index: liveIndex });
     } else {
       sellShopInventoryIndex(state, liveSelected.idx);
     }
@@ -7892,7 +8266,7 @@ async function flushAnalyticsIfNeeded(state, reason = "heartbeat", force = false
   if (!analytics) return false;
   accumulateAnalyticsTime(analytics, Date.now());
   if (!force && !analyticsNeedsHeartbeat(analytics, Date.now())) return false;
-  if (!FEATURE_FLAGS.telemetryUpload || !isAuthenticatedUser) return false;
+  if (!FEATURE_FLAGS.telemetryUpload) return false;
   if (analyticsRuntime.flushing) return false;
 
   analyticsRuntime.flushing = true;
@@ -7935,6 +8309,7 @@ async function endAnalyticsRun(state, {
   deathCause = "",
   deathKillerType = "",
   reason = "run-end",
+  bestEffortBeacon = false,
 } = {}) {
   const analytics = ensureAnalyticsState(state);
   if (!analytics || analytics.ended) return false;
@@ -7950,6 +8325,11 @@ async function endAnalyticsRun(state, {
     deathKillerType,
     turn: state?.turn ?? 0,
   });
+  if (bestEffortBeacon && typeof analyticsApi?.runEndBestEffort === "function") {
+    try {
+      analyticsApi.runEndBestEffort(buildRunEndPayload(analytics, state, { reason }));
+    } catch {}
+  }
   return flushAnalyticsIfNeeded(state, reason, true);
 }
 
@@ -19563,17 +19943,34 @@ function importSave(saveStr) {
       setLastLadderLanding(state, state.player ?? state.startSpawn);
     }
     ensureSurfaceLinkTile(state);
-    if (state.shop && Array.isArray(state.shop.stock)) {
-      state.shop.stock = state.shop.stock
-        .map((s) => {
-          const type = normalizeItemType(s?.type, normalizeOpts);
-          const amountRaw = Math.max(1, Math.floor(s?.amount ?? 1));
-          const amount = isStackable(type) ? amountRaw : 1;
-          return { type, price: Math.max(1, Math.floor(s?.price ?? 0)), amount };
+    if (state.shop && typeof state.shop === "object") {
+      const legacyStock = Array.isArray(state.shop.stock) ? state.shop.stock : [];
+      if (!Array.isArray(state.shop.coreStock) && legacyStock.length > 0) {
+        state.shop.coreStock = legacyStock.slice();
+      }
+      if (!Array.isArray(state.shop.overflowStock)) state.shop.overflowStock = [];
+      state.shop.shopId = String(state.shop.shopId ?? "shop_01").trim() || "shop_01";
+      state.shop.shopType = normalizeShopType(state.shop.shopType ?? "general");
+      state.shop.coreStock = (Array.isArray(state.shop.coreStock) ? state.shop.coreStock : [])
+        .map((entry, idx) => {
+          const slotType = SHOP_CORE_SLOT_LAYOUT[idx] ?? "mid_gear";
+          return normalizeShopCoreItem(entry, slotType, state, {
+            nowMs: Date.now(),
+            allowGenerate: canMutateGameplayStateLocally(),
+          });
         })
-        .filter((s) => ITEM_TYPES[s.type]);
-      state.shop.lastRefreshMs = Number.isFinite(state.shop.lastRefreshMs) ? state.shop.lastRefreshMs : Date.now();
-      state.shop.nextRefreshMs = Number.isFinite(state.shop.nextRefreshMs) ? state.shop.nextRefreshMs : Date.now();
+        .filter(Boolean)
+        .slice(0, SHOP_CORE_SIZE);
+      state.shop.overflowStock = (Array.isArray(state.shop.overflowStock) ? state.shop.overflowStock : [])
+        .map((entry) => normalizeShopOverflowItem(entry))
+        .filter(Boolean)
+        .slice(-SHOP_OVERFLOW_MAX);
+      state.shop.lastRefreshMs = Number.isFinite(state.shop.lastRefreshMs)
+        ? Math.max(0, Math.floor(state.shop.lastRefreshMs))
+        : Date.now();
+      state.shop.nextRefreshMs = Number.isFinite(state.shop.nextRefreshMs)
+        ? Math.max(0, Math.floor(state.shop.nextRefreshMs))
+        : (Date.now() + shopRefreshIntervalMsForLevel(state.player.level));
     } else {
       state.shop = null;
     }
@@ -19796,8 +20193,9 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
   } else if (type === "UNEQUIP_ITEM") {
     ok = !!unequipSlotToInventory(state, String(command.slot ?? "").trim());
   } else if (type === "BUY_SHOP_ITEM") {
+    const itemId = String(command.itemId ?? command.id ?? "").trim();
     const index = Math.max(0, Math.floor(Number(command.index ?? command.slot ?? 0) || 0));
-    ok = !!buyShopItemByIndex(state, index);
+    ok = !!buyShopItemByIndex(state, { index, itemId });
   } else if (type === "SELL_SHOP_ITEM") {
     const idx = resolveInventoryIndexFromCommand(state, command);
     ok = idx >= 0 ? !!sellShopInventoryIndex(state, idx) : false;
@@ -20574,15 +20972,30 @@ if (!HEADLESS_RUNTIME) {
     renderLog(game);
     markCharacterStateDirty(game, "startup");
     void syncCharacterStateIfDirty("startup");
+    restartAnalyticsHeartbeatLoop(game);
+    void flushAnalyticsIfNeeded(game, "startup-init");
     void refreshSpriteOverridesFromServer(true);
     void startCharacterFlow().then(() => {
       void maybeHandlePostLoginGuestImport();
     });
     syncBodyModalLock();
     syncMobileUi(true);
-    const flushAutosaveLifecycle = () => {
+    const flushAutosaveLifecycle = (options = null) => {
+      const opts = (options && typeof options === "object") ? options : {};
+      const closeRun = opts.closeRun === true;
       if (!game) return;
       saveResumeSnapshot(game);
+      if (closeRun) {
+        requestLifecycleAuthoritativeClose("lifecycle-close");
+        stopAnalyticsHeartbeatLoop();
+        void endAnalyticsRun(game, {
+          status: "closed",
+          reason: "lifecycle-close",
+          bestEffortBeacon: true,
+        });
+      } else {
+        void flushAnalyticsIfNeeded(game, "lifecycle", true);
+      }
       if (saveRuntime.autoTimer) {
         clearTimeout(saveRuntime.autoTimer);
         saveRuntime.autoTimer = 0;
@@ -20601,12 +21014,12 @@ if (!HEADLESS_RUNTIME) {
       }
       void autosaveIfDirty("lifecycle");
     };
-    window.addEventListener("pagehide", flushAutosaveLifecycle);
+    window.addEventListener("pagehide", () => flushAutosaveLifecycle({ closeRun: true }));
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "hidden") return;
-      flushAutosaveLifecycle();
+      flushAutosaveLifecycle({ closeRun: false });
     });
-    window.addEventListener("beforeunload", flushAutosaveLifecycle);
+    window.addEventListener("beforeunload", () => flushAutosaveLifecycle({ closeRun: true }));
     document.addEventListener("keydown", (e) => onKey(game, e));
     window.addEventListener("resize", () => syncMobileUi(true));
     // Initialize touch controls (mobile): wire on-screen buttons to existing actions

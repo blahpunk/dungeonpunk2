@@ -9,6 +9,10 @@ declare(strict_types=1);
  */
 function authoritative_build_snapshot_response(array $session, array $snapshot, array $options = []): array
 {
+  if (function_exists('authoritative_shop_apply_shared_to_snapshot')) {
+    $snapshot = authoritative_shop_apply_shared_to_snapshot($snapshot);
+  }
+
   $acceptedCommandSeq = max(
     0,
     (int) ($options['accepted_command_seq'] ?? ($session['last_command_seq'] ?? 0))

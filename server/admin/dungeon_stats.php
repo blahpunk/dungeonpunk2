@@ -156,12 +156,33 @@ try {
   <?php
   exit;
 }
+
+$resetMessage = '';
+if (strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'POST' && isset($_POST['reset_stats'])) {
+  try {
+    $result = analytics_admin_reset_all($db);
+    $backup = trim((string) ($result['backup_path'] ?? ''));
+    $backupLabel = $backup !== '' ? basename($backup) : 'none';
+    $resetMessage = sprintf(
+      'Analytics reset complete. Runs: %d, Floors: %d, Events: %d, Totals: %d. Backup: %s',
+      (int) ($result['deleted_runs'] ?? 0),
+      (int) ($result['deleted_depths'] ?? 0),
+      (int) ($result['deleted_events'] ?? 0),
+      (int) ($result['deleted_totals'] ?? 0),
+      $backupLabel
+    );
+  } catch (Throwable $e) {
+    $resetMessage = 'Analytics reset failed: ' . $e->getMessage();
+  }
+}
+
 $overview = analytics_admin_overview($db);
 $liveSessions = analytics_admin_live_sessions($db);
+$users = analytics_admin_users($db);
 $selectedRunId = trim((string) ($_GET['run_id'] ?? ''));
 $selectedUser = strtolower(trim((string) ($_GET['user'] ?? '')));
 $runDetail = $selectedRunId !== '' ? analytics_admin_run($db, $selectedRunId) : ['run' => null, 'depths' => [], 'events' => []];
-$playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDATE_EMAIL) !== false)
+$playerDetail = ($selectedUser !== '')
   ? analytics_admin_player($db, $selectedUser)
   : ['user_email' => '', 'totals' => [], 'class_usage' => [], 'death_causes' => [], 'recent_runs' => []];
 
@@ -261,6 +282,14 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
         gap: 12px;
         margin-bottom: 18px;
       }
+      .flash {
+        background: rgba(126, 195, 255, 0.15);
+        border: 1px solid rgba(126, 195, 255, 0.4);
+        color: #d7ecff;
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin: 0 0 14px 0;
+      }
       .forms form {
         display: flex;
         gap: 8px;
@@ -280,6 +309,18 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
       button {
         cursor: pointer;
         background: linear-gradient(180deg, #1f3550 0%, #152536 100%);
+      }
+      .liveToggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .liveToggle input {
+        width: 16px;
+        height: 16px;
+        margin: 0;
       }
       h1, h2, h3 { margin: 0; }
       h2 { margin-bottom: 12px; font-size: 20px; }
@@ -301,8 +342,15 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
           <h1>Dungeon Stats</h1>
           <p>Signed in as <?php echo analytics_page_h($userEmail); ?>.</p>
         </div>
-        <a href="../../index.php">Back to the game</a>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <label class="liveToggle" for="liveRefreshToggle"><input id="liveRefreshToggle" type="checkbox" checked /> Auto refresh</label>
+          <a href="../../index.php">Back to the game</a>
+        </div>
       </div>
+
+      <?php if ($resetMessage !== ''): ?>
+        <div class="flash"><?php echo analytics_page_h($resetMessage); ?></div>
+      <?php endif; ?>
 
       <div class="grid">
         <div class="card"><div class="muted">Active Runs</div><div class="stat"><?php echo (int) ($overview['summary']['active_runs'] ?? 0); ?></div></div>
@@ -312,6 +360,10 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
       </div>
 
       <div class="forms">
+        <form method="post" onsubmit="return confirm('Reset all dungeon analytics stats? This cannot be undone from the UI.');">
+          <input type="hidden" name="reset_stats" value="1" />
+          <button type="submit">Reset All Stats</button>
+        </form>
         <form method="get">
           <label for="run_id">Run Inspector</label>
           <input id="run_id" name="run_id" type="text" value="<?php echo analytics_page_h($selectedRunId); ?>" placeholder="run id" />
@@ -319,7 +371,7 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
         </form>
         <form method="get">
           <label for="user">Player Profile</label>
-          <input id="user" name="user" type="email" value="<?php echo analytics_page_h($selectedUser); ?>" placeholder="player@example.com" />
+          <input id="user" name="user" type="text" value="<?php echo analytics_page_h($selectedUser); ?>" placeholder="email or guest id" />
           <button type="submit">Open</button>
         </form>
       </div>
@@ -344,6 +396,28 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
               <?php endforeach; ?>
               <?php if (!$liveSessions): ?>
                 <tr><td colspan="6" class="muted">No active runs.</td></tr>
+              <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>Users</h2>
+          <table>
+            <thead>
+              <tr><th>User</th><th>Active</th><th>Total Runs</th><th>Last Heartbeat</th></tr>
+            </thead>
+            <tbody>
+              <?php foreach ($users as $row): ?>
+                <tr>
+                  <td><a href="?user=<?php echo rawurlencode((string) ($row['user_email'] ?? '')); ?>"><?php echo analytics_page_h((string) ($row['user_email'] ?? '')); ?></a></td>
+                  <td><?php echo (int) ($row['active_runs'] ?? 0); ?></td>
+                  <td><?php echo (int) ($row['total_runs'] ?? 0); ?></td>
+                  <td><?php echo analytics_page_h((string) ($row['last_heartbeat_at'] ?? '')); ?></td>
+                </tr>
+              <?php endforeach; ?>
+              <?php if (!$users): ?>
+                <tr><td colspan="4" class="muted">No users tracked yet.</td></tr>
               <?php endif; ?>
             </tbody>
           </table>
@@ -517,5 +591,30 @@ $playerDetail = ($selectedUser !== '' && filter_var($selectedUser, FILTER_VALIDA
         </div>
       <?php endif; ?>
     </div>
+    <script>
+      (() => {
+        const storageKey = "dp_stats_live_refresh";
+        const toggle = document.getElementById("liveRefreshToggle");
+        let enabled = true;
+        try {
+          enabled = localStorage.getItem(storageKey) !== "0";
+        } catch {}
+        if (toggle) {
+          toggle.checked = enabled;
+          toggle.addEventListener("change", () => {
+            enabled = !!toggle.checked;
+            try {
+              localStorage.setItem(storageKey, enabled ? "1" : "0");
+            } catch {}
+          });
+        }
+        setInterval(() => {
+          if (!enabled || document.hidden) return;
+          const focusedTag = String(document.activeElement?.tagName ?? "").toUpperCase();
+          if (focusedTag === "INPUT" || focusedTag === "TEXTAREA" || focusedTag === "SELECT") return;
+          window.location.reload();
+        }, 5000);
+      })();
+    </script>
   </body>
 </html>
