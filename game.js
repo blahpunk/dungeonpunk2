@@ -153,6 +153,14 @@ const KEY_INDIGO = "key_indigo";
 const KEY_BLUE = "key_blue";
 const KEY_PURPLE = "key_purple";
 const KEY_MAGENTA = "key_magenta";
+const DOOR_MUTATION_LOCK_COLOR_IDS = Object.freeze([
+  KEY_GREEN,
+  KEY_YELLOW,
+  KEY_ORANGE,
+  KEY_RED,
+  KEY_VIOLET,
+  KEY_INDIGO,
+]);
 
 const SAVE_KEY = "infinite_dungeon_roguelike_save_v8";
 const SAVE_LOGIN_HANDOFF_KEY = "dungeon25_save_after_login_handoff_v1";
@@ -317,6 +325,14 @@ const COMBAT_HUD_WINDOW_MS = 4500;
 const AREA_RESPAWN_FLOOR1_MS = 90 * 1000;
 const AREA_RESPAWN_MIN_MS = 45 * 1000;
 const AREA_RESPAWN_DEPTH_CAP = 15;
+const DOOR_MUTATION_PULSE_MIN_MS = 120 * 1000;
+const DOOR_MUTATION_PULSE_MAX_MS = 240 * 1000;
+const DOOR_MUTATION_INTERACTION_COOLDOWN_MS = 180 * 1000;
+const DOOR_MUTATION_COOLDOWN_MS = 900 * 1000;
+const DOOR_MUTATION_NEAR_OCCUPANT_RADIUS = 12;
+const DOOR_MUTATION_BALANCE_TOLERANCE_PCT = 0.03;
+const DOOR_MUTATION_COLOR_SWAP_CHANCE = 0.15;
+const DOOR_MUTATION_DEBUG_LOG_LIMIT = 180;
 const OUT_OF_COMBAT_HP_BAR_WIDTH_FRAC = 0.82;
 const OUT_OF_COMBAT_HP_BAR_HEIGHT_FRAC = 0.125;
 const COMBAT_HP_BAR_NEARBY_EXTRA_GAP_FRAC = 0.2;
@@ -1959,6 +1975,8 @@ function normalizeLoadedStateCollections(state) {
   if (state.player && typeof state.player === "object") {
     state.player.effects = ensureArray(state.player.effects);
   }
+  ensureAreaRespawnState(state);
+  ensureDoorMutationState(state);
   return state;
 }
 
@@ -12109,6 +12127,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     combat: { lastEventMs: 0, regenAnchorMs: Date.now(), hudTargets: {} },
     disengageGrace: {},
     areaRespawn: { currentAreaKey: "", schedules: {} },
+    doorMutation: { enabled: true, nextPulseAt: 0, lastPulseAt: 0, doors: {}, debugLog: [] },
     quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
     debug: normalizeDebugFlags(),
     analytics: null,
@@ -12643,10 +12662,533 @@ function parseChunkAreaKey(areaKey) {
   return { z: Math.trunc(z), cx: Math.trunc(cx), cy: Math.trunc(cy), areaId: Math.trunc(areaId) };
 }
 
+function ensureDoorMutationState(state) {
+  if (!state || typeof state !== "object") return { enabled: true, nextPulseAt: 0, lastPulseAt: 0, doors: {}, debugLog: [] };
+  if (!state.doorMutation || typeof state.doorMutation !== "object") {
+    state.doorMutation = { enabled: true, nextPulseAt: 0, lastPulseAt: 0, doors: {}, debugLog: [] };
+  }
+  const doorMutation = state.doorMutation;
+  doorMutation.enabled = doorMutation.enabled !== false;
+  if (!Number.isFinite(doorMutation.nextPulseAt)) doorMutation.nextPulseAt = 0;
+  else doorMutation.nextPulseAt = Math.max(0, Math.floor(doorMutation.nextPulseAt));
+  if (!Number.isFinite(doorMutation.lastPulseAt)) doorMutation.lastPulseAt = 0;
+  else doorMutation.lastPulseAt = Math.max(0, Math.floor(doorMutation.lastPulseAt));
+  if (!doorMutation.doors || typeof doorMutation.doors !== "object") doorMutation.doors = {};
+  if (!Array.isArray(doorMutation.debugLog)) doorMutation.debugLog = [];
+  if (doorMutation.debugLog.length > DOOR_MUTATION_DEBUG_LOG_LIMIT) {
+    doorMutation.debugLog = doorMutation.debugLog.slice(-DOOR_MUTATION_DEBUG_LOG_LIMIT);
+  }
+  return doorMutation;
+}
+
+function doorMutationIdForCell(x, y, z) {
+  return `door|${Math.trunc(z)}|${Math.trunc(x)},${Math.trunc(y)}`;
+}
+
+function parseExploredChunkKey(chunkKey = "") {
+  const m = /^(-?\d+)\|(-?\d+),(-?\d+)$/.exec(String(chunkKey ?? ""));
+  if (!m) return null;
+  const z = Number(m[1]);
+  const cx = Number(m[2]);
+  const cy = Number(m[3]);
+  if (!Number.isFinite(z) || !Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+  return { z: Math.trunc(z), cx: Math.trunc(cx), cy: Math.trunc(cy) };
+}
+
+function parseDoorMutationId(id = "") {
+  const m = /^door\|(-?\d+)\|(-?\d+),(-?\d+)$/.exec(String(id ?? ""));
+  if (!m) return null;
+  const z = Number(m[1]);
+  const x = Number(m[2]);
+  const y = Number(m[3]);
+  if (!Number.isFinite(z) || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { z: Math.trunc(z), x: Math.trunc(x), y: Math.trunc(y) };
+}
+
+function doorMutationAreaDescriptor(state, x, y, z) {
+  const world = state?.world;
+  if (!world) {
+    return {
+      z: Math.trunc(z),
+      cx: 0,
+      cy: 0,
+      lx: 0,
+      ly: 0,
+      areaId: -1,
+      areaKey: `${Math.trunc(z)}|0,0|void|0,0`,
+      areaKeys: [],
+    };
+  }
+  const { cx, cy, lx, ly } = splitWorldToChunk(x, y);
+  const chunk = world.getChunk(z, cx, cy);
+  const areaIds = [];
+  const axis = chunkDoorAxis(chunk?.grid ?? [], lx, ly);
+  if (axis) {
+    const aId = Number(chunk?.areaMap?.[axis.a.y]?.[axis.a.x] ?? -1);
+    const bId = Number(chunk?.areaMap?.[axis.b.y]?.[axis.b.x] ?? -1);
+    if (Number.isFinite(aId) && aId >= 0) areaIds.push(Math.trunc(aId));
+    if (Number.isFinite(bId) && bId >= 0 && bId !== aId) areaIds.push(Math.trunc(bId));
+  } else {
+    const fallbackAreaId = Number(chunk?.areaMap?.[ly]?.[lx] ?? -1);
+    if (Number.isFinite(fallbackAreaId) && fallbackAreaId >= 0) areaIds.push(Math.trunc(fallbackAreaId));
+  }
+  const areaId = areaIds[0] ?? -1;
+  const areaKeys = areaIds.map((id) => `${z}|${cx},${cy}|${id}`);
+  return {
+    z: Math.trunc(z),
+    cx,
+    cy,
+    lx,
+    ly,
+    areaId,
+    areaKey: areaId >= 0 ? `${z}|${cx},${cy}|${areaId}` : `${z}|${cx},${cy}|void|${lx},${ly}`,
+    areaKeys,
+  };
+}
+
+function appendDoorMutationDebug(state, event) {
+  const doorMutation = ensureDoorMutationState(state);
+  const entry = (event && typeof event === "object") ? { ...event } : { message: String(event ?? "") };
+  entry.at = Number.isFinite(entry.at) ? Math.floor(entry.at) : Date.now();
+  doorMutation.debugLog.push(entry);
+  if (doorMutation.debugLog.length > DOOR_MUTATION_DEBUG_LOG_LIMIT) {
+    doorMutation.debugLog.splice(0, doorMutation.debugLog.length - DOOR_MUTATION_DEBUG_LOG_LIMIT);
+  }
+}
+
+function upsertDoorMutationRecordFromWorld(state, x, y, z, options = null) {
+  if (!state?.world) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const { cx, cy, lx, ly } = splitWorldToChunk(x, y);
+  const chunk = state.world.getChunk(z, cx, cy);
+  const currentTile = state.world.getTile(x, y, z);
+  const currentDoorState = doorStateFromTile(currentTile);
+  if (!currentDoorState) return null;
+  const baseTile = chunk?.grid?.[ly]?.[lx];
+  const baseDoorState = doorStateFromTile(baseTile);
+  const doorMutation = ensureDoorMutationState(state);
+  const id = doorMutationIdForCell(x, y, z);
+  const hasExistingRecord = !!(doorMutation.doors[id] && typeof doorMutation.doors[id] === "object");
+  const existing = hasExistingRecord ? doorMutation.doors[id] : {};
+  const area = doorMutationAreaDescriptor(state, x, y, z);
+  const record = {
+    id,
+    x: Math.trunc(x),
+    y: Math.trunc(y),
+    z: Math.trunc(z),
+    areaId: area.areaId,
+    areaKey: area.areaKey,
+    areaKeys: area.areaKeys.slice(0, 4),
+    doorType: currentDoorState.doorType,
+    lockColor: normalizeDoorLockColor(currentDoorState.lockColor),
+    isOpen: !!currentDoorState.isOpen,
+    originalDoorType: String(existing.originalDoorType ?? "").trim() || (baseDoorState?.doorType ?? currentDoorState.doorType),
+    originalLockColor: normalizeDoorLockColor(existing.originalLockColor ?? "") || normalizeDoorLockColor(baseDoorState?.lockColor ?? currentDoorState.lockColor),
+    lastMutatedAt: Number.isFinite(existing.lastMutatedAt) ? Math.max(0, Math.floor(existing.lastMutatedAt)) : 0,
+    lastInteractedAt: Number.isFinite(existing.lastInteractedAt) ? Math.max(0, Math.floor(existing.lastInteractedAt)) : 0,
+    mutationCooldownUntil: Number.isFinite(existing.mutationCooldownUntil) ? Math.max(0, Math.floor(existing.mutationCooldownUntil)) : 0,
+    mutable: existing.mutable !== false,
+    mutationWeight: Number.isFinite(existing.mutationWeight) ? Math.max(0.05, Number(existing.mutationWeight)) : 1,
+    tags: Array.isArray(existing.tags) ? existing.tags.slice(0, 10).map((tag) => String(tag ?? "").trim()).filter(Boolean) : [],
+    debugLastMutationReason: String(existing.debugLastMutationReason ?? "").slice(0, 180),
+  };
+  if (record.originalDoorType !== "locked") record.originalLockColor = "";
+  if (record.doorType !== "locked") record.lockColor = "";
+  if (opts.reason) record.debugLastMutationReason = String(opts.reason).slice(0, 180);
+  const shouldPersist = opts.persist !== false || hasExistingRecord;
+  if (shouldPersist) {
+    doorMutation.doors[id] = record;
+  }
+  return record;
+}
+
 function areaRespawnDelayMsForDepth(z) {
   const depth = clamp(Math.max(0, Math.floor(z)), 0, AREA_RESPAWN_DEPTH_CAP);
   const t = depth / AREA_RESPAWN_DEPTH_CAP;
   return Math.round(AREA_RESPAWN_FLOOR1_MS + (AREA_RESPAWN_MIN_MS - AREA_RESPAWN_FLOOR1_MS) * t);
+}
+
+function nextDoorMutationPulseAt(now = Date.now(), rng = Math.random) {
+  const jitter = randInt(rng, DOOR_MUTATION_PULSE_MIN_MS, DOOR_MUTATION_PULSE_MAX_MS);
+  return Math.max(0, Math.floor(now + jitter));
+}
+
+function collectDoorMutationChunkKeys(state) {
+  const keys = new Set();
+  for (const rawKey of state?.exploredChunks ?? []) {
+    const parsed = parseExploredChunkKey(rawKey);
+    if (!parsed || parsed.z < 0) continue;
+    keys.add(keyZCXCY(parsed.z, parsed.cx, parsed.cy));
+  }
+  const p = state?.player;
+  if (p) {
+    const { cx: pcx, cy: pcy } = splitWorldToChunk(p.x, p.y);
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        keys.add(keyZCXCY(p.z, pcx + dx, pcy + dy));
+      }
+    }
+  }
+  return keys;
+}
+
+function collectDoorMutationDoors(state, now = Date.now()) {
+  const doorMutation = ensureDoorMutationState(state);
+  const seenDoorIds = new Set();
+  const scannedDoors = [];
+  const chunkKeys = collectDoorMutationChunkKeys(state);
+  for (const chunkKey of chunkKeys) {
+    const parsed = parseExploredChunkKey(chunkKey);
+    if (!parsed || parsed.z < 0) continue;
+    const { z, cx, cy } = parsed;
+    const chunk = state.world.getChunk(z, cx, cy);
+    const grid = chunk?.grid;
+    if (!Array.isArray(grid)) continue;
+    for (let ly = 0; ly < CHUNK; ly++) {
+      const row = grid[ly];
+      if (!Array.isArray(row)) continue;
+      for (let lx = 0; lx < CHUNK; lx++) {
+        const baseTile = row[lx];
+        const wx = cx * CHUNK + lx;
+        const wy = cy * CHUNK + ly;
+        const currentTile = state.world.getTile(wx, wy, z);
+        if (!isDoorTile(baseTile) && !isDoorTile(currentTile)) continue;
+        const record = upsertDoorMutationRecordFromWorld(state, wx, wy, z, { reason: "refresh", persist: false });
+        if (!record) continue;
+        scannedDoors.push(record);
+        seenDoorIds.add(record.id);
+      }
+    }
+  }
+
+  for (const [doorId] of Object.entries(doorMutation.doors)) {
+    const parsed = parseDoorMutationId(doorId);
+    if (!parsed) {
+      delete doorMutation.doors[doorId];
+      continue;
+    }
+    if (seenDoorIds.has(doorId)) continue;
+    const tile = state.world.getTile(parsed.x, parsed.y, parsed.z);
+    if (!isDoorTile(tile)) {
+      delete doorMutation.doors[doorId];
+      continue;
+    }
+    const refreshed = upsertDoorMutationRecordFromWorld(state, parsed.x, parsed.y, parsed.z, { reason: "recovered", persist: true });
+    if (refreshed) {
+      scannedDoors.push(refreshed);
+      seenDoorIds.add(doorId);
+    }
+  }
+
+  return scannedDoors;
+}
+
+function collectDoorMutationActiveAreaKeys(state) {
+  const keys = new Set();
+  const p = state?.player;
+  if (!p || !state?.world) return keys;
+  const radius = 2;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      if (Math.abs(dx) + Math.abs(dy) > radius) continue;
+      const key = state.world.areaKeyAt(p.x + dx, p.y + dy, p.z);
+      if (key) keys.add(key);
+    }
+  }
+  const areaState = ensureAreaRespawnState(state);
+  if (areaState.currentAreaKey) keys.add(areaState.currentAreaKey);
+  return keys;
+}
+
+function isDoorNearActiveOccupant(state, door, radius = DOOR_MUTATION_NEAR_OCCUPANT_RADIUS) {
+  const p = state?.player;
+  if (!p || !door) return false;
+  if (p.z !== door.z) return false;
+  const dist = Math.abs((door.x ?? 0) - p.x) + Math.abs((door.y ?? 0) - p.y);
+  return dist <= Math.max(1, Math.floor(Number(radius) || DOOR_MUTATION_NEAR_OCCUPANT_RADIUS));
+}
+
+function isDoorInActiveArea(state, door, activeAreaKeys = null) {
+  if (!door) return false;
+  const active = activeAreaKeys instanceof Set ? activeAreaKeys : collectDoorMutationActiveAreaKeys(state);
+  if (!active.size) return false;
+  if (door.areaKey && active.has(door.areaKey)) return true;
+  if (Array.isArray(door.areaKeys)) {
+    for (const key of door.areaKeys) {
+      if (active.has(String(key ?? ""))) return true;
+    }
+  }
+  return false;
+}
+
+function buildDoorMutationOccupancy(state) {
+  const occupied = new Set();
+  if (state?.player) {
+    occupied.add(keyXYZ(state.player.x, state.player.y, state.player.z));
+  }
+  for (const ent of state?.entities?.values?.() ?? []) {
+    if (!ent || !Number.isFinite(ent.x) || !Number.isFinite(ent.y) || !Number.isFinite(ent.z)) continue;
+    occupied.add(keyXYZ(ent.x, ent.y, ent.z));
+  }
+  return occupied;
+}
+
+function isDoorTileSafeForMutation(state, door, occupiedKeys = null) {
+  const occupied = occupiedKeys instanceof Set ? occupiedKeys : buildDoorMutationOccupancy(state);
+  if (occupied.has(keyXYZ(door.x, door.y, door.z))) return false;
+  const tile = state?.world?.getTile?.(door.x, door.y, door.z);
+  return isDoorTile(tile);
+}
+
+function isDoorEligibleForMutation(state, door, now = Date.now(), context = null) {
+  if (!door || door.mutable === false) return false;
+  const ctx = (context && typeof context === "object") ? context : {};
+  if (isDoorNearActiveOccupant(state, door)) return false;
+  if (isDoorInActiveArea(state, door, ctx.activeAreaKeys)) return false;
+  if (state?.player?.z === door.z && state?.visible?.has?.(keyXY(door.x, door.y))) return false;
+  if ((now - Math.max(0, Number(door.lastInteractedAt) || 0)) < DOOR_MUTATION_INTERACTION_COOLDOWN_MS) return false;
+  if (Number(door.mutationCooldownUntil ?? 0) > now) return false;
+  if (!isDoorTileSafeForMutation(state, door, ctx.occupiedKeys)) return false;
+  return true;
+}
+
+function incrementDoorColorCount(target, lockColor, delta = 1) {
+  if (!target || typeof target !== "object") return;
+  const color = normalizeDoorLockColor(lockColor);
+  if (!color) return;
+  target[color] = Math.max(0, Math.floor((target[color] ?? 0) + delta));
+}
+
+function getDoorDistribution(doors = []) {
+  const distribution = {
+    total: 0,
+    current: { normal: 0, locked: 0, byColor: {} },
+    original: { normal: 0, locked: 0, byColor: {} },
+  };
+  for (const door of doors) {
+    if (!door || door.mutable === false) continue;
+    distribution.total += 1;
+    const currentType = door.doorType === "locked" ? "locked" : "normal";
+    const originalType = door.originalDoorType === "locked" ? "locked" : "normal";
+    distribution.current[currentType] += 1;
+    distribution.original[originalType] += 1;
+    if (currentType === "locked") incrementDoorColorCount(distribution.current.byColor, door.lockColor, 1);
+    if (originalType === "locked") incrementDoorColorCount(distribution.original.byColor, door.originalLockColor, 1);
+  }
+  return distribution;
+}
+
+function buildDoorMutationPlan(distribution, rng = Math.random) {
+  const totalDoors = Math.max(0, Math.floor(distribution?.total ?? 0));
+  const tolerance = Math.max(1, Math.round(totalDoors * DOOR_MUTATION_BALANCE_TOLERANCE_PCT));
+  const currentLocked = Math.max(0, Math.floor(distribution?.current?.locked ?? 0));
+  const originalLocked = Math.max(0, Math.floor(distribution?.original?.locked ?? currentLocked));
+  const lockedDelta = currentLocked - originalLocked;
+  let doLockedToNormal = true;
+  let doNormalToLocked = true;
+  let reason = "paired";
+
+  if (lockedDelta > tolerance) {
+    doLockedToNormal = true;
+    doNormalToLocked = false;
+    reason = "locked-over-target";
+  } else if (lockedDelta < -tolerance) {
+    doLockedToNormal = false;
+    doNormalToLocked = true;
+    reason = "locked-under-target";
+  }
+
+  return {
+    reason,
+    tolerance,
+    doLockedToNormal,
+    doNormalToLocked,
+    doRareColorSwap: rng() < DOOR_MUTATION_COLOR_SWAP_CHANCE,
+  };
+}
+
+function pickMutationCandidate(doors = [], excludedIds = null, rng = Math.random) {
+  const blocked = excludedIds instanceof Set ? excludedIds : new Set();
+  const pool = doors.filter((door) => door && !blocked.has(door.id));
+  if (!pool.length) return null;
+  if (pool.length === 1) return pool[0];
+  let totalWeight = 0;
+  const weights = pool.map((door) => {
+    const weight = Number.isFinite(door.mutationWeight) ? Math.max(0.05, Number(door.mutationWeight)) : 1;
+    totalWeight += weight;
+    return weight;
+  });
+  let roll = rng() * totalWeight;
+  for (let i = 0; i < pool.length; i++) {
+    roll -= weights[i];
+    if (roll <= 0) return pool[i];
+  }
+  return pool[pool.length - 1];
+}
+
+function pickWeightedLockColor(state, door, distribution, rng = Math.random, avoidColor = "") {
+  const avoided = normalizeDoorLockColor(avoidColor);
+  const baseWeights = keyWeightsForDepth(Math.max(0, Math.floor(door?.z ?? 0)));
+  const currentLocked = Math.max(1, Math.floor(distribution?.current?.locked ?? 1));
+  const colorTolerance = Math.max(1, Math.round(currentLocked * DOOR_MUTATION_BALANCE_TOLERANCE_PCT));
+  const weighted = [];
+  for (const entry of baseWeights) {
+    const color = normalizeDoorLockColor(entry?.id ?? "");
+    if (!color || !DOOR_MUTATION_LOCK_COLOR_IDS.includes(color)) continue;
+    if (avoided && color === avoided) continue;
+    let weight = Math.max(0.05, Number(entry?.w ?? 1));
+    const currentCount = Math.max(0, Math.floor(distribution?.current?.byColor?.[color] ?? 0));
+    const targetCount = Math.max(0, Math.floor(distribution?.original?.byColor?.[color] ?? 0));
+    const delta = currentCount - targetCount;
+    if (delta > colorTolerance) {
+      weight *= 0.35;
+    } else if (delta < 0) {
+      weight *= (1 + Math.min(1.5, Math.abs(delta) * 0.22));
+    }
+    weighted.push({ id: color, w: Math.max(0.05, weight) });
+  }
+  if (!weighted.length) {
+    const fallback = DOOR_MUTATION_LOCK_COLOR_IDS.filter((color) => !avoided || color !== avoided);
+    return fallback[0] ?? KEY_GREEN;
+  }
+  return normalizeDoorLockColor(weightedChoice(rng, weighted) || KEY_GREEN) || KEY_GREEN;
+}
+
+function applyDoorMutation(state, door, mutation, now = Date.now(), reason = "") {
+  if (!state?.world || !door || !mutation) return false;
+  const nextDoorType = mutation.doorType === "locked" ? "locked" : "normal";
+  const nextLockColor = nextDoorType === "locked" ? normalizeDoorLockColor(mutation.lockColor) : "";
+  const nextTile = closedTileForDoorState(nextDoorType, nextLockColor);
+  const prevDoorType = String(door.doorType ?? "normal");
+  const prevLockColor = normalizeDoorLockColor(door.lockColor ?? "");
+
+  state.world.setTile(door.x, door.y, door.z, nextTile);
+  const updated = upsertDoorMutationRecordFromWorld(state, door.x, door.y, door.z, { reason: reason || "mutated" });
+  if (!updated) return false;
+  updated.doorType = nextDoorType;
+  updated.lockColor = nextDoorType === "locked" ? nextLockColor : "";
+  updated.isOpen = false;
+  updated.lastMutatedAt = Math.floor(now);
+  updated.mutationCooldownUntil = Math.floor(now + DOOR_MUTATION_COOLDOWN_MS);
+  updated.debugLastMutationReason = String(reason || `${prevDoorType}->${nextDoorType}`).slice(0, 180);
+  door.doorType = updated.doorType;
+  door.lockColor = updated.lockColor;
+  door.isOpen = updated.isOpen;
+  door.lastMutatedAt = updated.lastMutatedAt;
+  door.mutationCooldownUntil = updated.mutationCooldownUntil;
+  door.debugLastMutationReason = updated.debugLastMutationReason;
+
+  occupancySig = "";
+  hydrationSig = "";
+  visibilitySig = "";
+  markSaveDirty(state, "door-mutation");
+
+  appendDoorMutationDebug(state, {
+    type: "door-mutation",
+    at: now,
+    doorId: updated.id,
+    areaKey: updated.areaKey,
+    from: { doorType: prevDoorType, lockColor: prevLockColor || null },
+    to: { doorType: nextDoorType, lockColor: updated.lockColor || null },
+    reason: updated.debugLastMutationReason,
+  });
+  return true;
+}
+
+function recordDoorInteraction(state, x, y, z, reason = "interact", now = Date.now()) {
+  const record = upsertDoorMutationRecordFromWorld(state, x, y, z, { reason: `interaction:${reason}` });
+  if (!record) return false;
+  record.lastInteractedAt = Math.floor(now);
+  return true;
+}
+
+function runDoorMutationPulse(state, now = Date.now()) {
+  if (!state?.world || !state?.player) return false;
+  const doorMutation = ensureDoorMutationState(state);
+  if (doorMutation.enabled === false) return false;
+  if (!Number.isFinite(doorMutation.nextPulseAt) || doorMutation.nextPulseAt <= 0) {
+    doorMutation.nextPulseAt = nextDoorMutationPulseAt(now);
+    return false;
+  }
+  if (doorMutation.nextPulseAt > now) return false;
+
+  const rng = Math.random;
+  const allDoors = collectDoorMutationDoors(state, now).filter((door) => door?.mutable !== false);
+  doorMutation.lastPulseAt = Math.floor(now);
+  doorMutation.nextPulseAt = nextDoorMutationPulseAt(now, rng);
+  if (!allDoors.length) {
+    appendDoorMutationDebug(state, {
+      type: "door-mutation-pulse",
+      at: now,
+      changed: 0,
+      reason: "no-doors",
+    });
+    return false;
+  }
+
+  const context = {
+    activeAreaKeys: collectDoorMutationActiveAreaKeys(state),
+    occupiedKeys: buildDoorMutationOccupancy(state),
+  };
+  const eligible = allDoors.filter((door) => isDoorEligibleForMutation(state, door, now, context));
+  const eligibleLocked = eligible.filter((door) => door.doorType === "locked");
+  const eligibleNormal = eligible.filter((door) => door.doorType !== "locked");
+  let distribution = getDoorDistribution(allDoors);
+  const plan = buildDoorMutationPlan(distribution, rng);
+  const selectedDoorIds = new Set();
+  let changed = 0;
+
+  if (plan.doLockedToNormal && eligibleLocked.length > 0) {
+    const chosen = pickMutationCandidate(eligibleLocked, selectedDoorIds, rng);
+    if (chosen && applyDoorMutation(state, chosen, { doorType: "normal", lockColor: "" }, now, "locked_to_normal")) {
+      selectedDoorIds.add(chosen.id);
+      changed += 1;
+      distribution = getDoorDistribution(allDoors);
+    }
+  }
+
+  if (plan.doNormalToLocked && eligibleNormal.length > 0) {
+    const chosen = pickMutationCandidate(eligibleNormal, selectedDoorIds, rng);
+    if (chosen) {
+      const lockColor = pickWeightedLockColor(state, chosen, distribution, rng);
+      if (applyDoorMutation(state, chosen, { doorType: "locked", lockColor }, now, "normal_to_locked")) {
+        selectedDoorIds.add(chosen.id);
+        changed += 1;
+        distribution = getDoorDistribution(allDoors);
+      }
+    }
+  }
+
+  if (plan.doRareColorSwap) {
+    const swapCandidates = eligibleLocked.filter((door) => !selectedDoorIds.has(door.id));
+    const chosen = pickMutationCandidate(swapCandidates, selectedDoorIds, rng);
+    if (chosen) {
+      const nextColor = pickWeightedLockColor(state, chosen, distribution, rng, chosen.lockColor);
+      if (nextColor && nextColor !== normalizeDoorLockColor(chosen.lockColor)) {
+        if (applyDoorMutation(state, chosen, { doorType: "locked", lockColor: nextColor }, now, "locked_color_swap")) {
+          selectedDoorIds.add(chosen.id);
+          changed += 1;
+          distribution = getDoorDistribution(allDoors);
+        }
+      }
+    }
+  }
+
+  appendDoorMutationDebug(state, {
+    type: "door-mutation-pulse",
+    at: now,
+    changed,
+    eligible: eligible.length,
+    totalDoors: allDoors.length,
+    planReason: plan.reason,
+    counts: {
+      currentLocked: distribution.current.locked,
+      currentNormal: distribution.current.normal,
+      originalLocked: distribution.original.locked,
+      originalNormal: distribution.original.normal,
+    },
+  });
+  return changed > 0;
 }
 
 function collectChunkAreaCells(state, z, cx, cy, areaId) {
@@ -12836,6 +13378,7 @@ function processAreaRespawns(state, now = Date.now()) {
 function updateAreaRespawnSystem(state, now = Date.now()) {
   updateAreaRespawnTracking(state, now);
   processAreaRespawns(state, now);
+  runDoorMutationPulse(state, now);
 }
 
 // ---------- Visibility ----------
@@ -13637,10 +14180,60 @@ function lockToOpenDoorTile(t) {
   return DOOR_OPEN;
 }
 
+function normalizeDoorLockColor(lockColor) {
+  const color = String(lockColor ?? "").trim();
+  if (!color) return "";
+  if (color === KEY_BLUE) return KEY_INDIGO;
+  if (color === KEY_PURPLE) return KEY_VIOLET;
+  if (color === KEY_MAGENTA) return KEY_INDIGO;
+  return color;
+}
+
+function lockColorForOpenDoorTile(t) {
+  if (t === DOOR_OPEN_GREEN) return KEY_GREEN;
+  if (t === DOOR_OPEN_YELLOW) return KEY_YELLOW;
+  if (t === DOOR_OPEN_ORANGE) return KEY_ORANGE;
+  if (t === DOOR_OPEN_RED) return KEY_RED;
+  if (t === DOOR_OPEN_VIOLET || t === DOOR_OPEN_PURPLE) return KEY_VIOLET;
+  if (t === DOOR_OPEN_INDIGO || t === DOOR_OPEN_BLUE || t === DOOR_OPEN_MAGENTA) return KEY_INDIGO;
+  return "";
+}
+
+function lockColorForDoorTile(t) {
+  if (tileIsLocked(t)) return normalizeDoorLockColor(lockToKeyType(t));
+  if (isOpenDoorTile(t)) return normalizeDoorLockColor(lockColorForOpenDoorTile(t));
+  return "";
+}
+
+function doorStateFromTile(t) {
+  if (t === DOOR_CLOSED) return { doorType: "normal", lockColor: "", isOpen: false };
+  if (t === DOOR_OPEN) return { doorType: "normal", lockColor: "", isOpen: true };
+  if (tileIsLocked(t)) return { doorType: "locked", lockColor: lockColorForDoorTile(t), isOpen: false };
+  if (isOpenDoorTile(t)) {
+    const lockColor = lockColorForDoorTile(t);
+    if (lockColor) return { doorType: "locked", lockColor, isOpen: true };
+    return { doorType: "normal", lockColor: "", isOpen: true };
+  }
+  return null;
+}
+
+function isDoorTile(t) {
+  return !!doorStateFromTile(t);
+}
+
+function closedTileForDoorState(doorType = "normal", lockColor = "") {
+  if (doorType !== "locked") return DOOR_CLOSED;
+  const color = normalizeDoorLockColor(lockColor);
+  if (!color) return DOOR_CLOSED;
+  return keyTypeToLockTile(color);
+}
+
 function tryUnlockDoor(state, x, y, z) {
   const t = state.world.getTile(x, y, z);
   if (!tileIsLocked(t)) return false;
   state.lastPlayerActionKind = "door";
+  const interactionAt = Date.now();
+  recordDoorInteraction(state, x, y, z, "unlock_attempt", interactionAt);
 
   const keyType = lockToKeyType(t);
   const lockpickEnabled = !!stateDebug(state).lockpick;
@@ -13651,6 +14244,7 @@ function tryUnlockDoor(state, x, y, z) {
   }
 
   state.world.setTile(x, y, z, lockToOpenDoorTile(t));
+  recordDoorInteraction(state, x, y, z, "unlock_success", interactionAt);
   recordAnalyticsCounter(ensureAnalyticsState(state), "doorsOpened", 1, z);
   analyticsEventAtPlayer(state, "locked_door_opened", {
     keyType,
@@ -13665,7 +14259,9 @@ function tryOpenClosedDoor(state, x, y, z) {
   const t = state.world.getTile(x, y, z);
   if (t !== DOOR_CLOSED) return false;
   state.lastPlayerActionKind = "door";
+  const interactionAt = Date.now();
   state.world.setTile(x, y, z, DOOR_OPEN);
+  recordDoorInteraction(state, x, y, z, "open_closed", interactionAt);
   recordAnalyticsCounter(ensureAnalyticsState(state), "doorsOpened", 1, z);
   pushLog(state, "You open the door.");
   state.visitedDoors?.add(keyXYZ(x, y, z));
@@ -13688,6 +14284,7 @@ function tryCloseAdjacentDoor(state) {
     if (occ) continue;
 
     state.world.setTile(x, y, p.z, DOOR_CLOSED);
+    recordDoorInteraction(state, x, y, p.z, "close_open", Date.now());
     state.lastPlayerActionKind = "door";
     recordAnalyticsCounter(ensureAnalyticsState(state), "doorsClosed", 1, p.z);
     pushLog(state, "You close the door.");
@@ -19613,6 +20210,7 @@ function placeMatchingLockedDoorNearPlayer(state, keyType) {
 function exportSave(state) {
   const character = touchCharacterProgress(state);
   const areaRespawn = ensureAreaRespawnState(state);
+  const doorMutation = ensureDoorMutationState(state);
   const tileOv = Array.from(state.world.tileOverrides.entries());
   const removed = Array.from(state.removedIds);
   const entOv = Array.from(state.entityOverrides.entries()).map(([id, ov]) => {
@@ -19675,6 +20273,13 @@ function exportSave(state) {
     areaRespawn: {
       currentAreaKey: areaRespawn.currentAreaKey ?? "",
       schedules: areaRespawn.schedules ?? {},
+    },
+    doorMutation: {
+      enabled: doorMutation.enabled !== false,
+      nextPulseAt: Number.isFinite(doorMutation.nextPulseAt) ? Math.max(0, Math.floor(doorMutation.nextPulseAt)) : 0,
+      lastPulseAt: Number.isFinite(doorMutation.lastPulseAt) ? Math.max(0, Math.floor(doorMutation.lastPulseAt)) : 0,
+      doors: (doorMutation.doors && typeof doorMutation.doors === "object") ? doorMutation.doors : {},
+      debugLog: ensureArray(doorMutation.debugLog).slice(-DOOR_MUTATION_DEBUG_LOG_LIMIT),
     },
     debug: normalizeDebugFlags(state.debug),
     combat: {
@@ -20088,6 +20693,9 @@ function importSave(saveStr) {
               )
           : {},
       },
+      doorMutation: (payload?.doorMutation && typeof payload.doorMutation === "object")
+        ? payload.doorMutation
+        : { enabled: true, nextPulseAt: 0, lastPulseAt: 0, doors: {}, debugLog: [] },
       quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
       debug: normalizeDebugFlags(payload.debug),
       analytics: null,
@@ -20149,6 +20757,7 @@ function importSave(saveStr) {
     }
     state.debug = normalizeDebugFlags(state.debug);
     ensureQuickSwitchState(state);
+    ensureDoorMutationState(state);
     if (canMutateGameplayStateLocally()) {
       ensureShopState(state);
     }
@@ -21372,6 +21981,7 @@ function tryOpenAdjacentDoor(state) {
 
     // Opening a closed door does not require checking occupancy
     state.world.setTile(x, y, p.z, DOOR_OPEN);
+    recordDoorInteraction(state, x, y, p.z, "open_adjacent", Date.now());
     pushLog(state, "You open the door.");
     state.visitedDoors?.add(keyXYZ(x, y, p.z));
     return true;
