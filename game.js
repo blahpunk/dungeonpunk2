@@ -20315,12 +20315,17 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
   const command = (rawCommand && typeof rawCommand === "object") ? rawCommand : {};
   const type = String(command.type ?? "").trim().toUpperCase();
   const logStart = Array.isArray(state?.log) ? state.log.length : 0;
+  const snapshotWithAreaRespawn = () => {
+    updateAreaRespawnSystem(state, Date.now());
+    hydrateNearby(state);
+    return buildHeadlessStateSnapshot(state, { logStart });
+  };
   if (!state?.player || !type) {
     return {
       ok: false,
       error: "Invalid authoritative command.",
       turnSpent: false,
-      snapshot: state ? buildHeadlessStateSnapshot(state, { logStart }) : null,
+      snapshot: state ? snapshotWithAreaRespawn() : null,
     };
   }
 
@@ -20335,7 +20340,7 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
         ok: false,
         error: "Invalid move direction.",
         turnSpent: false,
-        snapshot: buildHeadlessStateSnapshot(state, { logStart }),
+        snapshot: snapshotWithAreaRespawn(),
       };
     }
     ok = !!playerMoveOrAttack(state, delta.dx, delta.dy);
@@ -20352,7 +20357,7 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
         ok: false,
         error: "Invalid stairs direction.",
         turnSpent: false,
-        snapshot: buildHeadlessStateSnapshot(state, { logStart }),
+        snapshot: snapshotWithAreaRespawn(),
       };
     }
     ok = !!tryUseStairs(state, dir);
@@ -20396,7 +20401,7 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
         ok: false,
         error: "Ability is not available.",
         turnSpent: false,
-        snapshot: buildHeadlessStateSnapshot(state, { logStart }),
+        snapshot: snapshotWithAreaRespawn(),
       };
     }
     const target = findMonsterForAuthoritativeCommand(state, command);
@@ -20454,7 +20459,7 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
       ok: false,
       error: `Unsupported authoritative command: ${type}`,
       turnSpent: false,
-      snapshot: buildHeadlessStateSnapshot(state, { logStart }),
+      snapshot: snapshotWithAreaRespawn(),
     };
   }
 
@@ -20462,7 +20467,7 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
     ok,
     error: ok ? "" : `Command ${type} could not be completed.`,
     turnSpent,
-    snapshot: buildHeadlessStateSnapshot(state, { logStart }),
+    snapshot: snapshotWithAreaRespawn(),
   };
 }
 
@@ -20470,6 +20475,22 @@ function headlessStateFromPayload(payload = "") {
   const src = String(payload ?? "").trim();
   if (!src) return null;
   return importSave(src);
+}
+
+function applyHeadlessMonsterEditorPayload(payload = null) {
+  try {
+    applyMonsterEditorPayload(
+      payload ?? {
+        version: 1,
+        monsters: cloneMonsterTypeMapForEditor(MONSTER_TYPES),
+        spawn_rules: cloneMonsterSpawnRulesForEditor(MONSTER_SPAWN_RULES),
+        updated_at: "",
+      }
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function headlessBootstrapState(options = null) {
@@ -21372,6 +21393,7 @@ export {
   executeAuthoritativeCommandOnState,
   exportCharacterSnapshot,
   exportSave,
+  applyHeadlessMonsterEditorPayload,
   headlessBootstrapState,
   headlessExecuteCommandPayload,
   headlessStateFromPayload,
