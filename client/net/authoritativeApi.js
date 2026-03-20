@@ -3,12 +3,17 @@ export function createAuthoritativeApi(options = {}) {
   const csrfToken = String(options.csrfToken ?? "").trim();
   const browserInstanceId = String(options.browserInstanceId ?? "").trim();
   const cacheBust = typeof options.cacheBust === "function" ? options.cacheBust : ((url) => url);
+  const liveTickCombatOption = options.liveTickCombat;
 
   function buildPayload(body = null) {
     const payload = (body && typeof body === "object")
       ? { ...body }
       : {};
     if (browserInstanceId) payload.browser_instance_id = browserInstanceId;
+    const liveTickCombat = typeof liveTickCombatOption === "function"
+      ? liveTickCombatOption()
+      : liveTickCombatOption;
+    if (typeof liveTickCombat === "boolean") payload.live_tick_combat = liveTickCombat;
     if (csrfToken) payload._csrf = csrfToken;
     return payload;
   }
@@ -42,6 +47,7 @@ export function createAuthoritativeApi(options = {}) {
       headers,
       cache: "no-store",
       keepalive: opts.keepalive === true,
+      signal: opts.signal,
       body: JSON.stringify(payload),
     });
     let data = null;
@@ -75,6 +81,23 @@ export function createAuthoritativeApi(options = {}) {
         command,
         client_sent_at: Date.now(),
       });
+    },
+    setMovementIntent({ sessionId = "", holdDir = "", active = false, enqueueDir = "", intentSeq = 0 } = {}) {
+      return request({
+        action: "set_movement_intent",
+        session_id: sessionId,
+        hold_dir: holdDir || undefined,
+        active: active === true,
+        enqueue_dir: enqueueDir || undefined,
+        intent_seq: Math.max(0, Math.floor(Number(intentSeq) || 0)),
+      });
+    },
+    pollMovement({ sessionId = "", timeoutMs = 25000, signal } = {}) {
+      return request({
+        action: "poll_movement",
+        session_id: sessionId,
+        timeout_ms: Math.max(100, Math.floor(Number(timeoutMs) || 25000)),
+      }, { signal });
     },
     touchSession({ sessionId = "" } = {}) {
       return request({

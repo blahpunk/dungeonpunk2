@@ -22,7 +22,13 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
   path.join(PROJECT_ROOT, "src", "content", "monsters.seed.json"),
 ].filter(Boolean);
 let appliedMonsterConfigRaw = "";
-const AUTHORITATIVE_TICK_MS = 50;
+const AUTHORITATIVE_TICK_MS = 28;
+
+function sleep(ms = 0) {
+  const delay = Math.max(0, Math.floor(Number(ms) || 0));
+  if (delay <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
 
 function loadMonsterEditorPayload() {
   for (const cfgPath of MONSTER_EDITOR_CONFIG_PATHS) {
@@ -109,17 +115,34 @@ async function main() {
 
   if (operation === "command") {
     const opStartMs = Date.now();
-    const result = engine.headlessExecuteCommandPayload(
-      String(input.worldPayload ?? ""),
-      input.command ?? {},
-      ""
-    );
+    const nowMs = Date.now();
+    const nowTick = Math.max(0, Math.floor(nowMs / AUTHORITATIVE_TICK_MS));
+    const serverTick = nowTick + 1;
+    const executeAtMs = serverTick * AUTHORITATIVE_TICK_MS;
+    const waitMs = Math.max(0, executeAtMs - nowMs);
+    if (waitMs > 0) await sleep(waitMs);
+    const worldPayload = String(input.worldPayload ?? "");
+    let result;
+    if (typeof engine.headlessExecuteCommandOnState === "function") {
+      const state = engine.headlessStateFromPayload(worldPayload);
+      if (!state) return fail("Invalid canonical run payload.");
+      result = engine.headlessExecuteCommandOnState(state, input.command ?? {}, "", {
+        basePayload: worldPayload,
+        nowMs: executeAtMs,
+      });
+    } else {
+      result = engine.headlessExecuteCommandPayload(
+        worldPayload,
+        input.command ?? {},
+        ""
+      );
+    }
     if (result && typeof result === "object") {
       const perf = (result.perf && typeof result.perf === "object") ? { ...result.perf } : {};
       perf.workerMs = Math.max(0, Date.now() - opStartMs);
       result.perf = perf;
       result.tick = {
-        serverTick: Math.max(0, Math.floor(Date.now() / AUTHORITATIVE_TICK_MS)),
+        serverTick,
         tickMs: AUTHORITATIVE_TICK_MS,
         inputWindowMs: AUTHORITATIVE_TICK_MS,
       };

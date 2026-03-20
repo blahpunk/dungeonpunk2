@@ -3,7 +3,7 @@ import {
   LOCAL_SLOT_MAX,
   createLocalSlotStore,
 } from "./client/save/saveManager.js?v=20260315a";
-import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260318d";
+import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260320b";
 import {
   abilityCommand,
   attackCommand,
@@ -218,7 +218,81 @@ const FEATURE_FLAGS = Object.freeze({
   telemetryUpload: true,
   adminConsole: true,
   classActives: true,
+  liveTickCombat: true,
 });
+const LIVE_SIM_SCHEMA_VERSION = 1;
+const LIVE_SIM_DEFAULT_TICK_MS = 28;
+const LIVE_SIM_TICKS_PER_LEGACY_TURN = 10;
+const LIVE_SIM_MAX_EVENT_HISTORY = 48;
+const LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS = 3;
+const LIVE_TIMING_ACTION_POLICY = Object.freeze({
+  MOVE: "live_action_timeline",
+  MOVE_BATCH: "live_action_timeline",
+  ATTACK: "live_action_timeline",
+  ACTIVATE_ABILITY: "live_action_timeline",
+  OPEN_DOOR: "timed_interaction",
+  CLOSE_DOOR: "timed_interaction",
+  PICKUP: "timed_interaction",
+  OPEN_CHEST: "timed_interaction",
+  DISARM_TRAP: "timed_interaction",
+  USE_SHRINE: "timed_interaction",
+  INTERACT: "contextual_interaction",
+  USE_STAIRS: "blocked_during_live_combat",
+  DROP_ITEM: "transactional_non_turn",
+  USE_ITEM: "transactional_non_turn",
+  EQUIP_ITEM: "transactional_non_turn",
+  UNEQUIP_ITEM: "transactional_non_turn",
+  BUY_SHOP_ITEM: "transactional_non_turn",
+  SELL_SHOP_ITEM: "transactional_non_turn",
+  ALLOCATE_STATS: "out_of_combat_only",
+  REQUEST_RESYNC: "meta",
+  SAVE_AND_EXIT: "meta",
+});
+const LIVE_TICK_COMBAT_STORAGE_KEY = "d25_live_tick_combat";
+
+function parseLiveTickCombatFlagValue(value) {
+  if (typeof value === "boolean") return value;
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "1" || raw === "true" || raw === "yes" || raw === "on") return true;
+  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+  return null;
+}
+
+function resolveBrowserLiveTickCombatRequestMode() {
+  try {
+    const href = String(globalThis?.window?.location?.href ?? globalThis?.location?.href ?? "").trim();
+    if (href) {
+      const url = new URL(href, "http://localhost/");
+      const queryValue = parseLiveTickCombatFlagValue(
+        url.searchParams.get("liveTickCombat")
+        ?? url.searchParams.get("live_tick_combat")
+      );
+      if (queryValue !== null) return queryValue;
+    }
+  } catch {}
+  try {
+    const datasetValue = parseLiveTickCombatFlagValue(globalThis?.document?.body?.dataset?.liveTickCombat ?? "");
+    if (datasetValue !== null) return datasetValue;
+  } catch {}
+  try {
+    const storedValue = parseLiveTickCombatFlagValue(localStorage.getItem(LIVE_TICK_COMBAT_STORAGE_KEY));
+    if (storedValue !== null) return storedValue;
+  } catch {}
+  return null;
+}
+
+const BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE = resolveBrowserLiveTickCombatRequestMode();
+
+function resolveLiveTickCombatRequestMode() {
+  const runtimeValue = parseLiveTickCombatFlagValue(globalThis.__DUNGEONPUNK_LIVE_TICK_COMBAT__);
+  if (runtimeValue !== null) return runtimeValue;
+  return BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE;
+}
+
+function liveTickCombatRequestedByClient() {
+  return resolveLiveTickCombatRequestMode() === true;
+}
 const ENV_STYLE_VARIANTS = Object.freeze([
   {
     id: "carved_stone",
@@ -1731,16 +1805,23 @@ const authoritativePendingAction = createPendingActionState();
 let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
 const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
-const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 1;
+const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 2;
 const AUTHORITATIVE_MOVE_BATCH_MAX = 1;
 const authoritativeCommandQueue = [];
 const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 90;
+const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 28;
+const AUTHORITATIVE_CLIENT_TICK_MS_MIN = 25;
+const AUTHORITATIVE_CLIENT_TICK_MS_MAX = 100;
+const AUTHORITATIVE_CLIENT_PREDICTION_ENABLED = true;
+const AUTHORITATIVE_ATTACK_PREDICTION_ENABLED = false;
+const AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD = 1;
 const AUTHORITATIVE_PAYLOAD_DIFF_FORMAT = "save_payload_delta_v1";
 const AUTHORITATIVE_PAYLOAD_DIFF_MAX_OPS = 1600;
 const AUTHORITATIVE_PAYLOAD_DIFF_MAX_BYTES = 120000;
 const AUTHORITATIVE_LOCK_AUDIT_INTERVAL_MS = 20000;
 const AUTHORITATIVE_FAST_UI_REASONS = new Set([
   "move",
+  "move-stream",
   "attack",
   "wait",
   "open-door",
@@ -1757,15 +1838,32 @@ const AUTHORITATIVE_HOT_DELTA_TYPES = new Set([
   "MOVE_BATCH",
   "ATTACK",
   "WAIT",
+  "PICKUP",
+  "OPEN_CHEST",
   "OPEN_DOOR",
   "CLOSE_DOOR",
   "INTERACT",
   "DISARM_TRAP",
+  "USE_SHRINE",
+  "USE_STAIRS",
 ]);
 const authoritativeSessionRuntime = {
   touchTimer: 0,
   touchInFlight: false,
   lastTouchAt: 0,
+};
+const AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS = 25000;
+const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 200;
+const AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED = true;
+const authoritativeMovementChannelRuntime = {
+  pollInFlight: false,
+  stopRequested: false,
+  sessionId: "",
+  lastErrorAt: 0,
+  intentSeq: 0,
+  abortController: null,
+  disabled: !AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED,
+  disableReason: AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED ? "" : "client-disabled",
 };
 const authoritativeLockAuditRuntime = {
   inFlight: false,
@@ -1777,11 +1875,35 @@ const authoritativeRateLimitRuntime = {
   drainTimer: 0,
   lastWarnAt: 0,
 };
+const authoritativeTickRuntime = {
+  tickMs: AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS,
+  nextMoveAt: 0,
+};
+const authoritativePredictionRuntime = {
+  inFlightMovePredicted: false,
+  lastAppliedAcceptedSeq: 0,
+  lastAppliedServerRevision: 0,
+  lastSessionId: "",
+};
+const authoritativeMoveTelemetryRuntime = {
+  pendingBySeq: new Map(),
+  totals: {
+    sent: 0,
+    acked: 0,
+    predicted: 0,
+    corrected: 0,
+    totalCorrectionDist: 0,
+    totalRttMs: 0,
+    totalInputToVisualMs: 0,
+    totalInputToAckMs: 0,
+  },
+  last: null,
+};
 const authoritativeQueuedMovePreviewRuntime = {
   active: false,
   source: "",
 };
-const AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED = false;
+const AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED = true;
 const authoritativeVisualMotionRuntime = {
   initialized: false,
   fromX: 0,
@@ -1842,7 +1964,8 @@ function noteAuthoritativeVisualPlayerTarget(nextX = 0, nextY = 0, previousX = n
   authoritativeVisualMotionRuntime.toX = nx;
   authoritativeVisualMotionRuntime.toY = ny;
   authoritativeVisualMotionRuntime.startAtMs = nowMs;
-  authoritativeVisualMotionRuntime.durationMs = Math.max(28, Math.min(80, 32 + dist * 14));
+  const targetTickMs = isAuthoritativeSessionActive() ? authoritativeClientTickMs() : 50;
+  authoritativeVisualMotionRuntime.durationMs = Math.max(20, Math.min(96, Math.round(targetTickMs * (dist > 1 ? 0.95 : 0.86))));
 }
 
 function resolveBrowserInstanceId() {
@@ -1875,7 +1998,55 @@ const authoritativeApi = createAuthoritativeApi({
   csrfToken: saveApiCsrfToken,
   browserInstanceId: resolveBrowserInstanceId(),
   cacheBust: withCacheBust,
+  liveTickCombat: () => resolveLiveTickCombatRequestMode(),
 });
+
+let authoritativeMovementStreamCompatibilityWarned = false;
+
+function isAuthoritativeMovementStreamAvailable() {
+  return (
+    !authoritativeMovementChannelRuntime.disabled &&
+    typeof authoritativeApi?.setMovementIntent === "function" &&
+    typeof authoritativeApi?.pollMovement === "function"
+  );
+}
+
+function noteAuthoritativeMovementStreamCompatibilityFallback() {
+  if (authoritativeMovementStreamCompatibilityWarned) return;
+  authoritativeMovementStreamCompatibilityWarned = true;
+  if (!game?.log) return;
+  if (authoritativeMovementChannelRuntime.disableReason === "client-disabled") return;
+  pushLog(game, "Movement stream unavailable in this tab; using compatibility movement mode.");
+  renderLog(game);
+}
+
+function shouldDisableAuthoritativeMovementStream(err) {
+  const message = String(
+    err?.response?.error
+    ?? err?.message
+    ?? err
+    ?? ""
+  ).trim().toLowerCase();
+  if (!message) return false;
+  return (
+    message.includes("unsupported worker operation") ||
+    message.includes("poll_movement") ||
+    message.includes("set_movement_intent") ||
+    message.includes("movement stream unavailable")
+  );
+}
+
+function disableAuthoritativeMovementStream(reason = "", err = null) {
+  if (authoritativeMovementChannelRuntime.disabled) return;
+  authoritativeMovementChannelRuntime.disabled = true;
+  authoritativeMovementChannelRuntime.disableReason = String(reason ?? "").trim();
+  stopAuthoritativeMovementPollLoop();
+  noteAuthoritativeMovementStreamCompatibilityFallback();
+  if (!game?.log || !err) return;
+  const message = authoritativeErrorMessage(err, "Movement stream unavailable.");
+  pushLog(game, `${message} Falling back to compatibility movement.`);
+  renderLog(game);
+}
 
 function isAuthoritativeModeEnabled() {
   return authoritativeEnabled && isAuthenticatedUser;
@@ -1895,8 +2066,28 @@ function setAuthoritativeInputLock(locked = false, descriptor = null) {
   setServerMirrorInFlight(authoritativeMirror, locked);
 }
 
+function nextAuthoritativeMovementIntentSeq() {
+  authoritativeMovementChannelRuntime.intentSeq =
+    Math.max(0, Math.floor(Number(authoritativeMovementChannelRuntime.intentSeq ?? 0) || 0)) + 1;
+  return authoritativeMovementChannelRuntime.intentSeq;
+}
+
+function authoritativeMoveDirFromDelta(dx = 0, dy = 0) {
+  const command = moveCommand(dx, dy);
+  return String(command?.dir ?? "").trim().toUpperCase();
+}
+
+function resetAuthoritativePredictionRuntime(sessionId = "") {
+  authoritativePredictionRuntime.inFlightMovePredicted = false;
+  authoritativePredictionRuntime.lastAppliedAcceptedSeq = 0;
+  authoritativePredictionRuntime.lastAppliedServerRevision = 0;
+  authoritativePredictionRuntime.lastSessionId = String(sessionId ?? "").trim();
+  clearAuthoritativeMoveTelemetry();
+}
+
 function clearAuthoritativeCommandQueue() {
   authoritativeCommandQueue.length = 0;
+  authoritativePredictionRuntime.inFlightMovePredicted = false;
   clearQueuedAuthoritativeMovePreview();
 }
 
@@ -1924,6 +2115,10 @@ function canQueueAuthoritativeCommand(command) {
   return cmdType === "MOVE";
 }
 
+function isAuthoritativeMoveCommand(command) {
+  return String(command?.type ?? "").trim().toUpperCase() === "MOVE";
+}
+
 function enqueueAuthoritativeCommand(command, options = null) {
   if (!command || typeof command !== "object") return false;
   const opts = (options && typeof options === "object") ? options : {};
@@ -1938,6 +2133,7 @@ function enqueueAuthoritativeCommand(command, options = null) {
       if (queuedType !== "MOVE") continue;
       const queuedSource = String(queued?.options?.movementSource ?? "").trim();
       if (!queuedSource || queuedSource === movementSource) continue;
+      if (queued?.predicted === true) continue;
       authoritativeCommandQueue.splice(i, 1);
     }
     // Keep a short buffered run per source so we can batch-send movement on drain.
@@ -1949,15 +2145,25 @@ function enqueueAuthoritativeCommand(command, options = null) {
       if (String(queued?.options?.movementSource ?? "").trim() !== movementSource) continue;
       sameSourceCount += 1;
       if (sameSourceCount >= AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX) {
+        if (queued?.predicted === true) continue;
         authoritativeCommandQueue.splice(i, 1);
       }
     }
   }
   if (authoritativeCommandQueue.length >= AUTHORITATIVE_COMMAND_QUEUE_MAX) {
-    authoritativeCommandQueue.shift();
+    let dropIndex = authoritativeCommandQueue.findIndex((entry) => entry?.predicted !== true);
+    if (dropIndex < 0) dropIndex = 0;
+    authoritativeCommandQueue.splice(dropIndex, 1);
   }
-  authoritativeCommandQueue.push({ command, options: opts });
-  return true;
+  const entry = {
+    command,
+    options: opts,
+    predicted: false,
+    predictedTrace: null,
+    predictedInputAt: normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now()),
+  };
+  authoritativeCommandQueue.push(entry);
+  return entry;
 }
 
 function dropQueuedAuthoritativeMovementBySource(source = "") {
@@ -2004,6 +2210,85 @@ function hasQueuedAuthoritativeMove() {
   return false;
 }
 
+function authoritativePredictedQueuedMoveCount() {
+  let total = 0;
+  for (const entry of authoritativeCommandQueue) {
+    if (!entry || typeof entry !== "object") continue;
+    if (!isAuthoritativeMoveCommand(entry.command)) continue;
+    if (entry.predicted === true) total += 1;
+  }
+  return total;
+}
+
+function authoritativePredictedMoveLead() {
+  let lead = authoritativePredictionRuntime.inFlightMovePredicted ? 1 : 0;
+  lead += authoritativePredictedQueuedMoveCount();
+  return lead;
+}
+
+function canPredictAuthoritativeMoveNow() {
+  if (!AUTHORITATIVE_CLIENT_PREDICTION_ENABLED) return false;
+  return authoritativePredictedMoveLead() < AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD;
+}
+
+function replayQueuedAuthoritativeMovePredictions() {
+  if (!AUTHORITATIVE_CLIENT_PREDICTION_ENABLED) return 0;
+  if (!isAuthoritativeSessionActive()) return 0;
+  if (!game?.player || game.player.dead) return 0;
+  let lead = authoritativePredictionRuntime.inFlightMovePredicted ? 1 : 0;
+  let applied = 0;
+  for (const entry of authoritativeCommandQueue) {
+    if (!entry || typeof entry !== "object") continue;
+    entry.predicted = false;
+    entry.predictedTrace = null;
+  }
+  for (const entry of authoritativeCommandQueue) {
+    if (!entry || typeof entry !== "object") continue;
+    if (!isAuthoritativeMoveCommand(entry.command)) {
+      entry.predicted = false;
+      entry.predictedTrace = null;
+      continue;
+    }
+    if (lead >= AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD) {
+      entry.predicted = false;
+      entry.predictedTrace = null;
+      continue;
+    }
+    if (shouldDropAuthoritativeCommand(entry.command, { suppressWallLog: true })) {
+      entry.predicted = false;
+      entry.predictedTrace = null;
+      continue;
+    }
+    const predicted = applyPredictedMoveToQueueEntry(entry, entry.command, entry.predictedInputAt ?? entry.options?.inputAt ?? Date.now());
+    if (predicted) {
+      lead += 1;
+      applied += 1;
+    }
+  }
+  return applied;
+}
+
+function applyPredictedMoveToQueueEntry(entry, command, inputAt = null) {
+  if (!entry || typeof entry !== "object") return false;
+  const trace = {};
+  const predicted = tryApplyImmediateAuthoritativeMovePrediction(command, trace);
+  entry.predicted = predicted;
+  if (!predicted) {
+    entry.predictedTrace = null;
+    return false;
+  }
+  entry.predictedInputAt = normalizeAuthoritativeMoveInputAt(inputAt ?? entry.predictedInputAt ?? Date.now());
+  entry.predictedTrace = {
+    dir: String(command?.dir ?? "").trim().toUpperCase(),
+    startX: Math.floor(Number(trace.startX ?? 0) || 0),
+    startY: Math.floor(Number(trace.startY ?? 0) || 0),
+    endX: Math.floor(Number(trace.endX ?? 0) || 0),
+    endY: Math.floor(Number(trace.endY ?? 0) || 0),
+    predictedAt: normalizeAuthoritativeMoveInputAt(trace.predictedAt ?? Date.now()),
+  };
+  return true;
+}
+
 function clearQueuedAuthoritativeMovePreview() {
   authoritativeQueuedMovePreviewRuntime.active = false;
   authoritativeQueuedMovePreviewRuntime.source = "";
@@ -2013,6 +2298,163 @@ function clearAuthoritativeRateLimitTimer() {
   if (!authoritativeRateLimitRuntime.drainTimer) return;
   clearTimeout(authoritativeRateLimitRuntime.drainTimer);
   authoritativeRateLimitRuntime.drainTimer = 0;
+}
+
+function resetAuthoritativeTickRuntime() {
+  authoritativeTickRuntime.tickMs = AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS;
+  authoritativeTickRuntime.nextMoveAt = 0;
+}
+
+function authoritativeClientTickMs() {
+  const raw = Number(authoritativeTickRuntime.tickMs ?? AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS);
+  if (!Number.isFinite(raw)) return AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS;
+  const rounded = Math.floor(raw);
+  return Math.max(AUTHORITATIVE_CLIENT_TICK_MS_MIN, Math.min(AUTHORITATIVE_CLIENT_TICK_MS_MAX, rounded));
+}
+
+function noteAuthoritativeTickFromResponse(data = null) {
+  const tickMsRaw = Number(data?.tick?.tickMs ?? data?.tick?.inputWindowMs ?? 0);
+  if (!Number.isFinite(tickMsRaw) || tickMsRaw <= 0) return;
+  const normalized = Math.max(
+    AUTHORITATIVE_CLIENT_TICK_MS_MIN,
+    Math.min(AUTHORITATIVE_CLIENT_TICK_MS_MAX, Math.floor(tickMsRaw))
+  );
+  authoritativeTickRuntime.tickMs = normalized;
+}
+
+function normalizeAuthoritativeMoveInputAt(value = null) {
+  const raw = Number(value ?? 0);
+  if (!Number.isFinite(raw) || raw <= 0) return Date.now();
+  return Math.floor(raw);
+}
+
+function moveDirsForAuthoritativeCommand(command = null) {
+  const type = String(command?.type ?? "").trim().toUpperCase();
+  if (type === "MOVE") {
+    const dir = String(command?.dir ?? "").trim().toUpperCase();
+    return (dir === "N" || dir === "S" || dir === "E" || dir === "W") ? [dir] : [];
+  }
+  if (type === "MOVE_BATCH") {
+    const dirs = Array.isArray(command?.dirs) ? command.dirs : [];
+    return dirs
+      .map((dir) => String(dir ?? "").trim().toUpperCase())
+      .filter((dir) => dir === "N" || dir === "S" || dir === "E" || dir === "W");
+  }
+  return [];
+}
+
+function clearAuthoritativeMoveTelemetry() {
+  authoritativeMoveTelemetryRuntime.pendingBySeq.clear();
+  authoritativeMoveTelemetryRuntime.totals.sent = 0;
+  authoritativeMoveTelemetryRuntime.totals.acked = 0;
+  authoritativeMoveTelemetryRuntime.totals.predicted = 0;
+  authoritativeMoveTelemetryRuntime.totals.corrected = 0;
+  authoritativeMoveTelemetryRuntime.totals.totalCorrectionDist = 0;
+  authoritativeMoveTelemetryRuntime.totals.totalRttMs = 0;
+  authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs = 0;
+  authoritativeMoveTelemetryRuntime.totals.totalInputToAckMs = 0;
+  authoritativeMoveTelemetryRuntime.last = null;
+}
+
+function noteAuthoritativeMoveDispatch(clientCommandSeq = 0, command = null, options = null) {
+  const seq = Math.max(0, Math.floor(Number(clientCommandSeq) || 0));
+  if (!seq) return;
+  const dirs = moveDirsForAuthoritativeCommand(command);
+  if (!dirs.length) return;
+  const opts = (options && typeof options === "object") ? options : {};
+  const sendAt = Date.now();
+  const predictedStepsRaw = Array.isArray(opts.predictedSteps) ? opts.predictedSteps : [];
+  const predictedSteps = predictedStepsRaw
+    .filter((step) => step && typeof step === "object")
+    .map((step) => ({
+      dir: String(step.dir ?? "").trim().toUpperCase(),
+      startX: Math.floor(Number(step.startX ?? 0) || 0),
+      startY: Math.floor(Number(step.startY ?? 0) || 0),
+      endX: Math.floor(Number(step.endX ?? 0) || 0),
+      endY: Math.floor(Number(step.endY ?? 0) || 0),
+      inputAt: normalizeAuthoritativeMoveInputAt(step.inputAt ?? opts.inputAt ?? sendAt),
+      predictedAt: normalizeAuthoritativeMoveInputAt(step.predictedAt ?? sendAt),
+    }));
+  const inputAt = predictedSteps.length
+    ? Math.min(...predictedSteps.map((step) => normalizeAuthoritativeMoveInputAt(step.inputAt)))
+    : normalizeAuthoritativeMoveInputAt(opts.inputAt ?? sendAt);
+  const expected = predictedSteps.length ? predictedSteps[predictedSteps.length - 1] : null;
+  const record = {
+    seq,
+    dirs,
+    sendAt,
+    inputAt,
+    predictedSteps,
+    expectedX: expected ? expected.endX : null,
+    expectedY: expected ? expected.endY : null,
+    queueDepthAtSend: Math.max(0, Math.floor(Number(opts.queueDepth ?? authoritativeCommandQueue.length) || 0)),
+  };
+  authoritativeMoveTelemetryRuntime.pendingBySeq.set(seq, record);
+  authoritativeMoveTelemetryRuntime.totals.sent += dirs.length;
+  if (predictedSteps.length) {
+    authoritativeMoveTelemetryRuntime.totals.predicted += predictedSteps.length;
+    for (const step of predictedSteps) {
+      authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs += Math.max(0, step.predictedAt - step.inputAt);
+    }
+  }
+}
+
+function acknowledgeAuthoritativeMoveTelemetry(data = null, authoritativePlayer = null) {
+  const acceptedSeq = Math.max(0, Math.floor(Number(data?.acceptedCommandSeq ?? 0) || 0));
+  if (!acceptedSeq) return;
+  if (!authoritativeMoveTelemetryRuntime.pendingBySeq.size) return;
+  const ackAt = Date.now();
+  const keys = [...authoritativeMoveTelemetryRuntime.pendingBySeq.keys()]
+    .filter((seq) => seq <= acceptedSeq)
+    .sort((a, b) => a - b);
+  if (!keys.length) return;
+  for (const seq of keys) {
+    const record = authoritativeMoveTelemetryRuntime.pendingBySeq.get(seq);
+    authoritativeMoveTelemetryRuntime.pendingBySeq.delete(seq);
+    if (!record) continue;
+    const rttMs = Math.max(0, ackAt - Math.max(0, Number(record.sendAt ?? ackAt) || ackAt));
+    const inputToAckMs = Math.max(0, ackAt - normalizeAuthoritativeMoveInputAt(record.inputAt ?? ackAt));
+    const authX = Math.floor(Number(authoritativePlayer?.x ?? 0) || 0);
+    const authY = Math.floor(Number(authoritativePlayer?.y ?? 0) || 0);
+    let correctionDist = 0;
+    if (Number.isFinite(Number(record.expectedX)) && Number.isFinite(Number(record.expectedY))) {
+      correctionDist = Math.abs(authX - Math.floor(Number(record.expectedX))) + Math.abs(authY - Math.floor(Number(record.expectedY)));
+    }
+    const moveCount = Math.max(1, Array.isArray(record.dirs) ? record.dirs.length : 1);
+    authoritativeMoveTelemetryRuntime.totals.acked += moveCount;
+    authoritativeMoveTelemetryRuntime.totals.totalRttMs += rttMs;
+    authoritativeMoveTelemetryRuntime.totals.totalInputToAckMs += inputToAckMs;
+    authoritativeMoveTelemetryRuntime.totals.totalCorrectionDist += correctionDist;
+    if (correctionDist > 0) authoritativeMoveTelemetryRuntime.totals.corrected += 1;
+    authoritativeMoveTelemetryRuntime.last = {
+      seq,
+      rttMs,
+      inputToAckMs,
+      correctionDist,
+      authX,
+      authY,
+      queueDepthAtSend: Math.max(0, Math.floor(Number(record.queueDepthAtSend ?? 0) || 0)),
+      tickMs: Math.max(0, Math.floor(Number(data?.tick?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())),
+      pending: authoritativeMoveTelemetryRuntime.pendingBySeq.size,
+      at: ackAt,
+    };
+  }
+}
+
+function authoritativeMoveDiagnosticsLabel() {
+  const totals = authoritativeMoveTelemetryRuntime.totals;
+  const acked = Math.max(0, Math.floor(Number(totals.acked ?? 0) || 0));
+  if (acked <= 0) return "MOVE diag: collecting...";
+  const avgRtt = Math.round((Number(totals.totalRttMs ?? 0) / Math.max(1, acked)) * 10) / 10;
+  const avgInputVisual = Math.round((Number(totals.totalInputToVisualMs ?? 0) / Math.max(1, Number(totals.predicted ?? 0) || 1)) * 10) / 10;
+  const avgInputAck = Math.round((Number(totals.totalInputToAckMs ?? 0) / Math.max(1, acked)) * 10) / 10;
+  const correctionRate = Math.round((Number(totals.corrected ?? 0) / Math.max(1, acked)) * 1000) / 10;
+  const avgCorrection = Math.round((Number(totals.totalCorrectionDist ?? 0) / Math.max(1, acked)) * 100) / 100;
+  const last = authoritativeMoveTelemetryRuntime.last;
+  const tickMs = Math.max(0, Math.floor(Number(last?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs()));
+  const pending = authoritativeMoveTelemetryRuntime.pendingBySeq.size;
+  const lead = authoritativePredictedMoveLead();
+  return `MOVE diag: tick ${tickMs}ms | RTT ${avgRtt}ms | input->visual ${avgInputVisual}ms | input->ack ${avgInputAck}ms | corr ${correctionRate}% avg ${avgCorrection} | lead ${lead} | pending ${pending}`;
 }
 
 function scheduleAuthoritativeQueueDrain(delayMs = 0) {
@@ -2057,7 +2499,7 @@ function shouldDropAuthoritativeCommand(command, options = null) {
   return true;
 }
 
-function tryApplyImmediateAuthoritativeMovePrediction(command) {
+function tryApplyImmediateAuthoritativeMovePrediction(command, trace = null) {
   if (!command || typeof command !== "object") return false;
   if (String(command.type ?? "").trim().toUpperCase() !== "MOVE") return false;
   if (!game?.player || !game?.world) return false;
@@ -2065,6 +2507,8 @@ function tryApplyImmediateAuthoritativeMovePrediction(command) {
   if (!delta) return false;
   const p = game.player;
   if (p.dead) return false;
+  const startX = Number(p.x ?? 0);
+  const startY = Number(p.y ?? 0);
   const nx = p.x + delta.dx;
   const ny = p.y + delta.dy;
   const nz = p.z;
@@ -2079,6 +2523,14 @@ function tryApplyImmediateAuthoritativeMovePrediction(command) {
   p.y = ny;
   p.attackAfterMove = true;
   game.lastPlayerActionKind = "move";
+  if (trace && typeof trace === "object") {
+    trace.startX = Math.floor(startX);
+    trace.startY = Math.floor(startY);
+    trace.endX = Math.floor(nx);
+    trace.endY = Math.floor(ny);
+    trace.predictedAt = Date.now();
+  }
+  noteAuthoritativeVisualPlayerTarget(nx, ny, startX, startY);
   computeVisibility(game);
   hydrateNearby(game);
   updateContextActionButton(game);
@@ -2120,6 +2572,7 @@ function drainAuthoritativeCommandQueue() {
     const nextType = String(next.command.type ?? "").trim().toUpperCase();
     let commandToSend = next.command;
     let optionsToSend = next.options;
+    const consumedEntries = [next];
     if (nextType === "MOVE") {
       const dirs = [];
       const firstDir = String(next.command.dir ?? "").trim().toUpperCase();
@@ -2131,7 +2584,8 @@ function drainAuthoritativeCommandQueue() {
         if (!peek?.command || typeof peek.command !== "object") break;
         const peekType = String(peek.command.type ?? "").trim().toUpperCase();
         if (peekType !== "MOVE") break;
-        authoritativeCommandQueue.shift();
+        const shifted = authoritativeCommandQueue.shift();
+        if (shifted && typeof shifted === "object") consumedEntries.push(shifted);
         const peekDir = String(peek.command.dir ?? "").trim().toUpperCase();
         if (peekDir === "N" || peekDir === "S" || peekDir === "E" || peekDir === "W") {
           dirs.push(peekDir);
@@ -2146,6 +2600,54 @@ function drainAuthoritativeCommandQueue() {
       }
     }
     if (shouldDropAuthoritativeCommand(commandToSend, { suppressWallLog: true })) continue;
+    const commandKind = String(commandToSend?.type ?? "").trim().toUpperCase();
+    const predictedSteps = [];
+    for (const consumed of consumedEntries) {
+      if (!consumed || typeof consumed !== "object") continue;
+      if (consumed.predicted !== true) continue;
+      if (!consumed.predictedTrace || typeof consumed.predictedTrace !== "object") continue;
+      predictedSteps.push({
+        dir: String(consumed.predictedTrace.dir ?? consumed.command?.dir ?? "").trim().toUpperCase(),
+        startX: Math.floor(Number(consumed.predictedTrace.startX ?? 0) || 0),
+        startY: Math.floor(Number(consumed.predictedTrace.startY ?? 0) || 0),
+        endX: Math.floor(Number(consumed.predictedTrace.endX ?? 0) || 0),
+        endY: Math.floor(Number(consumed.predictedTrace.endY ?? 0) || 0),
+        predictedAt: normalizeAuthoritativeMoveInputAt(consumed.predictedTrace.predictedAt ?? Date.now()),
+        inputAt: normalizeAuthoritativeMoveInputAt(consumed.predictedInputAt ?? consumed.options?.inputAt ?? Date.now()),
+      });
+    }
+    let predictionAlreadyApplied = false;
+    if (AUTHORITATIVE_CLIENT_PREDICTION_ENABLED && (commandKind === "MOVE" || commandKind === "MOVE_BATCH")) {
+      predictionAlreadyApplied = consumedEntries.some((entry) => {
+        if (!entry || typeof entry !== "object") return false;
+        if (!isAuthoritativeMoveCommand(entry.command)) return false;
+        return entry.predicted === true;
+      });
+      if (!predictionAlreadyApplied && commandKind === "MOVE" && canPredictAuthoritativeMoveNow()) {
+        const trace = {};
+        predictionAlreadyApplied = tryApplyImmediateAuthoritativeMovePrediction(commandToSend, trace);
+        if (predictionAlreadyApplied) {
+          predictedSteps.push({
+            dir: String(commandToSend?.dir ?? "").trim().toUpperCase(),
+            startX: Math.floor(Number(trace.startX ?? 0) || 0),
+            startY: Math.floor(Number(trace.startY ?? 0) || 0),
+            endX: Math.floor(Number(trace.endX ?? 0) || 0),
+            endY: Math.floor(Number(trace.endY ?? 0) || 0),
+            predictedAt: normalizeAuthoritativeMoveInputAt(trace.predictedAt ?? Date.now()),
+            inputAt: normalizeAuthoritativeMoveInputAt(next?.options?.inputAt ?? Date.now()),
+          });
+        }
+      }
+      authoritativePredictionRuntime.inFlightMovePredicted = predictionAlreadyApplied;
+    } else {
+      authoritativePredictionRuntime.inFlightMovePredicted = false;
+    }
+    optionsToSend = {
+      ...(optionsToSend && typeof optionsToSend === "object" ? optionsToSend : {}),
+      queuedDispatch: true,
+      predictionAlreadyApplied,
+      predictedSteps,
+    };
     void performAuthoritativeCommand(commandToSend, optionsToSend);
     return true;
   }
@@ -2179,6 +2681,7 @@ function normalizeLoadedStateCollections(state) {
   }
   ensureAreaRespawnState(state);
   ensureDoorMutationState(state);
+  ensureLiveSimulationState(state);
   return state;
 }
 
@@ -2231,6 +2734,20 @@ function activateLoadedGameState(nextGame, reason = "load") {
 function applyAuthoritativeSnapshotToGame(response, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const data = (response && typeof response === "object") ? response : {};
+  const runtimeSessionId = String(authoritativePredictionRuntime.lastSessionId ?? "").trim();
+  const incomingSessionId = String(data?.sessionId ?? "").trim();
+  const allowSessionChange = opts.allowSessionChange === true;
+  if (incomingSessionId && runtimeSessionId && incomingSessionId !== runtimeSessionId && !allowSessionChange) {
+    return true;
+  }
+  if (
+    incomingSessionId &&
+    incomingSessionId !== runtimeSessionId &&
+    (allowSessionChange || !runtimeSessionId)
+  ) {
+    resetAuthoritativePredictionRuntime(incomingSessionId);
+  }
+  if (isAuthoritativeResponseStale(data)) return true;
   const resolvedPayload = resolveAuthoritativeResponsePayload(data);
   const payload = String(resolvedPayload?.payload ?? "").trim();
   if (!payload) return false;
@@ -2244,7 +2761,7 @@ function applyAuthoritativeSnapshotToGame(response, options = null) {
   const hotDeltaApplied = (
     isAuthoritativeSessionActive() &&
     game &&
-    data?.hotDelta &&
+    shouldApplyAuthoritativeHotDelta(data) &&
     applyAuthoritativeHotDeltaToState(game, data.hotDelta)
   );
   if (hotDeltaApplied) {
@@ -2255,7 +2772,12 @@ function applyAuthoritativeSnapshotToGame(response, options = null) {
     nextState = loaded;
   }
   applyAuthoritativeResponseToMirror(authoritativeMirror, mirrorResponse);
+  noteAppliedAuthoritativeResponse(data);
+  noteAuthoritativeTickFromResponse(data);
   if (!activateLoadedGameState(nextState, reason)) return false;
+  acknowledgeAuthoritativeMoveTelemetry(data, game?.player ?? null);
+  replayQueuedAuthoritativeMovePredictions();
+  updateDebugQuickSwitchStatus(game);
   if (Array.isArray(data?.saves)) saveMenuUi.saves = data.saves;
   if (data?.save?.id) {
     const saveId = String(data.save.id ?? "").trim();
@@ -2296,30 +2818,71 @@ async function performAuthoritativeCommand(command, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const queueable = canQueueAuthoritativeCommand(command);
   const commandType = String(command.type ?? "").trim().toUpperCase();
-  const movementSource = String(opts.movementSource ?? "").trim();
+  const movementCommand = commandType === "MOVE" || commandType === "MOVE_BATCH";
+  const predictionAlreadyApplied = opts.predictionAlreadyApplied === true;
+  const dispatchPredictedSteps = Array.isArray(opts.predictedSteps)
+    ? opts.predictedSteps.filter((step) => step && typeof step === "object")
+    : [];
   let optimisticMoveApplied = false;
   let optimisticAttackApplied = false;
   const now = Date.now();
   if (now < authoritativeRateLimitRuntime.blockedUntil) {
     if (queueable) {
-      enqueueAuthoritativeCommand(command, opts);
+      const queuedEntry = enqueueAuthoritativeCommand(command, opts);
+      if (
+        AUTHORITATIVE_CLIENT_PREDICTION_ENABLED &&
+        queuedEntry &&
+        commandType === "MOVE" &&
+        canPredictAuthoritativeMoveNow()
+      ) {
+        applyPredictedMoveToQueueEntry(queuedEntry, command, opts.inputAt ?? Date.now());
+      }
       scheduleAuthoritativeQueueDrain(authoritativeRateLimitRuntime.blockedUntil - now);
     }
     return Promise.resolve(false);
   }
   if (authoritativeMirror.inFlight) {
     if (queueable) {
-      enqueueAuthoritativeCommand(command, opts);
-      if (commandType === "MOVE") {
-        tryApplyImmediateAuthoritativeMovePrediction(command);
+      const queuedEntry = enqueueAuthoritativeCommand(command, opts);
+      if (
+        AUTHORITATIVE_CLIENT_PREDICTION_ENABLED &&
+        queuedEntry &&
+        commandType === "MOVE" &&
+        canPredictAuthoritativeMoveNow()
+      ) {
+        applyPredictedMoveToQueueEntry(queuedEntry, command, opts.inputAt ?? Date.now());
       }
     }
     return Promise.resolve(false);
   }
   if (shouldDropAuthoritativeCommand(command)) return false;
-  if (queueable) optimisticMoveApplied = tryApplyImmediateAuthoritativeMovePrediction(command);
-  else if (commandType === "ATTACK" || commandType === "ACTIVATE_ABILITY") {
-    optimisticAttackApplied = tryApplyImmediateAuthoritativeAttackPrediction(command);
+  let directPredictedStep = null;
+  if (movementCommand) {
+    if (AUTHORITATIVE_CLIENT_PREDICTION_ENABLED && predictionAlreadyApplied) optimisticMoveApplied = true;
+    else if (AUTHORITATIVE_CLIENT_PREDICTION_ENABLED && queueable && canPredictAuthoritativeMoveNow()) {
+      const trace = {};
+      optimisticMoveApplied = tryApplyImmediateAuthoritativeMovePrediction(command, trace);
+      if (optimisticMoveApplied) {
+        directPredictedStep = {
+          dir: String(command?.dir ?? "").trim().toUpperCase(),
+          startX: Math.floor(Number(trace.startX ?? 0) || 0),
+          startY: Math.floor(Number(trace.startY ?? 0) || 0),
+          endX: Math.floor(Number(trace.endX ?? 0) || 0),
+          endY: Math.floor(Number(trace.endY ?? 0) || 0),
+          predictedAt: normalizeAuthoritativeMoveInputAt(trace.predictedAt ?? Date.now()),
+          inputAt: normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now()),
+        };
+        dispatchPredictedSteps.push(directPredictedStep);
+      }
+    }
+    authoritativePredictionRuntime.inFlightMovePredicted = optimisticMoveApplied;
+  } else if (commandType === "ATTACK" || commandType === "ACTIVATE_ABILITY") {
+    authoritativePredictionRuntime.inFlightMovePredicted = false;
+    if (AUTHORITATIVE_ATTACK_PREDICTION_ENABLED) {
+      optimisticAttackApplied = tryApplyImmediateAuthoritativeAttackPrediction(command);
+    }
+  } else {
+    authoritativePredictionRuntime.inFlightMovePredicted = false;
   }
   if (commandType === "ATTACK" || commandType === "ACTIVATE_ABILITY") {
     const target = findMonsterForAuthoritativeCommand(game, command);
@@ -2329,10 +2892,19 @@ async function performAuthoritativeCommand(command, options = null) {
     type: commandType,
     reason: String(opts.reason ?? command.type ?? "authoritative-command"),
   });
+  let clientCommandSeq = 0;
   try {
+    clientCommandSeq = nextServerMirrorCommandSeq(authoritativeMirror);
+    if (movementCommand) {
+      noteAuthoritativeMoveDispatch(clientCommandSeq, command, {
+        predictedSteps: dispatchPredictedSteps,
+        inputAt: opts.inputAt ?? Date.now(),
+        queueDepth: authoritativeCommandQueue.length,
+      });
+    }
     const response = await authoritativeApi.sendCommand({
       sessionId: authoritativeMirror.sessionId,
-      clientCommandSeq: nextServerMirrorCommandSeq(authoritativeMirror),
+      clientCommandSeq,
       command,
     });
     const applied = applyAuthoritativeSnapshotToGame(response, {
@@ -2350,11 +2922,30 @@ async function performAuthoritativeCommand(command, options = null) {
     }
     return !!response?.ok;
   } catch (err) {
+    if (movementCommand && clientCommandSeq > 0) {
+      authoritativeMoveTelemetryRuntime.pendingBySeq.delete(clientCommandSeq);
+    }
     if (String(err?.response?.status_code ?? "") === "429") {
       const delayMs = authoritativeRateLimitDelayMs(err);
       authoritativeRateLimitRuntime.blockedUntil = Date.now() + delayMs;
       if (queueable) {
-        enqueueAuthoritativeCommand(command, opts);
+        const queuedEntry = enqueueAuthoritativeCommand(command, opts);
+        if (AUTHORITATIVE_CLIENT_PREDICTION_ENABLED && queuedEntry && commandType === "MOVE") {
+          if (optimisticMoveApplied && directPredictedStep) {
+            queuedEntry.predicted = true;
+            queuedEntry.predictedInputAt = normalizeAuthoritativeMoveInputAt(directPredictedStep.inputAt);
+            queuedEntry.predictedTrace = {
+              dir: directPredictedStep.dir,
+              startX: directPredictedStep.startX,
+              startY: directPredictedStep.startY,
+              endX: directPredictedStep.endX,
+              endY: directPredictedStep.endY,
+              predictedAt: directPredictedStep.predictedAt,
+            };
+          } else if (canPredictAuthoritativeMoveNow()) {
+            applyPredictedMoveToQueueEntry(queuedEntry, command, opts.inputAt ?? Date.now());
+          }
+        }
         scheduleAuthoritativeQueueDrain(delayMs + 5);
         const warnNow = Date.now();
         if ((warnNow - authoritativeRateLimitRuntime.lastWarnAt) > 2000 && game?.log) {
@@ -2364,13 +2955,37 @@ async function performAuthoritativeCommand(command, options = null) {
         }
       } else if (String(command?.type ?? "").trim().toUpperCase() === "MOVE_BATCH") {
         const dirs = Array.isArray(command?.dirs) ? command.dirs : [];
+        let carriedPrediction = optimisticMoveApplied;
+        let carriedTrace = dispatchPredictedSteps.length ? dispatchPredictedSteps[0] : null;
         for (const dirRaw of dirs) {
           const dir = String(dirRaw ?? "").trim().toUpperCase();
           if (dir !== "N" && dir !== "S" && dir !== "E" && dir !== "W") continue;
-          enqueueAuthoritativeCommand({ type: "MOVE", dir }, opts);
+          const queuedEntry = enqueueAuthoritativeCommand({ type: "MOVE", dir }, opts);
+          if (!queuedEntry) continue;
+          if (AUTHORITATIVE_CLIENT_PREDICTION_ENABLED && carriedPrediction) {
+            queuedEntry.predicted = true;
+            queuedEntry.predictedInputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now());
+            if (carriedTrace && typeof carriedTrace === "object") {
+              queuedEntry.predictedTrace = {
+                dir: String(carriedTrace.dir ?? dir).trim().toUpperCase(),
+                startX: Math.floor(Number(carriedTrace.startX ?? 0) || 0),
+                startY: Math.floor(Number(carriedTrace.startY ?? 0) || 0),
+                endX: Math.floor(Number(carriedTrace.endX ?? 0) || 0),
+                endY: Math.floor(Number(carriedTrace.endY ?? 0) || 0),
+                predictedAt: normalizeAuthoritativeMoveInputAt(carriedTrace.predictedAt ?? Date.now()),
+              };
+            }
+            carriedPrediction = false;
+            carriedTrace = null;
+            continue;
+          }
+          if (AUTHORITATIVE_CLIENT_PREDICTION_ENABLED && canPredictAuthoritativeMoveNow()) {
+            applyPredictedMoveToQueueEntry(queuedEntry, { type: "MOVE", dir }, opts.inputAt ?? Date.now());
+          }
         }
         scheduleAuthoritativeQueueDrain(delayMs + 5);
       }
+      authoritativePredictionRuntime.inFlightMovePredicted = false;
       return false;
     }
     const message = authoritativeErrorMessage(err, "Authoritative command failed.");
@@ -2378,6 +2993,7 @@ async function performAuthoritativeCommand(command, options = null) {
       pushLog(game, message);
       renderLog(game);
     }
+    authoritativePredictionRuntime.inFlightMovePredicted = false;
     if (optimisticMoveApplied) {
       void requestAuthoritativeResync("move-prediction-recover");
     }
@@ -2390,9 +3006,105 @@ async function performAuthoritativeCommand(command, options = null) {
     return false;
   } finally {
     setAuthoritativeInputLock(false);
+    authoritativePredictionRuntime.inFlightMovePredicted = false;
     updateContextActionButton(game);
     drainAuthoritativeCommandQueue();
   }
+}
+
+function stopAuthoritativeMovementPollLoop() {
+  authoritativeMovementChannelRuntime.stopRequested = true;
+  try {
+    authoritativeMovementChannelRuntime.abortController?.abort();
+  } catch {}
+  authoritativeMovementChannelRuntime.abortController = null;
+  authoritativeMovementChannelRuntime.sessionId = "";
+}
+
+async function runAuthoritativeMovementPollLoop(sessionId = "") {
+  const sid = String(sessionId ?? "").trim();
+  if (!sid) return false;
+  if (!isAuthoritativeMovementStreamAvailable()) {
+    noteAuthoritativeMovementStreamCompatibilityFallback();
+    return false;
+  }
+  if (authoritativeMovementChannelRuntime.pollInFlight) return false;
+  authoritativeMovementChannelRuntime.stopRequested = false;
+  authoritativeMovementChannelRuntime.sessionId = sid;
+  while (
+    !authoritativeMovementChannelRuntime.stopRequested &&
+    isAuthoritativeSessionActive() &&
+    String(authoritativeMirror.sessionId ?? "").trim() === sid
+  ) {
+    authoritativeMovementChannelRuntime.pollInFlight = true;
+    const controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    authoritativeMovementChannelRuntime.abortController = controller;
+    try {
+      const response = await authoritativeApi.pollMovement({
+        sessionId: sid,
+        timeoutMs: AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS,
+        signal: controller?.signal,
+      });
+      if (
+        authoritativeMovementChannelRuntime.stopRequested ||
+        !isAuthoritativeSessionActive() ||
+        String(authoritativeMirror.sessionId ?? "").trim() !== sid
+      ) {
+        break;
+      }
+      if (response?.changed && response?.snapshot) {
+        applyAuthoritativeSnapshotToGame(response, {
+          markDirty: !!response?.ok,
+          dirtyReason: "move-stream",
+          reason: "move-stream",
+        });
+      } else if (response?.tick) {
+        noteAuthoritativeTickFromResponse(response);
+      }
+    } catch (err) {
+      if (authoritativeMovementChannelRuntime.stopRequested) break;
+      if (String(err?.name ?? "").trim() === "AbortError") break;
+      if (shouldDisableAuthoritativeMovementStream(err)) {
+        disableAuthoritativeMovementStream("poll-error", err);
+        break;
+      }
+      const now = Date.now();
+      if ((now - authoritativeMovementChannelRuntime.lastErrorAt) > 2000 && game?.log) {
+        pushLog(game, authoritativeErrorMessage(err, "Movement stream interrupted."));
+        renderLog(game);
+        authoritativeMovementChannelRuntime.lastErrorAt = now;
+      }
+      await new Promise((resolve) => setTimeout(resolve, AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS));
+    } finally {
+      if (authoritativeMovementChannelRuntime.abortController === controller) {
+        authoritativeMovementChannelRuntime.abortController = null;
+      }
+      authoritativeMovementChannelRuntime.pollInFlight = false;
+    }
+  }
+  if (String(authoritativeMovementChannelRuntime.sessionId ?? "").trim() === sid) {
+    authoritativeMovementChannelRuntime.sessionId = "";
+  }
+  return true;
+}
+
+function restartAuthoritativeMovementPollLoop() {
+  if (HEADLESS_RUNTIME) return;
+  if (!isAuthoritativeMovementStreamAvailable()) {
+    stopAuthoritativeMovementPollLoop();
+    noteAuthoritativeMovementStreamCompatibilityFallback();
+    return;
+  }
+  if (!isAuthoritativeSessionActive()) return;
+  const sid = String(authoritativeMirror.sessionId ?? "").trim();
+  if (!sid) return;
+  const activeSid = String(authoritativeMovementChannelRuntime.sessionId ?? "").trim();
+  if (activeSid && activeSid !== sid) {
+    stopAuthoritativeMovementPollLoop();
+  }
+  if (authoritativeMovementChannelRuntime.pollInFlight && activeSid === sid) return;
+  authoritativeMovementChannelRuntime.stopRequested = false;
+  void runAuthoritativeMovementPollLoop(sid);
 }
 
 function stopAuthoritativeSessionTouchLoop() {
@@ -2460,6 +3172,7 @@ function restartAuthoritativeSessionTouchLoop() {
     void touchAuthoritativeSession("interval");
     void runAuthoritativeLockAudit("interval");
   }, AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS);
+  restartAuthoritativeMovementPollLoop();
   void touchAuthoritativeSession("startup");
   void runAuthoritativeLockAudit("startup");
 }
@@ -2470,9 +3183,14 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
   const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
   if (!sessionId) return false;
   lifecycleAuthoritativeCloseRequested = true;
+  keyboardMovementHolds.clear();
+  authoritativeMovementIntentBySource.clear();
   clearAuthoritativeCommandQueue();
+  resetAuthoritativePredictionRuntime("");
+  resetAuthoritativeTickRuntime();
   clearAuthoritativeRateLimitTimer();
   stopAuthoritativeSessionTouchLoop();
+  stopAuthoritativeMovementPollLoop();
   void authoritativeApi.closeSession({
     sessionId,
     reason: String(reason ?? "").trim() || "lifecycle-close",
@@ -2482,7 +3200,12 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
 }
 
 async function openAuthoritativeSessionForSelection(characterId = "", options = null) {
+  stopAuthoritativeMovementPollLoop();
+  keyboardMovementHolds.clear();
+  authoritativeMovementIntentBySource.clear();
   clearAuthoritativeCommandQueue();
+  clearAuthoritativeMoveTelemetry();
+  resetAuthoritativeTickRuntime();
   clearAuthoritativeRateLimitTimer();
   authoritativeRateLimitRuntime.blockedUntil = 0;
   const opts = (options && typeof options === "object") ? options : {};
@@ -2495,6 +3218,7 @@ async function openAuthoritativeSessionForSelection(characterId = "", options = 
   const applied = applyAuthoritativeSnapshotToGame(response, {
     clearDirty: true,
     reason: String(opts.reason ?? "open-session"),
+    allowSessionChange: true,
   });
   if (!applied) throw new Error("Authoritative session snapshot was invalid.");
   return response;
@@ -2503,7 +3227,12 @@ async function openAuthoritativeSessionForSelection(characterId = "", options = 
 async function switchAuthoritativeCharacter(characterId = "", options = null) {
   const targetId = String(characterId ?? "").trim();
   if (!targetId) return false;
+  stopAuthoritativeMovementPollLoop();
+  keyboardMovementHolds.clear();
+  authoritativeMovementIntentBySource.clear();
   clearAuthoritativeCommandQueue();
+  clearAuthoritativeMoveTelemetry();
+  resetAuthoritativeTickRuntime();
   clearAuthoritativeRateLimitTimer();
   authoritativeRateLimitRuntime.blockedUntil = 0;
   const opts = (options && typeof options === "object") ? options : {};
@@ -2521,6 +3250,7 @@ async function switchAuthoritativeCharacter(characterId = "", options = null) {
     return applyAuthoritativeSnapshotToGame(response, {
       clearDirty: true,
       reason: String(opts.reason ?? "switch-character"),
+      allowSessionChange: true,
     });
   } catch (err) {
     if (game?.log) {
@@ -2885,14 +3615,16 @@ function ensureDebugQuickSwitchClassOptions() {
 }
 function updateDebugQuickSwitchStatus(state) {
   if (!debugQuickSwitchStatusEl) return;
+  const diag = isAuthoritativeSessionActive() ? authoritativeMoveDiagnosticsLabel() : "";
+  const diagSuffix = diag ? ` | ${diag}` : "";
   const active = isQuickSwitchCharacterActive(state);
   if (!active) {
-    debugQuickSwitchStatusEl.textContent = "Quick characters are temporary and never saved.";
+    debugQuickSwitchStatusEl.textContent = `Quick characters are temporary and never saved.${diagSuffix}`;
     debugQuickSwitchStatusEl.classList.remove("active");
     return;
   }
   const classId = normalizeCharacterClassId(state?.player?.classId ?? state?.character?.classId ?? "");
-  debugQuickSwitchStatusEl.textContent = `Quick active: ${quickSwitchClassLabel(classId)} (not saved). Load a real character to switch back.`;
+  debugQuickSwitchStatusEl.textContent = `Quick active: ${quickSwitchClassLabel(classId)} (not saved). Load a real character to switch back.${diagSuffix}`;
   debugQuickSwitchStatusEl.classList.add("active");
 }
 function enforceAdminControlPolicy(state) {
@@ -8406,6 +9138,10 @@ function applyCharacterSnapshot(state, snapshot) {
   p.attackAfterMove = false;
   p.abilityCd = 0;
   p.dead = false;
+  p.live = normalizeLiveCombatActorState(p.live ?? null, "player");
+  p.live.cooldowns.abilityTicks = 0;
+  p.live.action = normalizeLiveActionTimelineState(null);
+  p.live.intent.autoRetaliate = true;
   state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
     speciesId: profile.speciesId,
     classId: profile.classId,
@@ -8416,6 +9152,7 @@ function applyCharacterSnapshot(state, snapshot) {
   const snapHp = Math.max(0, Math.floor(snapPlayer.hp ?? p.hp ?? snapMaxHp));
   const hpRatio = clamp(snapHp / snapMaxHp, 0, 1);
   recalcDerivedStats(state);
+  ensureLiveSimulationState(state);
   p.hp = clamp(Math.round((p.maxHp ?? 1) * hpRatio), 0, p.maxHp ?? 1);
   p.energy = p.energyMax;
   touchCharacterProgress(state);
@@ -10658,6 +11395,7 @@ function abilityAttackMonster(state, monster, ability, {
 } = {}) {
   if (!monster || monster.kind !== "monster") return false;
   const p = state.player;
+  const combatClock = liveTickCombatEnabled(state) ? currentLiveSimulationTick(state) : (state.turn ?? 0);
   const dist = Math.abs((monster.x ?? 0) - p.x) + Math.abs((monster.y ?? 0) - p.y);
   if (requiresLos && !hasLineOfSight(state.world, p.z, p.x, p.y, monster.x, monster.y)) {
     pushLog(state, `${ability.label} cannot find a clear line.`);
@@ -10667,8 +11405,8 @@ function abilityAttackMonster(state, monster, ability, {
   const attackAcc = Math.max(1, Math.round((p.acc ?? 70) + accuracyBonus));
   if (!rollHit(attackAcc, spec.eva ?? 0)) {
     monster.awake = true;
-    rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
-    alertMonsterPack(state, monster, p, monsterAlertRadius(spec));
+    rememberMonsterPlayerPosition(monster, p, combatClock);
+    alertMonsterPack(state, monster, p, monsterAlertRadius(spec), combatClock);
     persistMonsterOverride(state, monster);
     pushLog(state, `${ability.label} misses the ${monsterDisplayName(monster, p.z)}.`);
     return true;
@@ -10696,8 +11434,8 @@ function abilityAttackMonster(state, monster, ability, {
   });
   monster.hp = Math.max(0, hpBefore - attack.dmg);
   monster.awake = true;
-  rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
-  alertMonsterPack(state, monster, p, monsterAlertRadius(spec));
+  rememberMonsterPlayerPosition(monster, p, combatClock);
+  alertMonsterPack(state, monster, p, monsterAlertRadius(spec), combatClock);
   persistMonsterOverride(state, monster);
   const applied = Math.max(0, Math.min(attack.dmg, hpBefore));
   markCombatEvent(state, monster);
@@ -10724,7 +11462,7 @@ function deployPlayerTrap(state, trapFamily = "pressure_plate") {
     pushLog(state, "No adjacent tile is clear enough for a trap.");
     return false;
   }
-  const trapId = `dyn_trap|${trapFamily}|${state.turn}|${target.x},${target.y}`;
+  const trapId = `dyn_trap|${trapFamily}|${liveTickCombatEnabled(state) ? currentLiveSimulationTick(state) : (state.turn ?? 0)}|${target.x},${target.y}`;
   const trap = {
     id: trapId,
     origin: "dynamic",
@@ -10744,27 +11482,25 @@ function deployPlayerTrap(state, trapFamily = "pressure_plate") {
     payload: {},
     friendlyTo: "player",
     ownerId: state.character?.id ?? "player",
+    live: normalizeLiveCombatActorState(null, "trap"),
   };
+  if (liveTickCombatEnabled(state)) {
+    scheduleLiveTrapArming(trap, currentLiveSimulationTick(state));
+  }
   state.dynamic.set(trapId, trap);
   state.entities.set(trapId, trap);
-  pushLog(state, `You deploy ${trapDisplayName(trap).toLowerCase()}.`);
+  if (liveTickCombatEnabled(state) && trap.armed === false) {
+    pushLog(state, `You deploy ${trapDisplayName(trap).toLowerCase()}; it begins arming.`);
+  } else {
+    pushLog(state, `You deploy ${trapDisplayName(trap).toLowerCase()}.`);
+  }
   return true;
 }
 
-function usePlayerActiveAbility(state, ability = null, explicitTarget = null, occupancy = null) {
-  if (isAuthoritativeSessionActive()) {
-    const p = state?.player;
-    const resolvedAbility = ability ?? playerActiveAbility(state);
-    if (!p || p.dead || !resolvedAbility || !canPlayerUseActiveAbility(p, resolvedAbility)) return false;
-    return performAuthoritativeCommand(
-      abilityCommand(resolvedAbility.id, explicitTarget),
-      { reason: "activate-ability" }
-    );
-  }
+function resolvePlayerAbilityEffect(state, ability = null, explicitTarget = null, occupancy = null) {
   const p = state?.player;
-  if (!p || p.dead) return false;
-  const resolvedAbility = ability ?? playerActiveAbility(state);
-  if (!resolvedAbility || !canPlayerUseActiveAbility(p, resolvedAbility)) return false;
+  if (!p || p.dead || !ability) return false;
+  const resolvedAbility = ability;
   const occ = occupancy ?? getCachedOccupancy(state);
 
   let spent = false;
@@ -10858,6 +11594,25 @@ function usePlayerActiveAbility(state, ability = null, explicitTarget = null, oc
     }
   }
 
+  return spent;
+}
+
+function usePlayerActiveAbility(state, ability = null, explicitTarget = null, occupancy = null) {
+  if (isAuthoritativeSessionActive()) {
+    const p = state?.player;
+    const resolvedAbility = ability ?? playerActiveAbility(state);
+    if (!p || p.dead || !resolvedAbility || !canPlayerUseActiveAbility(p, resolvedAbility)) return false;
+    return performAuthoritativeCommand(
+      abilityCommand(resolvedAbility.id, explicitTarget),
+      { reason: "activate-ability" }
+    );
+  }
+  const p = state?.player;
+  if (!p || p.dead) return false;
+  const resolvedAbility = ability ?? playerActiveAbility(state);
+  if (!resolvedAbility || !canPlayerUseActiveAbility(p, resolvedAbility)) return false;
+  const occ = occupancy ?? getCachedOccupancy(state);
+  const spent = resolvePlayerAbilityEffect(state, resolvedAbility, explicitTarget, occ);
   if (!spent) return false;
   if (!spendActiveAbility(state, resolvedAbility)) return false;
   state.lastPlayerActionKind = "ability";
@@ -12378,6 +13133,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     effects: [],
     classId: characterProfile.classId,
     speciesId: characterProfile.speciesId,
+    live: normalizeLiveCombatActorState(null, "player"),
   };
 
   const state = {
@@ -12408,6 +13164,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
     debug: normalizeDebugFlags(),
     analytics: null,
+    live: normalizeLiveSimulationState(null),
   };
 
   if (carryover) {
@@ -12439,6 +13196,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
 
   ensureCharacterState(state);
   recalcDerivedStats(state);
+  ensureLiveSimulationState(state);
   state.analytics = initializeAnalyticsForState(state, null, "new-game");
   if (carryover) pushLog(state, "A fresh dungeon forms around your enduring character.");
   else pushLog(state, "You enter the dungeon...");
@@ -12484,6 +13242,7 @@ function hydrateChunkEntities(state, z, cx, cy) {
       cd,
       abilityCd: Math.max(0, Math.floor(ov?.abilityCd ?? 0)),
       effects,
+      live: normalizeLiveCombatActorState(ov?.live ?? null, "monster"),
     });
   }
 
@@ -12544,6 +13303,7 @@ function hydrateChunkEntities(state, z, cx, cy) {
         : ((trap.payload && typeof trap.payload === "object") ? { ...trap.payload } : {}),
       friendlyTo: String(ov?.friendlyTo ?? trap.friendlyTo ?? "").trim().toLowerCase(),
       ownerId: ov?.ownerId ?? trap.ownerId ?? "",
+      live: normalizeLiveCombatActorState(ov?.live ?? null, "trap"),
     });
   }
 
@@ -14720,6 +15480,8 @@ function handleMonsterDefeat(state, monster, options = null) {
   if (!monster || monster.kind !== "monster") return;
   const opts = (options && typeof options === "object") ? options : {};
   const p = state.player;
+  clearLivePlayerCombatTarget(state, monster.id);
+  clearLiveTelegraphForAction(state, String(monster?.live?.action?.currentActionId ?? "").trim());
   const xpMult = Math.max(0, Number(opts.xpMult ?? 1));
   const mSpec = monsterStatsForDepth(monster.type, monster.z ?? p.z);
   pushLog(state, String(opts.deathMessage ?? `The ${monsterDisplayName(monster, p.z)} dies.`));
@@ -14769,9 +15531,11 @@ function handleMonsterDefeat(state, monster, options = null) {
 
 function playerAttack(state, monster) {
   markCombatEvent(state, monster);
+  markLiveCombatEngagement(state, state.player, "player", monster, "monster");
   state.lastPlayerActionKind = "attack";
   recordAnalyticsCounter(ensureAnalyticsState(state), "attacks", 1, state.player.z);
   const p = state.player;
+  const combatClock = liveTickCombatEnabled(state) ? currentLiveSimulationTick(state) : (state.turn ?? 0);
   const weaponProfile = playerWeaponAttackProfile(state);
   if (!playerCanAttackMonster(state, monster, weaponProfile)) {
     if (weaponProfile?.kind === "ranged" && weaponProfile?.cannotFireAdjacent && hasAdjacentMonster(state)) {
@@ -14795,8 +15559,8 @@ function playerAttack(state, monster) {
   const attackAcc = Math.max(1, Math.round((p.acc ?? 70) + Number(weaponProfile?.accuracyMod ?? 0)));
   if (!rollHit(attackAcc, targetEva)) {
     monster.awake = true;
-    rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
-    alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec));
+    rememberMonsterPlayerPosition(monster, p, combatClock);
+    alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec), combatClock);
     pushLog(state, `You miss the ${monsterDisplayName(monster, p.z)}.`);
     persistMonsterOverride(state, monster);
     return;
@@ -14812,8 +15576,8 @@ function playerAttack(state, monster) {
   const dmg = attack.dmg;
   monster.hp -= dmg;
   monster.awake = true;
-  rememberMonsterPlayerPosition(monster, p, state.turn ?? 0);
-  alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec));
+  rememberMonsterPlayerPosition(monster, p, combatClock);
+  alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec), combatClock);
   persistMonsterOverride(state, monster);
 
   const profileKind = weaponProfile?.kind ?? "melee";
@@ -14927,16 +15691,31 @@ function markDisengageGraceFromStep(state, fromX, fromY, toX, toY, z) {
   }
 }
 
+function submitAuthoritativeMovementInput(dx = 0, dy = 0, options = null) {
+  if (!isAuthoritativeSessionActive()) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const enqueueDir = authoritativeMoveDirFromDelta(dx, dy);
+  if (!enqueueDir) return false;
+  if (!isAuthoritativeMovementStreamAvailable()) {
+    noteAuthoritativeMovementStreamCompatibilityFallback();
+    return performAuthoritativeCommand(moveCommand(dx, dy), opts);
+  }
+  return Promise.resolve(syncAuthoritativeMovementControl({
+    enqueueDir,
+    movementSource: String(opts.movementSource ?? "").trim(),
+    inputAt: normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now()),
+  })).then((ok) => {
+    if (ok) return true;
+    if (!isAuthoritativeMovementStreamAvailable()) {
+      return performAuthoritativeCommand(moveCommand(dx, dy), opts);
+    }
+    return false;
+  });
+}
+
 function playerMoveOrAttack(state, dx, dy, options = null) {
   if (isAuthoritativeSessionActive()) {
-    const opts = (options && typeof options === "object") ? options : {};
-    const command = moveCommand(dx, dy);
-    return command
-      ? performAuthoritativeCommand(command, {
-        reason: "move",
-        movementSource: String(opts.movementSource ?? "").trim(),
-      })
-      : false;
+    return submitAuthoritativeMovementInput(dx, dy, options);
   }
   const p = state.player;
   if (p.dead) return false;
@@ -15563,10 +16342,11 @@ function monsterAlertRadius(spec) {
   return Math.max(3, Math.floor(Number(spec?.alertRadius ?? ((spec?.range ?? 0) > 0 ? 6 : 4)) || 4));
 }
 
-function alertMonsterPack(state, sourceMonster, player, radius = 4) {
+function alertMonsterPack(state, sourceMonster, player, radius = 4, turnOverride = null) {
   if (!state?.entities || !sourceMonster || !player) return 0;
   const z = Math.floor(Number(sourceMonster.z ?? player.z ?? 0));
   const alertRadius = Math.max(1, Math.floor(Number(radius) || 4));
+  const memoryTurn = Math.floor(Number(turnOverride ?? state.turn ?? 0) || 0);
   let alerted = 0;
   for (const ent of state.entities.values()) {
     if (!ent || ent.kind !== "monster" || ent.id === sourceMonster.id) continue;
@@ -15575,7 +16355,7 @@ function alertMonsterPack(state, sourceMonster, player, radius = 4) {
     if (dist > alertRadius) continue;
     const wasAwake = !!ent.awake;
     ent.awake = true;
-    rememberMonsterPlayerPosition(ent, player, state.turn ?? 0);
+    rememberMonsterPlayerPosition(ent, player, memoryTurn);
     if (!wasAwake) alerted += 1;
     persistMonsterOverride(state, ent);
   }
@@ -15589,6 +16369,203 @@ function monsterUsesIntentTelegraph(monster, spec, ai = "") {
   if (String(ai) === "ranged_artillery") return true;
   if (type === "storm_sniper" || type === "deepcore_ballista_sentinel") return true;
   return String(ai) === "ranged_hold" && Math.floor(Number(spec?.range ?? 0)) >= 6 && Math.floor(Number(spec?.cdTurns ?? 0)) >= 2;
+}
+
+function isUndeadSupportMonsterType(type = "") {
+  const normalized = String(type ?? "").trim().toLowerCase();
+  return normalized === "skeleton" || normalized === "wraith" || normalized === "bone_herald";
+}
+
+function collectMonsterSupportUndeadAllies(state, monster = null, options = null) {
+  if (!state?.entities || !monster || monster.kind !== "monster") return [];
+  const opts = (options && typeof options === "object") ? options : {};
+  const radius = Math.max(1, Math.floor(Number(opts.radius ?? 4) || 4));
+  const z = Math.floor(Number(monster.z ?? state?.player?.z ?? 0));
+  const out = [];
+  for (const ent of state.entities.values()) {
+    if (!ent || ent.kind !== "monster" || ent.id === monster.id) continue;
+    if (Math.floor(Number(ent.z ?? z)) !== z) continue;
+    if (!isUndeadSupportMonsterType(ent.type)) continue;
+    const dist = Math.abs((ent.x ?? 0) - (monster.x ?? 0)) + Math.abs((ent.y ?? 0) - (monster.y ?? 0));
+    if (dist <= radius) out.push(ent);
+  }
+  return out;
+}
+
+function findMonsterSupportSummonTarget(state, monster = null, options = null) {
+  if (!state?.world || !monster || monster.kind !== "monster") return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const z = Math.floor(Number(monster.z ?? state?.player?.z ?? 0));
+  const player = state?.player ?? null;
+  const occupiedMonsters = opts.monsterOccupancy instanceof Map ? opts.monsterOccupancy : buildOccupancy(state).monsters;
+  const dirs = [
+    [1, 0], [-1, 0], [0, 1], [0, -1],
+    [1, 1], [-1, -1], [1, -1], [-1, 1],
+  ].sort(() => Math.random() - 0.5);
+  for (const [dx, dy] of dirs) {
+    const nx = Math.floor(Number(monster.x ?? 0)) + dx;
+    const ny = Math.floor(Number(monster.y ?? 0)) + dy;
+    if (!state.world.isPassable(nx, ny, z)) continue;
+    if (occupiedMonsters.get(keyXYZ(nx, ny, z))) continue;
+    if (
+      player
+      && nx === Math.floor(Number(player.x ?? 0))
+      && ny === Math.floor(Number(player.y ?? 0))
+      && z === Math.floor(Number(player.z ?? z))
+    ) {
+      continue;
+    }
+    return { x: nx, y: ny, z };
+  }
+  return null;
+}
+
+function chooseMonsterSupportUndeadAction(state, monster = null, spec = null, options = null) {
+  if (!monster || monster.kind !== "monster") return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const nearbyUndead = collectMonsterSupportUndeadAllies(state, monster, opts);
+  if (!nearbyUndead.length) {
+    const targetPos = findMonsterSupportSummonTarget(state, monster, opts);
+    if (!targetPos) return null;
+    return {
+      abilityId: "summon_skeleton",
+      targetPos,
+      allyIds: [],
+      cooldownTurns: Math.max(2, Math.floor(Number(spec?.summonCooldownTurns ?? 6) || 6)),
+    };
+  }
+  return {
+    abilityId: "bolster_undead",
+    targetPos: {
+      x: Math.floor(Number(monster.x ?? 0)),
+      y: Math.floor(Number(monster.y ?? 0)),
+      z: Math.floor(Number(monster.z ?? state?.player?.z ?? 0)),
+    },
+    allyIds: nearbyUndead.map((ally) => ally.id),
+    cooldownTurns: 4,
+  };
+}
+
+function spawnSupportSummonedMonster(state, summoner = null, monsterType = "skeleton", options = null) {
+  if (!state?.entities || !state?.dynamic) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const targetPos = normalizeLiveTargetPoint(opts.targetPos ?? null);
+  if (!targetPos) return null;
+  const spec = monsterStatsForDepth(monsterType, targetPos.z);
+  const summonSeed = Number.isFinite(Number(opts.currentTick))
+    ? Math.max(0, Math.floor(Number(opts.currentTick)))
+    : Math.max(0, Math.floor(Number(opts.currentTurn ?? state?.turn ?? 0) || 0));
+  const id = `summon|${String(summoner?.id ?? monsterType).trim()}|${monsterType}|${summonSeed}|${targetPos.x},${targetPos.y}`;
+  const ent = {
+    id,
+    origin: "dynamic",
+    kind: "monster",
+    type: monsterType,
+    x: targetPos.x,
+    y: targetPos.y,
+    z: targetPos.z,
+    hp: spec.maxHp,
+    maxHp: spec.maxHp,
+    awake: opts.awake !== false,
+    cd: 0,
+    abilityCd: 0,
+    live: normalizeLiveCombatActorState(null, "monster"),
+  };
+  state.dynamic.set(id, ent);
+  state.entities.set(id, ent);
+  if (opts.monsterOccupancy instanceof Map) {
+    opts.monsterOccupancy.set(keyXYZ(targetPos.x, targetPos.y, targetPos.z), id);
+  }
+  const summonLive = ensureLiveActorState(ent, "monster");
+  summonLive.ai.leashAnchor = { x: targetPos.x, y: targetPos.y, z: targetPos.z };
+  if (opts.trackPlayer === true && state?.player && targetPos.z === Math.floor(Number(state.player.z ?? targetPos.z))) {
+    rememberMonsterPlayerPosition(
+      ent,
+      state.player,
+      Number.isFinite(Number(opts.currentTick)) ? Math.floor(Number(opts.currentTick)) : Math.floor(Number(opts.currentTurn ?? state.turn ?? 0))
+    );
+    if (ent.awake) {
+      summonLive.combat.combatTargetId = liveSimulationActorId(state, state.player, "player");
+      summonLive.combat.lastKnownEnemyPos = {
+        x: Math.floor(Number(state.player.x ?? 0)),
+        y: Math.floor(Number(state.player.y ?? 0)),
+        z: Math.floor(Number(state.player.z ?? 0)),
+      };
+      summonLive.combat.aggroState = "engaged";
+    }
+  }
+  return ent;
+}
+
+function resolveMonsterSupportUndeadActionEffect(state, monster = null, spec = null, descriptor = null, options = null) {
+  if (!state?.entities || !monster || monster.kind !== "monster") return { ok: false, reason: "invalid" };
+  const opts = (options && typeof options === "object") ? options : {};
+  const abilityId = String(descriptor?.abilityId ?? "").trim().toLowerCase();
+  const z = Math.floor(Number(monster.z ?? state?.player?.z ?? 0));
+  if (abilityId === "summon_skeleton") {
+    const targetPos = normalizeLiveTargetPoint(descriptor?.targetPos ?? null);
+    if (!targetPos) return { ok: false, reason: "no_space" };
+    const occupiedMonsters = opts.monsterOccupancy instanceof Map ? opts.monsterOccupancy : buildOccupancy(state).monsters;
+    const player = state?.player ?? null;
+    if (!state.world.isPassable(targetPos.x, targetPos.y, targetPos.z)) return { ok: false, reason: "blocked" };
+    if (occupiedMonsters.get(keyXYZ(targetPos.x, targetPos.y, targetPos.z))) return { ok: false, reason: "blocked" };
+    if (
+      player
+      && targetPos.x === Math.floor(Number(player.x ?? 0))
+      && targetPos.y === Math.floor(Number(player.y ?? 0))
+      && targetPos.z === Math.floor(Number(player.z ?? targetPos.z))
+    ) {
+      return { ok: false, reason: "blocked" };
+    }
+    const summoned = spawnSupportSummonedMonster(state, monster, "skeleton", {
+      targetPos,
+      awake: true,
+      currentTick: opts.currentTick,
+      currentTurn: opts.currentTurn,
+      trackPlayer: opts.trackPlayer === true,
+      monsterOccupancy: occupiedMonsters,
+    });
+    if (!summoned) return { ok: false, reason: "spawn_failed" };
+    monster.awake = true;
+    pushLog(state, `${monsterDisplayName(monster, z)} summons a Skeleton.`);
+    return {
+      ok: true,
+      abilityId,
+      targetPos,
+      summonId: summoned.id,
+      affectedIds: [summoned.id],
+      cooldownTurns: Math.max(2, Math.floor(Number(descriptor?.cooldownTurns ?? spec?.summonCooldownTurns ?? 6) || 6)),
+    };
+  }
+  if (abilityId === "bolster_undead") {
+    const nearbyUndead = collectMonsterSupportUndeadAllies(state, monster, opts);
+    if (!nearbyUndead.length) return { ok: false, reason: "no_allies" };
+    let healedCount = 0;
+    const affectedIds = [];
+    for (const ally of nearbyUndead) {
+      const heal = Math.max(1, Math.round((ally.maxHp ?? 1) * 0.12));
+      const before = Math.max(0, Math.floor(Number(ally.hp ?? 0) || 0));
+      ally.hp = clamp(before + heal, 0, ally.maxHp ?? heal);
+      if (ally.hp > before) healedCount += 1;
+      affectedIds.push(ally.id);
+      persistMonsterOverride(state, ally);
+    }
+    if (healedCount > 0) pushLog(state, `${monsterDisplayName(monster, z)} bolsters nearby undead.`);
+    monster.awake = true;
+    return {
+      ok: true,
+      abilityId,
+      targetPos: normalizeLiveTargetPoint(descriptor?.targetPos ?? {
+        x: Math.floor(Number(monster.x ?? 0)),
+        y: Math.floor(Number(monster.y ?? 0)),
+        z,
+      }),
+      affectedIds,
+      healedCount,
+      cooldownTurns: Math.max(1, Math.floor(Number(descriptor?.cooldownTurns ?? 4) || 4)),
+    };
+  }
+  return { ok: false, reason: "unsupported" };
 }
 
 function queueMonsterShotIntent(state, monster, spec, player, options = null) {
@@ -15629,6 +16606,7 @@ function executeMonsterShotIntent(state, monster, spec) {
 
 function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
   markCombatEvent(state, monster);
+  markLiveCombatEngagement(state, monster, "monster", state.player, "player");
   const nm = monsterDisplayName(monster, state.player.z);
   const spec = monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
   const classId = normalizeCharacterClassId(state.player.classId, state.player.speciesId);
@@ -15849,60 +16827,22 @@ function monstersTurn(state) {
       persistOverride();
     }
 
-    if (ai === "support_undead") {
-      let supportActed = false;
-      const nearbyUndead = [];
-      for (const ent of state.entities.values()) {
-        if (!ent || ent.kind !== "monster") continue;
-        if (ent.id === m.id || ent.z !== z) continue;
-        if (!(ent.type === "skeleton" || ent.type === "wraith" || ent.type === "bone_herald")) continue;
-        const d = Math.abs((ent.x ?? 0) - m.x) + Math.abs((ent.y ?? 0) - m.y);
-        if (d <= 4) nearbyUndead.push(ent);
-      }
-      if (!nearbyUndead.length && (m.abilityCd ?? 0) === 0) {
-        const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]].sort(() => Math.random() - 0.5);
-        for (const [dx, dy] of dirs) {
-          const nx = m.x + dx, ny = m.y + dy;
-          if (!state.world.isPassable(nx, ny, z)) continue;
-          if (monsterOccupancy.get(keyXYZ(nx, ny, z))) continue;
-          if (nx === p.x && ny === p.y) continue;
-          const sumSpec = monsterStatsForDepth("skeleton", z);
-          const sid = `summon|${m.id}|${state.turn}|${nx},${ny}`;
-          state.entities.set(sid, {
-            id: sid,
-            origin: "summoned",
-            kind: "monster",
-            type: "skeleton",
-            x: nx, y: ny, z,
-            hp: sumSpec.maxHp,
-            maxHp: sumSpec.maxHp,
-            awake: true,
-            cd: 0,
-          });
-          monsterOccupancy.set(keyXYZ(nx, ny, z), sid);
-          m.abilityCd = Math.max(2, Math.floor(spec.summonCooldownTurns ?? 6));
+    if (ai === "support_undead" && (m.abilityCd ?? 0) === 0) {
+      const supportAction = chooseMonsterSupportUndeadAction(state, m, spec, {
+        monsterOccupancy,
+      });
+      if (supportAction) {
+        const supportResult = resolveMonsterSupportUndeadActionEffect(state, m, spec, supportAction, {
+          monsterOccupancy,
+          currentTurn: state.turn ?? 0,
+        });
+        if (supportResult.ok) {
+          m.abilityCd = Math.max(1, Math.floor(Number(supportResult.cooldownTurns ?? supportAction.cooldownTurns ?? 4) || 4));
           m.awake = true;
-          pushLog(state, `${monsterDisplayName(m, z)} summons a Skeleton.`);
           persistOverride();
-          supportActed = true;
-          break;
+          continue;
         }
-      } else if (nearbyUndead.length && (m.abilityCd ?? 0) === 0) {
-        let didBuff = false;
-        for (const ally of nearbyUndead) {
-          const heal = Math.max(1, Math.round((ally.maxHp ?? 1) * 0.12));
-          const before = ally.hp ?? 0;
-          ally.hp = clamp((ally.hp ?? 0) + heal, 0, ally.maxHp ?? heal);
-          didBuff = didBuff || ally.hp > before;
-          persistMonsterOverride(state, ally);
-        }
-        if (didBuff) pushLog(state, `${monsterDisplayName(m, z)} bolsters nearby undead.`);
-        m.abilityCd = 4;
-        m.awake = true;
-        persistOverride();
-        supportActed = true;
       }
-      if (supportActed) continue;
     }
 
     if (ai === "blink_flanker" && !adj && seesPlayer) {
@@ -16505,6 +17445,19 @@ function monsterIntentBadgeSpec(intent, targetsPlayer = false) {
   return { label: "!", color: targetsPlayer ? "#ff5f5f" : "#ff8b66" };
 }
 
+function liveTelegraphBadgeSpec(entry = null, isPlayerSource = false, targetsPlayer = false) {
+  const abilityId = String(entry?.abilityId ?? "").trim().toLowerCase();
+  if (isPlayerSource) {
+    if (abilityId === "aimed_shot") return { label: "Q", color: "#ffd166" };
+    if (abilityId === "mind_lance") return { label: "Q", color: "#7ce3ff" };
+    if (abilityId === "throw_vial" || abilityId === "acid_glob") return { label: "Q", color: "#8fe388" };
+    return { label: "Q", color: "#ffd166" };
+  }
+  if (abilityId === "summon_skeleton") return { label: "+", color: "#99d7ff" };
+  if (abilityId === "bolster_undead") return { label: "+", color: "#9ee8b0" };
+  return monsterIntentBadgeSpec({ type: abilityId || "charged_shot" }, targetsPlayer);
+}
+
 function collectVisibleMonsterIntentTelegraphs(state) {
   if (!FEATURE_FLAGS.monsterIntentTelegraphs) return [];
   const player = state?.player;
@@ -16528,6 +17481,44 @@ function collectVisibleMonsterIntentTelegraphs(state) {
       executeOnTurn: Math.max(0, Math.floor(Number(intent.executeOnTurn ?? 0) || 0)),
       targetsPlayer,
       ...monsterIntentBadgeSpec(intent, targetsPlayer),
+    });
+  }
+  return out;
+}
+
+function collectVisibleLiveTelegraphs(state) {
+  const player = state?.player;
+  if (!player || player.dead) return [];
+  const live = ensureLiveSimulationState(state);
+  const playerActorId = liveSimulationActorId(state, player, "player");
+  const out = [];
+  for (const entry of live.telegraphs ?? []) {
+    if (!entry || typeof entry !== "object") continue;
+    const actorId = String(entry.actorId ?? "").trim();
+    if (!actorId) continue;
+    if (Math.max(0, Math.floor(Number(entry.resolveTick ?? 0) || 0)) < Math.max(0, Math.floor(Number(live.tick ?? 0) || 0))) continue;
+    const isPlayerSource = actorId === playerActorId;
+    const actorEntity = isPlayerSource ? player : (state.entities?.get(actorId) ?? null);
+    const actorZ = Math.floor(Number(actorEntity?.z ?? player.z ?? 0));
+    if (actorZ !== Math.floor(Number(player.z ?? 0))) continue;
+    if (!isPlayerSource && (!actorEntity || !state.visible.has(keyXY(actorEntity.x, actorEntity.y)))) continue;
+    const points = Array.isArray(entry.points) ? entry.points.map((pt) => normalizeLiveTargetPoint(pt)).filter(Boolean) : [];
+    if (!points.length) continue;
+    const fromPoint = points[0];
+    const toPoint = points[points.length - 1];
+    if (!fromPoint || !toPoint || fromPoint.z !== player.z || toPoint.z !== player.z) continue;
+    const targetsPlayer = !isPlayerSource && toPoint.x === player.x && toPoint.y === player.y;
+    out.push({
+      monsterId: isPlayerSource ? "" : actorId,
+      monsterX: fromPoint.x,
+      monsterY: fromPoint.y,
+      targetX: toPoint.x,
+      targetY: toPoint.y,
+      type: String(entry.shape ?? "line"),
+      executeOnTurn: Math.max(0, Math.floor(Number(entry.resolveTick ?? 0) || 0)),
+      targetsPlayer,
+      sourceIsPlayer: isPlayerSource,
+      ...liveTelegraphBadgeSpec(entry, isPlayerSource, targetsPlayer),
     });
   }
   return out;
@@ -19520,8 +20511,15 @@ function draw(state) {
   const highlightedMonsterIds = new Set();
   if (primaryAction?.type === "attack" && primaryAction.targetMonsterId) highlightedMonsterIds.add(primaryAction.targetMonsterId);
   if (abilityAction?.type === "active-ability" && abilityAction.targetMonsterId) highlightedMonsterIds.add(abilityAction.targetMonsterId);
-  const visibleIntentTelegraphs = collectVisibleMonsterIntentTelegraphs(state);
-  const visibleIntentTelegraphByMonsterId = new Map(visibleIntentTelegraphs.map((entry) => [entry.monsterId, entry]));
+  const visibleIntentTelegraphs = [
+    ...collectVisibleMonsterIntentTelegraphs(state),
+    ...collectVisibleLiveTelegraphs(state),
+  ];
+  const visibleIntentTelegraphByMonsterId = new Map(
+    visibleIntentTelegraphs
+      .filter((entry) => String(entry?.monsterId ?? "").trim())
+      .map((entry) => [entry.monsterId, entry])
+  );
   const theme = applyVisibilityBoostToTheme(themeForDepth(player.z, world.seedStr ?? ""));
   const timeSec = Date.now() / 1000;
   const deferredWorldObjects = [];
@@ -20148,6 +21146,7 @@ function takeTurn(state, didSpendTurn) {
   const actionKind = String(state.lastPlayerActionKind ?? "turn");
   markAnalyticsInput(analytics, Date.now());
   state.turn += 1;
+  syncLegacyTurnStateIntoLiveTickState(state, { turnSpent: true, actionType: actionKind });
   advanceAnalyticsTurn(analytics, state.player.z, Date.now());
   if ((state.player.abilityCd ?? 0) > 0) state.player.abilityCd = Math.max(0, Math.floor(state.player.abilityCd ?? 0) - 1);
   maybeGrantExplorationXP(state);
@@ -20197,8 +21196,28 @@ function shouldIgnoreGameHotkeys(e) {
 
 const keyboardMovementHolds = new Map();
 const authoritativeMovementIntentBySource = new Map();
-const AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS = 90;
-const AUTHORITATIVE_MOVE_INTENT_REPEAT_MS = 36;
+const AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS = 120;
+const AUTHORITATIVE_MOVE_INTENT_REPEAT_MS_MIN = 22;
+const AUTHORITATIVE_MOVE_INTENT_REPEAT_MS_MAX = 40;
+
+function authoritativeMoveIntentRepeatMs() {
+  if (!isAuthoritativeSessionActive()) return 28;
+  const tickMs = authoritativeClientTickMs();
+  return Math.max(
+    AUTHORITATIVE_MOVE_INTENT_REPEAT_MS_MIN,
+    Math.min(AUTHORITATIVE_MOVE_INTENT_REPEAT_MS_MAX, Math.round(tickMs * 0.86))
+  );
+}
+
+function authoritativeMoveIntentInitialDelayMs() {
+  return Math.max(
+    90,
+    Math.min(
+      170,
+      Math.round(authoritativeMoveIntentRepeatMs() * 4.5)
+    )
+  );
+}
 
 function keyboardMovementFromEvent(e) {
   const code = String(e?.code ?? "").trim();
@@ -20240,34 +21259,28 @@ function releaseKeyboardMovementHold(source = "", code = "") {
 }
 
 function clearHeldKeyboardMovement() {
-  for (const source of keyboardMovementHolds.keys()) {
-    dropQueuedAuthoritativeMovementBySource(source);
-  }
   keyboardMovementHolds.clear();
   authoritativeMovementIntentBySource.clear();
+  if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
+    void syncAuthoritativeMovementControl();
+  }
 }
 
 function setAuthoritativeMovementIntent(source = "", dx = 0, dy = 0, options = null) {
-  const opts = (options && typeof options === "object") ? options : {};
   const key = String(source ?? "").trim();
   if (!key) return;
   const nowMs = Date.now();
-  const delayMs = Math.max(0, Math.floor(Number(opts.delayMs) || 0));
-  const nextAt = nowMs + delayMs;
   const entry = authoritativeMovementIntentBySource.get(key);
   if (entry && typeof entry === "object") {
     entry.dx = Math.trunc(Number(dx) || 0);
     entry.dy = Math.trunc(Number(dy) || 0);
     entry.updatedAt = nowMs;
-    if (opts.resetCooldown === true) entry.nextAt = nextAt;
-    else if (!Number.isFinite(Number(entry.nextAt)) || Number(entry.nextAt) < nowMs) entry.nextAt = nextAt;
     return;
   }
   authoritativeMovementIntentBySource.set(key, {
     dx: Math.trunc(Number(dx) || 0),
     dy: Math.trunc(Number(dy) || 0),
     updatedAt: nowMs,
-    nextAt,
   });
 }
 
@@ -20277,26 +21290,64 @@ function clearAuthoritativeMovementIntent(source = "") {
   authoritativeMovementIntentBySource.delete(key);
 }
 
-function pumpAuthoritativeMovementIntent(state, nowMs = Date.now()) {
-  if (!isAuthoritativeSessionActive()) return false;
-  if (!state?.player || state.player.dead) return false;
+function resolvePreferredAuthoritativeMovementIntent() {
   let selectedSource = "";
   let selectedIntent = null;
   for (const [source, entry] of authoritativeMovementIntentBySource.entries()) {
     if (!entry || typeof entry !== "object") continue;
-    if (nowMs < Number(entry.nextAt ?? 0)) continue;
     if (!selectedIntent || Number(entry.updatedAt ?? 0) >= Number(selectedIntent.updatedAt ?? 0)) {
       selectedSource = source;
       selectedIntent = entry;
     }
   }
-  if (!selectedIntent) return false;
-  selectedIntent.nextAt = nowMs + AUTHORITATIVE_MOVE_INTENT_REPEAT_MS;
-  takeTurn(
-    state,
-    playerMoveOrAttack(state, selectedIntent.dx, selectedIntent.dy, { movementSource: selectedSource })
-  );
-  return true;
+  if (!selectedIntent) return null;
+  return {
+    source: selectedSource,
+    dx: Math.trunc(Number(selectedIntent.dx) || 0),
+    dy: Math.trunc(Number(selectedIntent.dy) || 0),
+    updatedAt: Math.max(0, Math.floor(Number(selectedIntent.updatedAt ?? 0) || 0)),
+  };
+}
+
+async function syncAuthoritativeMovementControl(options = null) {
+  if (!isAuthoritativeSessionActive()) return false;
+  if (!isAuthoritativeMovementStreamAvailable()) {
+    noteAuthoritativeMovementStreamCompatibilityFallback();
+    return false;
+  }
+  const opts = (options && typeof options === "object") ? options : {};
+  const selected = resolvePreferredAuthoritativeMovementIntent();
+  const holdDir = selected ? authoritativeMoveDirFromDelta(selected.dx, selected.dy) : "";
+  const active = !!holdDir;
+  const enqueueDir = String(opts.enqueueDir ?? "").trim().toUpperCase();
+  const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
+  if (!sessionId) return false;
+  try {
+    await authoritativeApi.setMovementIntent({
+      sessionId,
+      holdDir,
+      active,
+      enqueueDir,
+      intentSeq: nextAuthoritativeMovementIntentSeq(),
+    });
+    return true;
+  } catch (err) {
+    if (shouldDisableAuthoritativeMovementStream(err)) {
+      disableAuthoritativeMovementStream("intent-error", err);
+      return false;
+    }
+    const now = Date.now();
+    if ((now - authoritativeMovementChannelRuntime.lastErrorAt) > 2000 && game?.log) {
+      pushLog(game, authoritativeErrorMessage(err, "Could not update movement input."));
+      renderLog(game);
+      authoritativeMovementChannelRuntime.lastErrorAt = now;
+    }
+    return false;
+  }
+}
+
+function pumpAuthoritativeMovementIntent() {
+  return false;
 }
 
 function onKey(state, e) {
@@ -20389,19 +21440,14 @@ function onKey(state, e) {
   if (movementInput) {
     e.preventDefault();
     markKeyboardMovementHeld(movementInput.source, String(e.code ?? ""));
-    if (isAuthoritativeSessionActive()) {
+    if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
       if (e.repeat) return;
-      setAuthoritativeMovementIntent(
-        movementInput.source,
-        movementInput.dx,
-        movementInput.dy,
-        {
-          delayMs: AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS,
-          resetCooldown: true,
-        }
-      );
+      setAuthoritativeMovementIntent(movementInput.source, movementInput.dx, movementInput.dy);
     }
-    takeTurn(state, playerMoveOrAttack(state, movementInput.dx, movementInput.dy, { movementSource: movementInput.source }));
+    takeTurn(state, playerMoveOrAttack(state, movementInput.dx, movementInput.dy, {
+      movementSource: movementInput.source,
+      inputAt: Date.now(),
+    }));
   }
   else if (k === "." || k === " " || k === "spacebar") { e.preventDefault(); takeTurn(state, waitTurn(state)); }
   else if (k === "q") {
@@ -20571,6 +21617,7 @@ function exportSave(state) {
   const character = touchCharacterProgress(state);
   const areaRespawn = ensureAreaRespawnState(state);
   const doorMutation = ensureDoorMutationState(state);
+  const live = ensureLiveSimulationState(state);
   const tileOv = Array.from(state.world.tileOverrides.entries());
   const removed = Array.from(state.removedIds);
   const entOv = Array.from(state.entityOverrides.entries()).map(([id, ov]) => {
@@ -20589,6 +21636,12 @@ function exportSave(state) {
       next.payload = (ent.payload && typeof ent.payload === "object") ? { ...ent.payload } : {};
       next.friendlyTo = String(ent.friendlyTo ?? "").trim().toLowerCase();
       next.ownerId = ent.ownerId ?? "";
+      next.live = normalizeLiveCombatActorState(ent.live ?? ov?.live ?? null, "trap");
+      return [id, next];
+    }
+    if (ent.kind === "actor") {
+      const next = { ...(ov ?? {}) };
+      next.live = normalizeLiveCombatActorState(ent.live ?? ov?.live ?? null, "actor");
       return [id, next];
     }
     if (ent.kind !== "monster") return [id, ov];
@@ -20598,6 +21651,7 @@ function exportSave(state) {
     const effects = normalizeMonsterEffects(ent.effects ?? []);
     if (effects.length > 0) next.effects = effects;
     else delete next.effects;
+    next.live = normalizeLiveCombatActorState(ent.live ?? ov?.live ?? null, "monster");
     return [id, next];
   });
   const seen = Array.from(state.seen).slice(0, 60000);
@@ -20608,11 +21662,14 @@ function exportSave(state) {
   const poisonClouds = ensurePoisonCloudState(state);
 
   const payload = {
-    v: 10,
+    v: 11,
     seed: state.world.seedStr,
     fog: fogEnabled,
     minimap: minimapEnabled,
-    player: state.player,
+    player: {
+      ...state.player,
+      live: normalizeLiveCombatActorState(state.player?.live ?? null, "player"),
+    },
     inv: state.inv,
     removed,
     entOv,
@@ -20647,6 +21704,7 @@ function exportSave(state) {
       regenAnchorMs: Number.isFinite(state?.combat?.regenAnchorMs) ? Math.max(0, Math.floor(state.combat.regenAnchorMs)) : 0,
       hudTargets: normalizeCombatHudTargets(state?.combat?.hudTargets ?? {}),
     },
+    live,
     analytics: analyticsSnapshotForSave(state.analytics),
   };
 
@@ -20695,6 +21753,2196 @@ function normalizeCombatHudTargets(raw) {
   return out;
 }
 
+function liveTicksFromLegacyTurns(turns = 0) {
+  const count = Math.max(0, Math.floor(Number(turns ?? 0) || 0));
+  return count * LIVE_SIM_TICKS_PER_LEGACY_TURN;
+}
+
+function normalizeLiveTargetPoint(raw = null) {
+  if (!raw || typeof raw !== "object") return null;
+  const x = Math.floor(Number(raw.x ?? NaN));
+  const y = Math.floor(Number(raw.y ?? NaN));
+  const z = Math.floor(Number(raw.z ?? NaN));
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+  return { x, y, z };
+}
+
+function normalizeLiveIntentState(raw = null, actorKind = "actor") {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  const moveDir = String(src.moveDir ?? "").trim().toUpperCase();
+  return {
+    moveDir: (moveDir === "N" || moveDir === "S" || moveDir === "E" || moveDir === "W") ? moveDir : "",
+    attackTargetId: String(src.attackTargetId ?? "").trim(),
+    autoRetaliate: src.autoRetaliate !== false && actorKind === "player",
+    abilityId: String(src.abilityId ?? "").trim(),
+    abilityTarget: normalizeLiveTargetPoint(src.abilityTarget ?? null),
+    interactMode: String(src.interactMode ?? "").trim().toLowerCase(),
+    chaseTargetId: String(src.chaseTargetId ?? "").trim(),
+  };
+}
+
+function normalizeLiveActionTimelineState(raw = null) {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  const actionState = String(src.actionState ?? "idle").trim().toLowerCase() || "idle";
+  return {
+    currentActionType: String(src.currentActionType ?? "").trim().toUpperCase(),
+    currentActionId: String(src.currentActionId ?? "").trim(),
+    actionState,
+    actionStartTick: Math.max(0, Math.floor(Number(src.actionStartTick ?? 0) || 0)),
+    actionResolveTick: Math.max(0, Math.floor(Number(src.actionResolveTick ?? 0) || 0)),
+    actionRecoveryEndTick: Math.max(0, Math.floor(Number(src.actionRecoveryEndTick ?? 0) || 0)),
+    gcdEndTick: Math.max(0, Math.floor(Number(src.gcdEndTick ?? 0) || 0)),
+    moveLockUntilTick: Math.max(0, Math.floor(Number(src.moveLockUntilTick ?? 0) || 0)),
+    castInterruptible: src.castInterruptible !== false,
+    targetId: String(src.targetId ?? "").trim(),
+    targetPos: normalizeLiveTargetPoint(src.targetPos ?? null),
+    sequence: Math.max(0, Math.floor(Number(src.sequence ?? 0) || 0)),
+  };
+}
+
+function normalizeLiveCooldownState(raw = null) {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  return {
+    abilityTicks: Math.max(0, Math.floor(Number(src.abilityTicks ?? 0) || 0)),
+    attackTicks: Math.max(0, Math.floor(Number(src.attackTicks ?? 0) || 0)),
+    interactTicks: Math.max(0, Math.floor(Number(src.interactTicks ?? 0) || 0)),
+  };
+}
+
+function normalizeLiveCombatActorState(raw = null, actorKind = "actor") {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  return {
+    version: LIVE_SIM_SCHEMA_VERSION,
+    actorKind: String(actorKind ?? "actor").trim().toLowerCase() || "actor",
+    intent: normalizeLiveIntentState(src.intent ?? null, actorKind),
+    action: normalizeLiveActionTimelineState(src.action ?? null),
+    cooldowns: normalizeLiveCooldownState(src.cooldowns ?? null),
+    combat: {
+      combatTargetId: String(src?.combat?.combatTargetId ?? "").trim(),
+      inCombatUntilTick: Math.max(0, Math.floor(Number(src?.combat?.inCombatUntilTick ?? 0) || 0)),
+      lastDamagedById: String(src?.combat?.lastDamagedById ?? "").trim(),
+      lastKnownEnemyPos: normalizeLiveTargetPoint(src?.combat?.lastKnownEnemyPos ?? null),
+      aggroState: String(src?.combat?.aggroState ?? (actorKind === "monster" ? "idle" : "ready")).trim().toLowerCase() || "idle",
+    },
+    ai: {
+      nextDecisionTick: Math.max(0, Math.floor(Number(src?.ai?.nextDecisionTick ?? 0) || 0)),
+      nextPathTick: Math.max(0, Math.floor(Number(src?.ai?.nextPathTick ?? 0) || 0)),
+      nextAttackTick: Math.max(0, Math.floor(Number(src?.ai?.nextAttackTick ?? 0) || 0)),
+      leashAnchor: normalizeLiveTargetPoint(src?.ai?.leashAnchor ?? null),
+      stance: String(src?.ai?.stance ?? (actorKind === "monster" ? "idle" : "player")).trim().toLowerCase() || "idle",
+      behaviorId: String(src?.ai?.behaviorId ?? "").trim().toLowerCase(),
+      state: String(src?.ai?.state ?? (actorKind === "monster" ? "idle" : "ready")).trim().toLowerCase() || "idle",
+      decisionReason: String(src?.ai?.decisionReason ?? "").trim().toLowerCase(),
+      lastDecisionTick: Math.max(0, Math.floor(Number(src?.ai?.lastDecisionTick ?? 0) || 0)),
+      preferredRange: Math.max(0, Math.floor(Number(src?.ai?.preferredRange ?? 0) || 0)),
+    },
+  };
+}
+
+function normalizeLiveEventEntries(raw = null) {
+  const entries = Array.isArray(raw) ? raw : [];
+  return entries
+    .filter((entry) => entry && typeof entry === "object")
+    .map((entry) => ({
+      tick: Math.max(0, Math.floor(Number(entry.tick ?? 0) || 0)),
+      type: String(entry.type ?? "").trim().toLowerCase(),
+      actorId: String(entry.actorId ?? "").trim(),
+      targetId: String(entry.targetId ?? "").trim(),
+      actionId: String(entry.actionId ?? "").trim(),
+      payload: (entry.payload && typeof entry.payload === "object") ? { ...entry.payload } : {},
+    }))
+    .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+}
+
+function normalizeLiveTelegraphEntries(raw = null) {
+  const entries = Array.isArray(raw) ? raw : [];
+  return entries
+    .filter((entry) => entry && typeof entry === "object")
+    .map((entry) => ({
+      id: String(entry.id ?? "").trim(),
+      actorId: String(entry.actorId ?? "").trim(),
+      abilityId: String(entry.abilityId ?? "").trim(),
+      startTick: Math.max(0, Math.floor(Number(entry.startTick ?? 0) || 0)),
+      resolveTick: Math.max(0, Math.floor(Number(entry.resolveTick ?? 0) || 0)),
+      shape: String(entry.shape ?? "").trim().toLowerCase(),
+      points: Array.isArray(entry.points)
+        ? entry.points.map((pt) => normalizeLiveTargetPoint(pt)).filter(Boolean)
+        : [],
+    }))
+    .filter((entry) => entry.id || entry.actorId || entry.abilityId)
+    .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+}
+
+function normalizeLiveSimulationState(raw = null) {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  const requestedMode = resolveLiveTickCombatRequestMode();
+  const enabled = requestedMode === false
+    ? false
+    : (src.enabled === true || requestedMode === true || FEATURE_FLAGS.liveTickCombat === true);
+  return {
+    version: LIVE_SIM_SCHEMA_VERSION,
+    enabled,
+    mode: enabled
+      ? (String(src.mode ?? "live_tick").trim().toLowerCase() || "live_tick")
+      : "legacy_turn_bridge",
+    tickMs: Math.max(10, Math.floor(Number(src.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS)),
+    tick: Math.max(0, Math.floor(Number(src.tick ?? 0) || 0)),
+    lastStepAtMs: Math.max(0, Math.floor(Number(src.lastStepAtMs ?? 0) || 0)),
+    lastServerTick: Math.max(0, Math.floor(Number(src.lastServerTick ?? 0) || 0)),
+    stepSeq: Math.max(0, Math.floor(Number(src.stepSeq ?? 0) || 0)),
+    telegraphs: normalizeLiveTelegraphEntries(src.telegraphs ?? null),
+    events: normalizeLiveEventEntries(src.events ?? null),
+  };
+}
+
+function ensureLiveActorState(holder, actorKind = "actor") {
+  if (!holder || typeof holder !== "object") {
+    return normalizeLiveCombatActorState(null, actorKind);
+  }
+  const normalized = normalizeLiveCombatActorState(holder.live ?? null, actorKind);
+  if (holder.live && typeof holder.live === "object") {
+    Object.assign(holder.live, normalized);
+  } else {
+    holder.live = normalized;
+  }
+  return holder.live;
+}
+
+function ensureLiveSimulationState(state) {
+  if (!state || typeof state !== "object") return normalizeLiveSimulationState(null);
+  const normalized = normalizeLiveSimulationState(state.live ?? null);
+  if (state.live && typeof state.live === "object") {
+    Object.assign(state.live, normalized);
+  } else {
+    state.live = normalized;
+  }
+  const live = state.live;
+  if (live.mode === "legacy_turn_bridge") {
+    live.tick = Math.max(live.tick, liveTicksFromLegacyTurns(state.turn ?? 0));
+  }
+  if (state.player && typeof state.player === "object") {
+    const playerLive = ensureLiveActorState(state.player, "player");
+    playerLive.cooldowns.abilityTicks = Math.max(
+      playerLive.cooldowns.abilityTicks,
+      liveTicksFromLegacyTurns(state.player.abilityCd ?? 0)
+    );
+  }
+  for (const entity of state.entities?.values?.() ?? []) {
+    if (!entity || typeof entity !== "object") continue;
+    if (entity.kind === "monster" || entity.kind === "trap" || entity.kind === "actor") {
+      const actorLive = ensureLiveActorState(entity, entity.kind);
+      if (entity.kind === "monster") {
+        actorLive.cooldowns.abilityTicks = Math.max(
+          actorLive.cooldowns.abilityTicks,
+          liveTicksFromLegacyTurns(entity.abilityCd ?? 0)
+        );
+      }
+    }
+  }
+  return live;
+}
+
+function coerceLiveTickCombatState(state, enabled = null) {
+  if (!state || typeof state !== "object") return null;
+  const live = ensureLiveSimulationState(state);
+  const override = parseLiveTickCombatFlagValue(enabled);
+  if (override === true) {
+    live.enabled = true;
+    live.mode = "live_tick";
+  } else if (override === false) {
+    live.enabled = false;
+    live.mode = "legacy_turn_bridge";
+  } else if (live.enabled) {
+    live.mode = "live_tick";
+  } else {
+    live.mode = "legacy_turn_bridge";
+  }
+  return live;
+}
+
+function syncLegacyTurnStateIntoLiveTickState(state, options = null) {
+  if (!state || typeof state !== "object") return null;
+  const live = ensureLiveSimulationState(state);
+  live.enabled = liveTickCombatEnabled(state);
+  live.mode = live.enabled ? "live_tick" : "legacy_turn_bridge";
+  live.tick = Math.max(live.tick, liveTicksFromLegacyTurns(state.turn ?? 0));
+  live.lastStepAtMs = Date.now();
+  const opts = (options && typeof options === "object") ? options : {};
+  const turnSpent = opts.turnSpent === true;
+  if (!turnSpent) return live;
+  live.stepSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const actionType = String(opts.actionType ?? "LEGACY_TURN").trim().toUpperCase() || "LEGACY_TURN";
+  const actionId = `legacy_${live.stepSeq}`;
+  playerLive.action.currentActionType = actionType;
+  playerLive.action.currentActionId = actionId;
+  playerLive.action.actionState = "recovery";
+  playerLive.action.sequence = live.stepSeq;
+  playerLive.action.actionResolveTick = live.tick;
+  playerLive.action.actionRecoveryEndTick = live.tick;
+  playerLive.action.gcdEndTick = Math.max(playerLive.action.gcdEndTick, live.tick);
+  playerLive.cooldowns.abilityTicks = liveTicksFromLegacyTurns(state.player?.abilityCd ?? 0);
+  for (const entity of state.entities?.values?.() ?? []) {
+    if (!entity || typeof entity !== "object") continue;
+    if (entity.kind !== "monster" && entity.kind !== "trap" && entity.kind !== "actor") continue;
+    const actorLive = ensureLiveActorState(entity, entity.kind);
+    if (entity.kind === "monster") {
+      actorLive.cooldowns.abilityTicks = liveTicksFromLegacyTurns(entity.abilityCd ?? 0);
+    }
+  }
+  live.events.push({
+    tick: live.tick,
+    type: "legacy_turn_bridge",
+    actorId: String(state.character?.id ?? state.player?.id ?? "player"),
+    targetId: "",
+    actionId,
+    payload: {
+      actionType,
+      policy: LIVE_TIMING_ACTION_POLICY[actionType] ?? "legacy_unclassified",
+    },
+  });
+  if (live.events.length > LIVE_SIM_MAX_EVENT_HISTORY) {
+    live.events = live.events.slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+  }
+  return live;
+}
+
+function liveTickCombatEnabled(state = null) {
+  if (state?.live?.enabled === true) return true;
+  return resolveLiveTickCombatRequestMode() === true || FEATURE_FLAGS.liveTickCombat === true;
+}
+
+function normalizeCardinalDirection(value = "") {
+  const dir = String(value ?? "").trim().toUpperCase();
+  return (dir === "N" || dir === "S" || dir === "E" || dir === "W") ? dir : "";
+}
+
+function liveSimulationActorId(state, actor = null, actorKind = "actor") {
+  if (actorKind === "player") {
+    return String(state?.character?.id ?? state?.player?.id ?? "player").trim() || "player";
+  }
+  return String(actor?.id ?? actorKind).trim() || actorKind;
+}
+
+function pushLiveSimulationEvent(state, type = "", options = null) {
+  if (!state || typeof state !== "object") return null;
+  const live = ensureLiveSimulationState(state);
+  const opts = (options && typeof options === "object") ? options : {};
+  const event = {
+    tick: Math.max(0, Math.floor(Number(opts.tick ?? live.tick ?? 0) || 0)),
+    type: String(type ?? "").trim().toLowerCase(),
+    actorId: String(opts.actorId ?? "").trim(),
+    targetId: String(opts.targetId ?? "").trim(),
+    actionId: String(opts.actionId ?? "").trim(),
+    payload: (opts.payload && typeof opts.payload === "object") ? { ...opts.payload } : {},
+  };
+  live.events.push(event);
+  if (live.events.length > LIVE_SIM_MAX_EVENT_HISTORY) {
+    live.events = live.events.slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+  }
+  return event;
+}
+
+function liveMovementRecoveryTicks(actor = null, actorKind = "player") {
+  const speed = Math.max(0.5, Number(actor?.spd ?? 1) || 1);
+  const baseTicks = actorKind === "player" ? 2 : 4;
+  return Math.max(1, Math.min(12, Math.round(baseTicks / speed)));
+}
+
+function tickDownLiveCooldownsForActor(holder, actorKind = "actor") {
+  const live = ensureLiveActorState(holder, actorKind);
+  live.cooldowns.abilityTicks = Math.max(0, Math.floor(Number(live.cooldowns.abilityTicks ?? 0) || 0) - 1);
+  live.cooldowns.attackTicks = Math.max(0, Math.floor(Number(live.cooldowns.attackTicks ?? 0) || 0) - 1);
+  live.cooldowns.interactTicks = Math.max(0, Math.floor(Number(live.cooldowns.interactTicks ?? 0) || 0) - 1);
+  if (
+    live.action.actionState === "recovery"
+    && Math.max(0, Math.floor(Number(live.action.actionRecoveryEndTick ?? 0) || 0)) <= Math.max(0, Math.floor(Number(holder?.live?.action?.actionRecoveryEndTick ?? live.action.actionRecoveryEndTick ?? 0) || 0))
+  ) {
+    // no-op placeholder; actual reset happens in the per-tick step when current tick is known
+  }
+  return live;
+}
+
+function applyLiveCooldownMirrors(state) {
+  if (!state || typeof state !== "object") return;
+  const playerLive = ensureLiveActorState(state.player, "player");
+  state.player.abilityCd = Math.max(0, Math.ceil(playerLive.cooldowns.abilityTicks / LIVE_SIM_TICKS_PER_LEGACY_TURN));
+  for (const entity of state.entities?.values?.() ?? []) {
+    if (!entity || typeof entity !== "object" || entity.kind !== "monster") continue;
+    const actorLive = ensureLiveActorState(entity, "monster");
+    entity.abilityCd = Math.max(0, Math.ceil(actorLive.cooldowns.abilityTicks / LIVE_SIM_TICKS_PER_LEGACY_TURN));
+    entity.cd = Math.max(0, Math.ceil(actorLive.cooldowns.attackTicks / LIVE_SIM_TICKS_PER_LEGACY_TURN));
+  }
+}
+
+function currentLiveSimulationTick(state) {
+  return Math.max(
+    0,
+    Math.floor(Number(state?.live?.tick ?? liveTicksFromLegacyTurns(state?.turn ?? 0) ?? 0) || 0)
+  );
+}
+
+function liveCombatWindowTicks() {
+  return Math.max(18, Math.floor(liveTicksFromLegacyTurns(4)));
+}
+
+function clearLiveTelegraphForAction(state, actionId = "") {
+  if (!state?.live || !Array.isArray(state.live.telegraphs)) return;
+  const id = String(actionId ?? "").trim();
+  if (!id) return;
+  state.live.telegraphs = state.live.telegraphs.filter((entry) => String(entry?.id ?? "").trim() !== id);
+}
+
+function liveBasicAttackTiming(actor = null, actorKind = "player", options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const speed = Math.max(0.5, Number(actor?.spd ?? opts.speed ?? 1) || 1);
+  if (actorKind === "player") {
+    const profile = (opts.weaponProfile && typeof opts.weaponProfile === "object")
+      ? opts.weaponProfile
+      : null;
+    const ranged = (profile?.kind ?? "melee") === "ranged";
+    const windupBase = ranged ? 4 : 3;
+    const recoveryBase = ranged ? 4 : 3;
+    const cooldownBase = ranged ? 6 : 5;
+    const moveLockBase = ranged ? 3 : 4;
+    return {
+      windupTicks: Math.max(1, Math.min(6, Math.round(windupBase / speed))),
+      recoveryTicks: Math.max(2, Math.min(8, Math.round(recoveryBase / speed))),
+      cooldownTicks: Math.max(3, Math.min(10, Math.round(cooldownBase / speed))),
+      moveLockTicks: Math.max(1, Math.min(6, Math.round(moveLockBase / speed))),
+    };
+  }
+  const spec = (opts.spec && typeof opts.spec === "object") ? opts.spec : {};
+  const ranged = Math.max(0, Math.floor(Number(spec.range ?? 0) || 0)) > 0;
+  const ai = String(spec.ai ?? "").trim().toLowerCase();
+  const telegraphed = ranged && monsterUsesIntentTelegraph(actor, spec, ai);
+  const legacyCdTurns = Math.max(0, Math.floor(Number(spec.cdTurns ?? 0) || 0));
+  const windupBase = telegraphed ? 4 : (ranged ? 3 : 2);
+  const recoveryBase = ranged ? 4 : 3;
+  const cooldownBase = Math.max(
+    recoveryBase + 1,
+    legacyCdTurns > 0 ? Math.round(liveTicksFromLegacyTurns(legacyCdTurns) / 4) : (ranged ? 5 : 4)
+  );
+  return {
+    windupTicks: Math.max(1, Math.min(7, Math.round(windupBase / speed))),
+    recoveryTicks: Math.max(2, Math.min(10, Math.round(recoveryBase / speed))),
+    cooldownTicks: Math.max(3, Math.min(14, Math.round(cooldownBase / speed))),
+    moveLockTicks: Math.max(0, Math.min(6, Math.round((ranged ? 1 : 2) / speed))),
+    telegraphed,
+  };
+}
+
+function liveAbilityTimingForPlayer(player, ability = null) {
+  const speed = Math.max(0.5, Number(player?.spd ?? 1) || 1);
+  const telegraphed = ability?.telegraph === true;
+  const targeting = String(ability?.targeting ?? "").trim().toLowerCase();
+  const castBase = telegraphed ? 5 : (targeting === "self" ? 2 : 3);
+  const recoveryBase = targeting === "self" ? 3 : 4;
+  const moveLockBase = telegraphed ? 4 : (targeting === "self" ? 2 : 3);
+  return {
+    castTicks: Math.max(1, Math.min(8, Math.round(castBase / speed))),
+    recoveryTicks: Math.max(2, Math.min(8, Math.round(recoveryBase / speed))),
+    moveLockTicks: Math.max(1, Math.min(6, Math.round(moveLockBase / speed))),
+    telegraphed,
+  };
+}
+
+function resolveLiveAbilityTargetForPlayer(state, ability = null, explicitTarget = null, occupancy = null) {
+  const targeting = String(ability?.targeting ?? "").trim().toLowerCase();
+  if (!ability || targeting === "self" || targeting === "ground") return null;
+  const target = explicitTarget;
+  if (target?.kind === "monster") {
+    const candidates = monstersTargetableByAbility(state, ability, occupancy);
+    if (candidates.some((entry) => entry.monster?.id === target.id)) return target;
+  }
+  return monstersTargetableByAbility(state, ability, occupancy)[0]?.monster ?? null;
+}
+
+function reserveLivePlayerAbilityResources(state, ability = null) {
+  const p = state?.player;
+  if (!p || !ability) return false;
+  const playerLive = ensureLiveActorState(p, "player");
+  const cost = activeAbilityCostForPlayer(p, ability);
+  if (!spendPlayerEnergy(state, cost)) return false;
+  playerLive.cooldowns.abilityTicks = Math.max(
+    playerLive.cooldowns.abilityTicks,
+    liveTicksFromLegacyTurns(Math.max(0, Math.floor(Number(ability.cooldown ?? 0) || 0)) + 1)
+  );
+  state.lastPlayerActionKind = "ability";
+  return true;
+}
+
+function liveTelegraphShapeForAbility(ability = null) {
+  const targeting = String(ability?.targeting ?? "").trim().toLowerCase();
+  if (targeting === "self") return "cell";
+  if (targeting === "ground") return "cell";
+  return "line";
+}
+
+function liveInteractionTimingForCommand(commandType = "") {
+  const type = String(commandType ?? "").trim().toUpperCase();
+  if (type === "OPEN_DOOR" || type === "CLOSE_DOOR") {
+    return { castTicks: 1, recoveryTicks: 1, moveLockTicks: 1, blockedInCombat: false };
+  }
+  if (type === "PICKUP" || type === "OPEN_CHEST") {
+    return { castTicks: 1, recoveryTicks: 1, moveLockTicks: 1, blockedInCombat: false };
+  }
+  if (type === "DISARM_TRAP") {
+    return { castTicks: 1, recoveryTicks: 2, moveLockTicks: 1, blockedInCombat: false };
+  }
+  if (type === "USE_SHRINE") {
+    return { castTicks: 1, recoveryTicks: 2, moveLockTicks: 2, blockedInCombat: true };
+  }
+  if (type === "USE_STAIRS") {
+    return { castTicks: 1, recoveryTicks: 1, moveLockTicks: 1, blockedInCombat: true };
+  }
+  return { castTicks: 1, recoveryTicks: 1, moveLockTicks: 1, blockedInCombat: false };
+}
+
+function playerIsInLiveCombat(state, currentTick = null) {
+  if (!state?.player) return false;
+  const tick = Math.max(0, Math.floor(Number(currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const playerLive = ensureLiveActorState(state.player, "player");
+  return tick < Math.max(0, Math.floor(Number(playerLive.combat.inCombatUntilTick ?? 0) || 0));
+}
+
+function liveTransactionalCommandError(state, commandType = "", options = null) {
+  if (!liveTickCombatEnabled(state) || !state?.player) return "";
+  const opts = (options && typeof options === "object") ? options : {};
+  void opts;
+  const type = String(commandType ?? "").trim().toUpperCase();
+  if (!type || type === "REQUEST_RESYNC" || type === "SAVE_AND_EXIT") return "";
+  const currentTick = Math.max(0, Math.floor(Number(currentLiveSimulationTick(state)) || 0));
+  const playerLive = ensureLiveActorState(state.player, "player");
+  if (playerLive.action.actionState === "windup" || playerLive.action.actionState === "executing") {
+    return "You are busy.";
+  }
+  const inCombat = playerIsInLiveCombat(state, currentTick);
+  if ((type === "BUY_SHOP_ITEM" || type === "SELL_SHOP_ITEM") && inCombat) {
+    return "You cannot trade during combat.";
+  }
+  if (type === "ALLOCATE_STATS" && inCombat) {
+    return "You cannot allocate stats during combat.";
+  }
+  if ((type === "EQUIP_ITEM" || type === "UNEQUIP_ITEM") && inCombat) {
+    return "You cannot change equipment during combat.";
+  }
+  return "";
+}
+
+function resolveLiveInteractionDescriptor(state, commandType = "", command = null) {
+  const type = String(commandType ?? "").trim().toUpperCase();
+  if (type === "OPEN_DOOR" || type === "CLOSE_DOOR" || type === "PICKUP" || type === "OPEN_CHEST" || type === "DISARM_TRAP") {
+    return { type, dir: String(command?.dir ?? "").trim().toLowerCase(), transactional: false };
+  }
+  if (type === "USE_SHRINE") return { type: "USE_SHRINE", dir: "", transactional: false };
+  if (type === "USE_STAIRS") {
+    const dir = String(command?.dir ?? "").trim().toLowerCase();
+    return (dir === "up" || dir === "down") ? { type: "USE_STAIRS", dir, transactional: false } : null;
+  }
+  if (type !== "INTERACT") return null;
+
+  const p = state?.player;
+  if (!p) return null;
+  const here = state.world.getTile(p.x, p.y, p.z);
+  if (here === STAIRS_DOWN) return { type: "USE_STAIRS", dir: "down", transactional: false };
+  if (here === STAIRS_UP) return { type: "USE_STAIRS", dir: "up", transactional: false };
+  if (getTrapAt(state, p.x, p.y, p.z, { requireArmed: true, requireRevealed: true })) {
+    return { type: "DISARM_TRAP", dir: "", transactional: false };
+  }
+  const shopkeeper = findItemAtByType(state, p.x, p.y, p.z, "shopkeeper");
+  if (shopkeeper?.type === "shopkeeper") return { type: "SHOP_INTERACT", dir: "", transactional: true };
+  const shrine = findItemAtByType(state, p.x, p.y, p.z, "shrine");
+  if (shrine?.type === "shrine") return { type: "USE_SHRINE", dir: "", transactional: false };
+  return null;
+}
+
+function isLivePlayerInteractionActionType(type = "") {
+  const normalized = String(type ?? "").trim().toUpperCase();
+  return normalized === "OPEN_DOOR"
+    || normalized === "CLOSE_DOOR"
+    || normalized === "PICKUP"
+    || normalized === "OPEN_CHEST"
+    || normalized === "DISARM_TRAP"
+    || normalized === "USE_SHRINE"
+    || normalized === "USE_STAIRS";
+}
+
+function resolveLiveInteractionEffect(state, interactionType = "", options = null) {
+  const type = String(interactionType ?? "").trim().toUpperCase();
+  const opts = (options && typeof options === "object") ? options : {};
+  if (type === "OPEN_DOOR") return !!tryOpenAdjacentDoor(state);
+  if (type === "CLOSE_DOOR") return !!tryCloseAdjacentDoor(state);
+  if (type === "PICKUP" || type === "OPEN_CHEST") return !!pickup(state);
+  if (type === "DISARM_TRAP") return !!disarmTrapAtPlayer(state);
+  if (type === "USE_SHRINE") return !!interactShrine(state);
+  if (type === "USE_STAIRS") return !!tryUseStairs(state, String(opts.dir ?? "").trim().toLowerCase());
+  return false;
+}
+
+function startLivePlayerInteractionAction(state, descriptor = null, options = null) {
+  if (!state?.player || !descriptor || descriptor.transactional === true) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const type = String(descriptor.type ?? "").trim().toUpperCase();
+  if (!isLivePlayerInteractionActionType(type)) return false;
+  const live = ensureLiveSimulationState(state);
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? live.tick ?? 0) || 0));
+  if (state.player.dead) return false;
+  if (playerLive.action.actionState === "windup" || playerLive.action.actionState === "executing") return false;
+  if (currentTick < Math.max(playerLive.action.gcdEndTick, playerLive.action.moveLockUntilTick)) return false;
+  const timing = liveInteractionTimingForCommand(type);
+  if (timing.blockedInCombat && playerIsInLiveCombat(state, currentTick)) return false;
+
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+  playerLive.intent.interactMode = type.toLowerCase();
+  playerLive.action.currentActionType = type;
+  playerLive.action.currentActionId = `${type.toLowerCase()}_${actionSeq}`;
+  playerLive.action.actionState = "windup";
+  playerLive.action.actionStartTick = currentTick;
+  playerLive.action.actionResolveTick = currentTick + timing.castTicks;
+  playerLive.action.actionRecoveryEndTick = currentTick + timing.castTicks + timing.recoveryTicks;
+  playerLive.action.gcdEndTick = playerLive.action.actionRecoveryEndTick;
+  playerLive.action.moveLockUntilTick = currentTick + timing.moveLockTicks;
+  playerLive.action.sequence = actionSeq;
+  playerLive.action.targetId = type === "USE_STAIRS" ? String(descriptor.dir ?? "").trim().toLowerCase() : "";
+  playerLive.action.targetPos = {
+    x: Math.floor(Number(state.player.x ?? 0)),
+    y: Math.floor(Number(state.player.y ?? 0)),
+    z: Math.floor(Number(state.player.z ?? 0)),
+  };
+  pushLiveSimulationEvent(state, "player_interact_windup", {
+    tick: currentTick,
+    actorId: liveSimulationActorId(state, state.player, "player"),
+    targetId: playerLive.action.targetId,
+    actionId: playerLive.action.currentActionId,
+    payload: {
+      interactionType: type,
+      castTicks: timing.castTicks,
+    },
+  });
+  return true;
+}
+
+function resolveLivePlayerInteractionAction(state, options = null) {
+  if (!state?.player) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const interactionType = String(playerLive.action.currentActionType ?? "").trim().toUpperCase();
+  if (!isLivePlayerInteractionActionType(interactionType) || playerLive.action.actionState !== "windup") return false;
+  const actionId = String(playerLive.action.currentActionId ?? "").trim();
+  const dir = String(playerLive.action.targetId ?? "").trim().toLowerCase();
+  const resolved = resolveLiveInteractionEffect(state, interactionType, { dir });
+  pushLiveSimulationEvent(state, resolved ? "player_interact_resolve" : "player_interact_cancel", {
+    tick: currentTick,
+    actorId: liveSimulationActorId(state, state.player, "player"),
+    targetId: dir,
+    actionId,
+    payload: {
+      interactionType,
+      reason: resolved ? "resolved" : "failed",
+    },
+  });
+  playerLive.intent.interactMode = "";
+  playerLive.action.actionState = "recovery";
+  playerLive.action.actionResolveTick = currentTick;
+  if (currentTick > playerLive.action.actionRecoveryEndTick) {
+    playerLive.action.actionRecoveryEndTick = currentTick;
+  }
+  return resolved;
+}
+
+function liveTrapArmDelayTicks(trapFamily = "pressure_plate") {
+  const familyId = trapFamilyDef(trapFamily)?.id ?? "pressure_plate";
+  if (familyId === "beam_link") return 2;
+  return 1;
+}
+
+function scheduleLiveTrapArming(trap = null, currentTick = 0) {
+  if (!trap || trap.kind !== "trap") return null;
+  const armAtTick = Math.max(0, Math.floor(Number(currentTick) || 0)) + liveTrapArmDelayTicks(trap.trapFamily ?? trap.trapType ?? "pressure_plate");
+  trap.armed = false;
+  trap.payload = (trap.payload && typeof trap.payload === "object") ? { ...trap.payload } : {};
+  trap.payload.armAtTick = armAtTick;
+  trap.payload.deployedAtTick = Math.max(0, Math.floor(Number(currentTick) || 0));
+  trap.live = normalizeLiveCombatActorState(trap.live ?? null, "trap");
+  trap.live.action.currentActionType = "ARMING";
+  trap.live.action.currentActionId = `trap_arm_${armAtTick}`;
+  trap.live.action.actionState = "windup";
+  trap.live.action.actionStartTick = Math.max(0, Math.floor(Number(currentTick) || 0));
+  trap.live.action.actionResolveTick = armAtTick;
+  trap.live.action.actionRecoveryEndTick = armAtTick;
+  return armAtTick;
+}
+
+function advanceLiveTrapTimingOnTick(state, options = null) {
+  if (!state || typeof state !== "object") return 0;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  let armedCount = 0;
+  for (const trap of state.entities?.values?.() ?? []) {
+    if (!trap || trap.kind !== "trap") continue;
+    const payload = (trap.payload && typeof trap.payload === "object") ? trap.payload : null;
+    const armAtTick = Math.floor(Number(payload?.armAtTick ?? NaN));
+    if (!Number.isFinite(armAtTick) || currentTick < armAtTick) continue;
+    trap.armed = true;
+    if (payload) {
+      delete payload.armAtTick;
+      trap.payload = payload;
+    }
+    trap.live = normalizeLiveCombatActorState(trap.live ?? null, "trap");
+    trap.live.action.actionState = "idle";
+    trap.live.action.currentActionType = "";
+    trap.live.action.currentActionId = "";
+    trap.live.action.actionResolveTick = currentTick;
+    trap.live.action.actionRecoveryEndTick = currentTick;
+    persistTrapOverride(state, trap);
+    pushLiveSimulationEvent(state, "trap_armed", {
+      tick: currentTick,
+      actorId: String(trap.id ?? "").trim(),
+      actionId: `trap_arm_${currentTick}`,
+      payload: {
+        trapFamily: trapFamilyId(trap),
+        x: Math.floor(Number(trap.x ?? 0)),
+        y: Math.floor(Number(trap.y ?? 0)),
+        z: Math.floor(Number(trap.z ?? 0)),
+      },
+    });
+    armedCount += 1;
+  }
+  return armedCount;
+}
+
+function liveTelegraphPointsForPlayerAbility(state, ability = null, target = null) {
+  const p = state?.player;
+  if (!p || !ability) return [];
+  const targeting = String(ability?.targeting ?? "").trim().toLowerCase();
+  if (targeting === "self") {
+    return [{ x: Math.floor(Number(p.x ?? 0)), y: Math.floor(Number(p.y ?? 0)), z: Math.floor(Number(p.z ?? 0)) }];
+  }
+  if (targeting === "ground") {
+    return [
+      { x: Math.floor(Number(p.x ?? 0)), y: Math.floor(Number(p.y ?? 0)), z: Math.floor(Number(p.z ?? 0)) },
+      { x: Math.floor(Number(p.x ?? 0)), y: Math.floor(Number(p.y - 1 ?? 0)), z: Math.floor(Number(p.z ?? 0)) },
+    ];
+  }
+  const targetPos = target
+    ? { x: Math.floor(Number(target.x ?? 0)), y: Math.floor(Number(target.y ?? 0)), z: Math.floor(Number(target.z ?? p.z ?? 0)) }
+    : { x: Math.floor(Number(p.x ?? 0)), y: Math.floor(Number(p.y ?? 0)), z: Math.floor(Number(p.z ?? 0)) };
+  return [
+    { x: Math.floor(Number(p.x ?? 0)), y: Math.floor(Number(p.y ?? 0)), z: Math.floor(Number(p.z ?? 0)) },
+    targetPos,
+  ];
+}
+
+function startLivePlayerAbilityAction(state, ability = null, explicitTarget = null, options = null) {
+  if (!state?.player || !ability) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const live = ensureLiveSimulationState(state);
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? live.tick ?? 0) || 0));
+  if (state.player.dead || !canPlayerUseActiveAbility(state.player, ability)) return false;
+  if (playerLive.action.actionState === "windup" || playerLive.action.actionState === "executing") return false;
+  if (currentTick < Math.max(playerLive.action.gcdEndTick, playerLive.action.moveLockUntilTick)) return false;
+  const occupancy = opts.occupancy ?? getCachedOccupancy(state);
+  const target = resolveLiveAbilityTargetForPlayer(state, ability, explicitTarget, occupancy);
+  const targeting = String(ability.targeting ?? "").trim().toLowerCase();
+  if (targeting === "enemy" && !target) return false;
+  if (!reserveLivePlayerAbilityResources(state, ability)) return false;
+
+  const timing = liveAbilityTimingForPlayer(state.player, ability);
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+  playerLive.intent.abilityId = ability.id;
+  playerLive.intent.abilityTarget = target
+    ? { x: Math.floor(Number(target.x ?? 0)), y: Math.floor(Number(target.y ?? 0)), z: Math.floor(Number(target.z ?? state.player.z ?? 0)) }
+    : { x: Math.floor(Number(state.player.x ?? 0)), y: Math.floor(Number(state.player.y ?? 0)), z: Math.floor(Number(state.player.z ?? 0)) };
+  playerLive.intent.attackTargetId = "";
+  playerLive.action.currentActionType = "ABILITY";
+  playerLive.action.currentActionId = `ability_${actionSeq}`;
+  playerLive.action.actionState = "windup";
+  playerLive.action.actionStartTick = currentTick;
+  playerLive.action.actionResolveTick = currentTick + timing.castTicks;
+  playerLive.action.actionRecoveryEndTick = currentTick + timing.castTicks + timing.recoveryTicks;
+  playerLive.action.gcdEndTick = playerLive.action.actionRecoveryEndTick;
+  playerLive.action.moveLockUntilTick = currentTick + timing.moveLockTicks;
+  playerLive.action.sequence = actionSeq;
+  playerLive.action.targetId = target?.id ?? "";
+  playerLive.action.targetPos = target
+    ? { x: Math.floor(Number(target.x ?? 0)), y: Math.floor(Number(target.y ?? 0)), z: Math.floor(Number(target.z ?? state.player.z ?? 0)) }
+    : { x: Math.floor(Number(state.player.x ?? 0)), y: Math.floor(Number(state.player.y ?? 0)), z: Math.floor(Number(state.player.z ?? 0)) };
+  if (timing.telegraphed) {
+    state.live.telegraphs = state.live.telegraphs
+      .filter((entry) => String(entry?.id ?? "").trim() !== playerLive.action.currentActionId)
+      .concat({
+        id: playerLive.action.currentActionId,
+        actorId: liveSimulationActorId(state, state.player, "player"),
+        abilityId: ability.id,
+        startTick: currentTick,
+        resolveTick: playerLive.action.actionResolveTick,
+        shape: liveTelegraphShapeForAbility(ability),
+        points: liveTelegraphPointsForPlayerAbility(state, ability, target),
+      })
+      .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+    }
+  pushLiveSimulationEvent(state, "player_ability_windup", {
+    tick: currentTick,
+    actorId: liveSimulationActorId(state, state.player, "player"),
+    targetId: target?.id ?? "",
+    actionId: playerLive.action.currentActionId,
+    payload: {
+      abilityId: ability.id,
+      castTicks: timing.castTicks,
+      telegraphed: timing.telegraphed === true,
+    },
+  });
+  return true;
+}
+
+function resolveLivePlayerAbilityAction(state, options = null) {
+  if (!state?.player) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const actionId = String(playerLive.action.currentActionId ?? "").trim();
+  if (playerLive.action.currentActionType !== "ABILITY" || playerLive.action.actionState !== "windup") return false;
+  const ability = playerActiveAbility(state);
+  const abilityId = String(playerLive.intent.abilityId ?? ability?.id ?? "").trim();
+  const resolvedAbility = ability && ability.id === abilityId ? ability : activeAbilityForClass(state.player?.classId);
+  clearLiveTelegraphForAction(state, actionId);
+  let resolved = false;
+  if (resolvedAbility && resolvedAbility.id === abilityId) {
+    const targetId = String(playerLive.action.targetId ?? "").trim();
+    const target = targetId ? (state.entities?.get(targetId) ?? null) : null;
+    const occupancy = getCachedOccupancy(state);
+    const targeting = String(resolvedAbility.targeting ?? "").trim().toLowerCase();
+    let liveTarget = null;
+    if (targeting === "enemy") {
+      const candidates = monstersTargetableByAbility(state, resolvedAbility, occupancy);
+      if (target?.kind === "monster" && candidates.some((entry) => entry.monster?.id === target.id)) {
+        liveTarget = target;
+      }
+    }
+    if (targeting !== "enemy" || liveTarget) {
+      resolved = resolvePlayerAbilityEffect(state, resolvedAbility, liveTarget, occupancy);
+    }
+    analyticsEventAtPlayer(state, resolvedAbility.id, {
+      abilityId: resolvedAbility.id,
+      classId: state.player.classId,
+      energyCost: activeAbilityCostForPlayer(state.player, resolvedAbility),
+    });
+  }
+  pushLiveSimulationEvent(state, resolved ? "player_ability_resolve" : "player_ability_cancel", {
+    tick: currentTick,
+    actorId: liveSimulationActorId(state, state.player, "player"),
+    targetId: String(playerLive.action.targetId ?? ""),
+    actionId,
+    payload: {
+      abilityId,
+      reason: resolved ? "resolved" : "invalid_target",
+    },
+  });
+  playerLive.intent.abilityId = "";
+  playerLive.intent.abilityTarget = null;
+  playerLive.action.actionState = "recovery";
+  playerLive.action.actionResolveTick = currentTick;
+  if (currentTick > playerLive.action.actionRecoveryEndTick) {
+    playerLive.action.actionRecoveryEndTick = currentTick;
+  }
+  return resolved;
+}
+
+function clearLivePlayerCombatTarget(state, targetId = "") {
+  if (!state?.player) return;
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const id = String(targetId ?? "").trim();
+  if (!id || playerLive.intent.attackTargetId === id) playerLive.intent.attackTargetId = "";
+  if (!id || playerLive.combat.combatTargetId === id) playerLive.combat.combatTargetId = "";
+  if (!id || playerLive.combat.lastDamagedById === id) playerLive.combat.lastDamagedById = "";
+  if (!id || playerLive.action.targetId === id) playerLive.action.targetId = "";
+  if (!playerLive.intent.attackTargetId && !playerLive.combat.combatTargetId) {
+    playerLive.combat.lastKnownEnemyPos = null;
+    playerLive.combat.aggroState = "ready";
+  }
+}
+
+function markLiveCombatEngagement(state, source = null, sourceKind = "actor", target = null, targetKind = "actor", tick = null) {
+  if (!state || typeof state !== "object") return;
+  const currentTick = Math.max(0, Math.floor(Number(tick ?? currentLiveSimulationTick(state)) || 0));
+  const untilTick = currentTick + liveCombatWindowTicks();
+  const sourceLive = sourceKind === "player"
+    ? ensureLiveActorState(state.player, "player")
+    : ensureLiveActorState(source, sourceKind);
+  const targetLive = targetKind === "player"
+    ? ensureLiveActorState(state.player, "player")
+    : ensureLiveActorState(target, targetKind);
+  const sourceId = liveSimulationActorId(state, source, sourceKind);
+  const targetId = liveSimulationActorId(state, target, targetKind);
+  if (sourceLive) {
+    sourceLive.combat.inCombatUntilTick = Math.max(sourceLive.combat.inCombatUntilTick, untilTick);
+    sourceLive.combat.combatTargetId = targetId;
+    if (target && typeof target === "object" && Number.isFinite(Number(target.x)) && Number.isFinite(Number(target.y)) && Number.isFinite(Number(target.z))) {
+      sourceLive.combat.lastKnownEnemyPos = {
+        x: Math.floor(Number(target.x)),
+        y: Math.floor(Number(target.y)),
+        z: Math.floor(Number(target.z)),
+      };
+    }
+    sourceLive.combat.aggroState = "engaged";
+    if (sourceKind === "player") {
+      sourceLive.intent.attackTargetId = targetId;
+    }
+  }
+  if (targetLive) {
+    targetLive.combat.inCombatUntilTick = Math.max(targetLive.combat.inCombatUntilTick, untilTick);
+    targetLive.combat.lastDamagedById = sourceId;
+    targetLive.combat.combatTargetId = sourceId;
+    if (source && typeof source === "object" && Number.isFinite(Number(source.x)) && Number.isFinite(Number(source.y)) && Number.isFinite(Number(source.z))) {
+      targetLive.combat.lastKnownEnemyPos = {
+        x: Math.floor(Number(source.x)),
+        y: Math.floor(Number(source.y)),
+        z: Math.floor(Number(source.z)),
+      };
+    }
+    targetLive.combat.aggroState = "engaged";
+    if (targetKind === "player" && targetLive.intent.autoRetaliate) {
+      targetLive.intent.attackTargetId = sourceId;
+    }
+  }
+}
+
+function resolveLivePlayerAttackTarget(state) {
+  if (!state?.player || state.player.dead) return null;
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const profile = playerWeaponAttackProfile(state);
+  const resolveById = (id) => {
+    const monsterId = String(id ?? "").trim();
+    if (!monsterId) return null;
+    const monster = state.entities?.get(monsterId) ?? null;
+    if (!monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return null;
+    return playerCanAttackMonster(state, monster, profile) ? monster : null;
+  };
+
+  const primary = resolveById(playerLive.intent.attackTargetId)
+    || resolveById(playerLive.combat.lastDamagedById)
+    || resolveById(playerLive.combat.combatTargetId)
+    || (playerLive.intent.autoRetaliate ? (getAttackableMonsters(state, null, profile)[0]?.monster ?? null) : null);
+
+  if (!primary) {
+    if (
+      playerLive.intent.attackTargetId
+      && !state.entities?.has?.(playerLive.intent.attackTargetId)
+    ) {
+      clearLivePlayerCombatTarget(state, playerLive.intent.attackTargetId);
+    }
+    return null;
+  }
+  playerLive.intent.attackTargetId = primary.id;
+  playerLive.combat.combatTargetId = primary.id;
+  playerLive.combat.lastKnownEnemyPos = {
+    x: Math.floor(Number(primary.x ?? 0)),
+    y: Math.floor(Number(primary.y ?? 0)),
+    z: Math.floor(Number(primary.z ?? state.player.z ?? 0)),
+  };
+  playerLive.combat.aggroState = "engaged";
+  return primary;
+}
+
+function liveMonsterCanConsiderSupportAction(state, monster = null, currentTick = 0) {
+  if (!state?.player || !monster || monster.kind !== "monster") return false;
+  const p = state.player;
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  const actRadius = Math.max(viewRadiusX, viewRadiusY) + 5;
+  const dx = Math.floor(Number(monster.x ?? 0)) - Math.floor(Number(p.x ?? 0));
+  const dy = Math.floor(Number(monster.y ?? 0)) - Math.floor(Number(p.y ?? 0));
+  const nearPlayer = (dx * dx + dy * dy) <= (actRadius * actRadius);
+  const hasMemory = monsterHasFreshPlayerMemory(monster, currentTick, Math.max(6, liveTicksFromLegacyTurns(10)));
+  const engaged = currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0));
+  return nearPlayer || monster.awake || hasMemory || engaged;
+}
+
+function liveMonsterSupportTiming(monster = null, spec = null, abilityId = "") {
+  const speed = Math.max(0.5, Number(monster?.spd ?? spec?.spd ?? 1) || 1);
+  const normalizedId = String(abilityId ?? "").trim().toLowerCase();
+  const summon = normalizedId === "summon_skeleton";
+  const castBase = summon ? 4 : 3;
+  const recoveryBase = summon ? 3 : 2;
+  const moveLockBase = summon ? 2 : 1;
+  const cooldownTurns = summon
+    ? Math.max(2, Math.floor(Number(spec?.summonCooldownTurns ?? 6) || 6))
+    : 4;
+  return {
+    castTicks: Math.max(1, Math.min(8, Math.round(castBase / speed))),
+    recoveryTicks: Math.max(1, Math.min(6, Math.round(recoveryBase / speed))),
+    moveLockTicks: Math.max(0, Math.min(4, Math.round(moveLockBase / speed))),
+    cooldownTicks: Math.max(6, liveTicksFromLegacyTurns(cooldownTurns)),
+    telegraphed: true,
+  };
+}
+
+function liveTelegraphPointsForMonsterAbility(state, monster = null, abilityId = "", targetPos = null) {
+  if (!state?.player || !monster) return [];
+  const origin = {
+    x: Math.floor(Number(monster.x ?? 0)),
+    y: Math.floor(Number(monster.y ?? 0)),
+    z: Math.floor(Number(monster.z ?? state.player.z ?? 0)),
+  };
+  const normalizedId = String(abilityId ?? "").trim().toLowerCase();
+  const resolvedTarget = normalizeLiveTargetPoint(targetPos ?? null)
+    ?? (normalizedId === "summon_skeleton"
+      ? origin
+      : {
+          x: Math.floor(Number(state.player.x ?? 0)),
+          y: Math.floor(Number(state.player.y ?? 0)),
+          z: Math.floor(Number(state.player.z ?? 0)),
+        });
+  if (normalizedId === "bolster_undead") return [origin];
+  return [origin, resolvedTarget];
+}
+
+function chooseLiveMonsterAbilityAction(state, monster = null, spec = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster") return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const ai = String(spec?.ai ?? (spec?.range ? "ranged_hold" : "melee_chase")).trim().toLowerCase();
+  if (ai !== "support_undead") return null;
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  if (monsterLive.cooldowns.abilityTicks > 0) return null;
+  if (!liveMonsterCanConsiderSupportAction(state, monster, currentTick)) return null;
+  return chooseMonsterSupportUndeadAction(state, monster, spec, opts);
+}
+
+function startLiveMonsterAbilityAction(state, monster = null, spec = null, descriptor = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0 || !descriptor) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const live = ensureLiveSimulationState(state);
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  if (monsterLive.action.actionState === "windup" || monsterLive.action.actionState === "executing" || monsterLive.action.actionState === "recovery") return false;
+  if (monsterLive.cooldowns.abilityTicks > 0) return false;
+
+  const abilityId = String(descriptor.abilityId ?? "").trim().toLowerCase();
+  if (!abilityId) return false;
+  const timing = liveMonsterSupportTiming(monster, spec, abilityId);
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+
+  monsterLive.intent.abilityId = abilityId;
+  monsterLive.intent.abilityTarget = normalizeLiveTargetPoint(descriptor.targetPos ?? null);
+  monsterLive.action.currentActionType = "ABILITY";
+  monsterLive.action.currentActionId = `monster_ability_${actionSeq}`;
+  monsterLive.action.actionState = "windup";
+  monsterLive.action.actionStartTick = currentTick;
+  monsterLive.action.actionResolveTick = currentTick + timing.castTicks;
+  monsterLive.action.actionRecoveryEndTick = currentTick + timing.castTicks + timing.recoveryTicks;
+  monsterLive.action.gcdEndTick = monsterLive.action.actionRecoveryEndTick;
+  monsterLive.action.moveLockUntilTick = currentTick + timing.moveLockTicks;
+  monsterLive.action.sequence = actionSeq;
+  monsterLive.action.targetId = abilityId;
+  monsterLive.action.targetPos = normalizeLiveTargetPoint(descriptor.targetPos ?? null);
+  monster.awake = true;
+  noteLiveMonsterAiDecision(monster, currentTick, "casting", abilityId, {
+    behaviorId: String(spec?.ai ?? "").trim().toLowerCase() || "support_undead",
+  });
+  const seesPlayer = state.player && hasLineOfSight(
+    state.world,
+    Math.floor(Number(monster.z ?? state.player.z ?? 0)),
+    monster.x,
+    monster.y,
+    state.player.x,
+    state.player.y
+  );
+  if (
+    state.player
+    && Math.floor(Number(monster.z ?? state.player.z ?? 0)) === Math.floor(Number(state.player.z ?? 0))
+    && (seesPlayer || currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0)))
+  ) {
+    liveRememberMonsterPlayer(state, monster, currentTick);
+  }
+  if (timing.telegraphed) {
+    state.live.telegraphs = state.live.telegraphs
+      .filter((entry) => String(entry?.id ?? "").trim() !== monsterLive.action.currentActionId)
+      .concat({
+        id: monsterLive.action.currentActionId,
+        actorId: monster.id,
+        abilityId,
+        startTick: currentTick,
+        resolveTick: monsterLive.action.actionResolveTick,
+        shape: abilityId === "bolster_undead" ? "cell" : "line",
+        points: liveTelegraphPointsForMonsterAbility(state, monster, abilityId, descriptor.targetPos),
+      })
+      .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+  }
+  pushLiveSimulationEvent(state, "monster_ability_windup", {
+    tick: currentTick,
+    actorId: monster.id,
+    targetId: abilityId,
+    actionId: monsterLive.action.currentActionId,
+    payload: {
+      abilityId,
+      castTicks: timing.castTicks,
+      telegraphed: timing.telegraphed === true,
+    },
+  });
+  persistMonsterOverride(state, monster);
+  return true;
+}
+
+function resolveLiveMonsterAbilityAction(state, monster = null, spec = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster") return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  if (monsterLive.action.currentActionType !== "ABILITY" || monsterLive.action.actionState !== "windup") return false;
+  const actionId = String(monsterLive.action.currentActionId ?? "").trim();
+  const abilityId = String(monsterLive.intent.abilityId ?? monsterLive.action.targetId ?? "").trim().toLowerCase();
+  clearLiveTelegraphForAction(state, actionId);
+
+  const result = resolveMonsterSupportUndeadActionEffect(state, monster, spec, {
+    abilityId,
+    targetPos: monsterLive.action.targetPos,
+  }, {
+    currentTick,
+    trackPlayer: hasLineOfSight(state.world, Math.floor(Number(monster.z ?? state.player.z ?? 0)), monster.x, monster.y, state.player.x, state.player.y)
+      || currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0)),
+  });
+  if (result.ok) {
+    const timing = liveMonsterSupportTiming(monster, spec, abilityId);
+    const cooldownTicks = Math.max(1, Math.floor(Number(result.cooldownTicks ?? timing.cooldownTicks) || timing.cooldownTicks));
+    monsterLive.cooldowns.abilityTicks = Math.max(monsterLive.cooldowns.abilityTicks, cooldownTicks);
+  }
+  pushLiveSimulationEvent(state, result.ok ? "monster_ability_resolve" : "monster_ability_cancel", {
+    tick: currentTick,
+    actorId: monster.id,
+    targetId: abilityId,
+    actionId,
+    payload: {
+      abilityId,
+      reason: result.ok ? "resolved" : String(result.reason ?? "invalid").trim().toLowerCase() || "invalid",
+      affectedIds: Array.isArray(result.affectedIds) ? result.affectedIds.slice(0, 8) : [],
+    },
+  });
+  monsterLive.intent.abilityId = "";
+  monsterLive.intent.abilityTarget = null;
+  monsterLive.action.actionState = "recovery";
+  monsterLive.action.actionResolveTick = currentTick;
+  noteLiveMonsterAiDecision(monster, currentTick, result.ok ? "recovering" : "repositioning", result.ok ? abilityId : (result.reason ?? "invalid"), {
+    behaviorId: String(spec?.ai ?? "").trim().toLowerCase() || "support_undead",
+  });
+  if (currentTick > monsterLive.action.actionRecoveryEndTick) {
+    monsterLive.action.actionRecoveryEndTick = currentTick;
+  }
+  persistMonsterOverride(state, monster);
+  return result.ok === true;
+}
+
+function startLivePlayerBasicAttack(state, monster = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const live = ensureLiveSimulationState(state);
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? live.tick ?? 0) || 0));
+  if (state.player.dead) return false;
+  if (playerLive.cooldowns.attackTicks > 0) return false;
+  if (currentTick < Math.max(playerLive.action.gcdEndTick, playerLive.action.moveLockUntilTick)) return false;
+  if (playerLive.action.actionState === "windup" || playerLive.action.actionState === "executing") return false;
+  const weaponProfile = playerWeaponAttackProfile(state);
+  if (!playerCanAttackMonster(state, monster, weaponProfile)) return false;
+
+  const timing = liveBasicAttackTiming(state.player, "player", { weaponProfile });
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+  playerLive.intent.attackTargetId = monster.id;
+  playerLive.combat.combatTargetId = monster.id;
+  playerLive.combat.lastKnownEnemyPos = {
+    x: Math.floor(Number(monster.x ?? 0)),
+    y: Math.floor(Number(monster.y ?? 0)),
+    z: Math.floor(Number(monster.z ?? state.player.z ?? 0)),
+  };
+  playerLive.combat.aggroState = "engaged";
+  playerLive.action.currentActionType = "ATTACK";
+  playerLive.action.currentActionId = `attack_${actionSeq}`;
+  playerLive.action.actionState = "windup";
+  playerLive.action.actionStartTick = currentTick;
+  playerLive.action.actionResolveTick = currentTick + timing.windupTicks;
+  playerLive.action.actionRecoveryEndTick = currentTick + timing.windupTicks + timing.recoveryTicks;
+  playerLive.action.gcdEndTick = playerLive.action.actionRecoveryEndTick;
+  playerLive.action.moveLockUntilTick = currentTick + timing.moveLockTicks;
+  playerLive.action.sequence = actionSeq;
+  playerLive.action.targetId = monster.id;
+  playerLive.action.targetPos = {
+    x: Math.floor(Number(monster.x ?? 0)),
+    y: Math.floor(Number(monster.y ?? 0)),
+    z: Math.floor(Number(monster.z ?? state.player.z ?? 0)),
+  };
+  playerLive.cooldowns.attackTicks = Math.max(playerLive.cooldowns.attackTicks, timing.cooldownTicks);
+  state.lastPlayerActionKind = "attack";
+  markLiveCombatEngagement(state, state.player, "player", monster, "monster", currentTick);
+  pushLiveSimulationEvent(state, "player_attack_windup", {
+    tick: currentTick,
+    actorId: liveSimulationActorId(state, state.player, "player"),
+    targetId: monster.id,
+    actionId: playerLive.action.currentActionId,
+    payload: {
+      windupTicks: timing.windupTicks,
+      recoveryTicks: timing.recoveryTicks,
+      attackKind: String(weaponProfile?.kind ?? "melee"),
+    },
+  });
+  return true;
+}
+
+function resolveLivePlayerBasicAttack(state, options = null) {
+  if (!state?.player) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const actionId = String(playerLive.action.currentActionId ?? "").trim();
+  if (playerLive.action.currentActionType !== "ATTACK" || playerLive.action.actionState !== "windup") return false;
+  const targetId = String(playerLive.action.targetId ?? playerLive.intent.attackTargetId ?? "").trim();
+  const target = targetId ? (state.entities?.get(targetId) ?? null) : null;
+  const weaponProfile = playerWeaponAttackProfile(state);
+  let resolved = false;
+  if (target && target.kind === "monster" && (target.hp ?? 0) > 0 && playerCanAttackMonster(state, target, weaponProfile)) {
+    playerAttack(state, target);
+    markLiveCombatEngagement(state, state.player, "player", target, "monster", currentTick);
+    pushLiveSimulationEvent(state, "player_attack_resolve", {
+      tick: currentTick,
+      actorId: liveSimulationActorId(state, state.player, "player"),
+      targetId,
+      actionId,
+      payload: {
+        x: Math.floor(Number(target.x ?? 0)),
+        y: Math.floor(Number(target.y ?? 0)),
+        z: Math.floor(Number(target.z ?? state.player.z ?? 0)),
+      },
+    });
+    resolved = true;
+  } else {
+    clearLivePlayerCombatTarget(state, targetId);
+    pushLiveSimulationEvent(state, "player_attack_cancel", {
+      tick: currentTick,
+      actorId: liveSimulationActorId(state, state.player, "player"),
+      targetId,
+      actionId,
+      payload: {
+        reason: "invalid_target",
+      },
+    });
+  }
+  playerLive.action.actionState = "recovery";
+  playerLive.action.actionResolveTick = currentTick;
+  if (currentTick > playerLive.action.actionRecoveryEndTick) {
+    playerLive.action.actionRecoveryEndTick = currentTick;
+  }
+  return resolved;
+}
+
+function monsterCanHitPlayerNow(state, monster = null, spec = null) {
+  if (!state?.player || !monster || monster.kind !== "monster") return { canHit: false, ranged: false, telegraphed: false };
+  const p = state.player;
+  const z = Math.floor(Number(monster.z ?? p.z ?? 0));
+  if (p.dead || z !== Math.floor(Number(p.z ?? 0))) return { canHit: false, ranged: false, telegraphed: false };
+  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, z);
+  const ai = String(monsterSpec.ai ?? (monsterSpec.range ? "ranged_hold" : "melee_chase")).trim().toLowerCase();
+  const dist = Math.abs((monster.x ?? 0) - p.x) + Math.abs((monster.y ?? 0) - p.y);
+  const adj = dist === 1;
+  const minRange = Math.max(1, Math.floor(Number(monsterSpec.minRange ?? (monsterSpec.range ? 2 : 1)) || 1));
+  const ranged = Math.max(0, Math.floor(Number(monsterSpec.range ?? 0) || 0)) > 0;
+  const telegraphed = ranged && monsterUsesIntentTelegraph(monster, monsterSpec, ai);
+  if (adj) return { canHit: true, ranged: false, telegraphed: false };
+  if (!ranged) return { canHit: false, ranged: false, telegraphed: false };
+  const hasLos = hasLineOfSight(state.world, z, monster.x, monster.y, p.x, p.y);
+  const canShoot = dist >= minRange && dist <= Math.max(minRange, Math.floor(Number(monsterSpec.range ?? minRange) || minRange)) && hasLos;
+  return { canHit: canShoot, ranged: true, telegraphed };
+}
+
+function startLiveMonsterBasicAttack(state, monster = null, spec = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
+  const canAttack = monsterCanHitPlayerNow(state, monster, monsterSpec);
+  if (!canAttack.canHit) return false;
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  if (monsterLive.cooldowns.attackTicks > 0) return false;
+  if (monsterLive.action.actionState === "windup" || monsterLive.action.actionState === "executing") return false;
+
+  const live = ensureLiveSimulationState(state);
+  const timing = liveBasicAttackTiming(monster, "monster", { spec: monsterSpec });
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+  monsterLive.action.currentActionType = "ATTACK";
+  monsterLive.action.currentActionId = `monster_attack_${actionSeq}`;
+  monsterLive.action.actionState = "windup";
+  monsterLive.action.actionStartTick = currentTick;
+  monsterLive.action.actionResolveTick = currentTick + timing.windupTicks;
+  monsterLive.action.actionRecoveryEndTick = currentTick + timing.windupTicks + timing.recoveryTicks;
+  monsterLive.action.gcdEndTick = monsterLive.action.actionRecoveryEndTick;
+  monsterLive.action.moveLockUntilTick = currentTick + timing.moveLockTicks;
+  monsterLive.action.sequence = actionSeq;
+  monsterLive.action.targetId = liveSimulationActorId(state, state.player, "player");
+  monsterLive.action.targetPos = {
+    x: Math.floor(Number(state.player.x ?? 0)),
+    y: Math.floor(Number(state.player.y ?? 0)),
+    z: Math.floor(Number(state.player.z ?? 0)),
+  };
+  monsterLive.cooldowns.attackTicks = Math.max(monsterLive.cooldowns.attackTicks, timing.cooldownTicks);
+  monsterLive.combat.combatTargetId = liveSimulationActorId(state, state.player, "player");
+  monsterLive.combat.lastKnownEnemyPos = {
+    x: Math.floor(Number(state.player.x ?? 0)),
+    y: Math.floor(Number(state.player.y ?? 0)),
+    z: Math.floor(Number(state.player.z ?? 0)),
+  };
+  monsterLive.combat.aggroState = "engaged";
+  noteLiveMonsterAiDecision(monster, currentTick, "attacking", canAttack.ranged ? "ranged_attack" : "melee_attack", {
+    behaviorId: String(monsterSpec.ai ?? "").trim().toLowerCase() || (monsterSpec.range ? "ranged_hold" : "melee_chase"),
+  });
+  monster.awake = true;
+  liveRememberMonsterPlayer(state, monster, currentTick);
+  if (timing.telegraphed) {
+    state.live.telegraphs = state.live.telegraphs
+      .filter((entry) => String(entry?.id ?? "").trim() !== monsterLive.action.currentActionId)
+      .concat({
+        id: monsterLive.action.currentActionId,
+        actorId: monster.id,
+        abilityId: "basic_attack",
+        startTick: currentTick,
+        resolveTick: monsterLive.action.actionResolveTick,
+        shape: canAttack.ranged ? "line" : "cell",
+        points: [
+          { x: Math.floor(Number(monster.x ?? 0)), y: Math.floor(Number(monster.y ?? 0)), z: Math.floor(Number(monster.z ?? state.player.z ?? 0)) },
+          { x: Math.floor(Number(state.player.x ?? 0)), y: Math.floor(Number(state.player.y ?? 0)), z: Math.floor(Number(state.player.z ?? 0)) },
+        ],
+      })
+      .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
+  }
+  markLiveCombatEngagement(state, monster, "monster", state.player, "player", currentTick);
+  pushLiveSimulationEvent(state, "monster_attack_windup", {
+    tick: currentTick,
+    actorId: monster.id,
+    targetId: liveSimulationActorId(state, state.player, "player"),
+    actionId: monsterLive.action.currentActionId,
+    payload: {
+      windupTicks: timing.windupTicks,
+      telegraphed: timing.telegraphed === true,
+      ranged: canAttack.ranged === true,
+    },
+  });
+  persistMonsterOverride(state, monster);
+  return true;
+}
+
+function resolveLiveMonsterBasicAttack(state, monster = null, spec = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster") return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  const actionId = String(monsterLive.action.currentActionId ?? "").trim();
+  if (monsterLive.action.currentActionType !== "ATTACK" || monsterLive.action.actionState !== "windup") return false;
+  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
+  const attackCheck = monsterCanHitPlayerNow(state, monster, monsterSpec);
+  const targetPos = normalizeLiveTargetPoint(monsterLive.action.targetPos ?? null);
+  const aimedAtPlayer = !attackCheck.ranged
+    || !targetPos
+    || (
+      Math.floor(Number(state.player.x ?? 0)) === targetPos.x
+      && Math.floor(Number(state.player.y ?? 0)) === targetPos.y
+      && Math.floor(Number(state.player.z ?? 0)) === targetPos.z
+    );
+  const resolved = attackCheck.canHit && aimedAtPlayer;
+  clearLiveTelegraphForAction(state, actionId);
+  if (resolved) {
+    monsterHitPlayer(state, monster, monsterSpec.atkLo, monsterSpec.atkHi, attackCheck.ranged ? "shoots" : "hits");
+    markLiveCombatEngagement(state, monster, "monster", state.player, "player", currentTick);
+    pushLiveSimulationEvent(state, "monster_attack_resolve", {
+      tick: currentTick,
+      actorId: monster.id,
+      targetId: liveSimulationActorId(state, state.player, "player"),
+      actionId,
+      payload: {
+        ranged: attackCheck.ranged === true,
+      },
+    });
+  } else {
+    if (state.visible?.has?.(keyXY(monster.x, monster.y))) {
+      pushLog(state, `The ${monsterDisplayName(monster, state.player.z)} lashes out but misses its window.`);
+    }
+    pushLiveSimulationEvent(state, "monster_attack_cancel", {
+      tick: currentTick,
+      actorId: monster.id,
+      targetId: liveSimulationActorId(state, state.player, "player"),
+      actionId,
+      payload: {
+        reason: aimedAtPlayer ? "out_of_range" : "target_moved",
+      },
+    });
+  }
+  monsterLive.action.actionState = "recovery";
+  monsterLive.action.actionResolveTick = currentTick;
+  noteLiveMonsterAiDecision(monster, currentTick, "recovering", resolved ? "attack_resolved" : (aimedAtPlayer ? "out_of_range" : "target_moved"), {
+    behaviorId: String(monsterSpec.ai ?? "").trim().toLowerCase() || (monsterSpec.range ? "ranged_hold" : "melee_chase"),
+  });
+  if (currentTick > monsterLive.action.actionRecoveryEndTick) {
+    monsterLive.action.actionRecoveryEndTick = currentTick;
+  }
+  persistMonsterOverride(state, monster);
+  return resolved;
+}
+
+function advanceLivePlayerCombatOnTick(state, options = null) {
+  if (!state?.player || state.player.dead) return { started: false, resolved: false };
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const playerLive = ensureLiveActorState(state.player, "player");
+  let resolved = false;
+  if (isLivePlayerInteractionActionType(playerLive.action.currentActionType) && playerLive.action.actionState === "windup" && currentTick >= playerLive.action.actionResolveTick) {
+    resolved = resolveLivePlayerInteractionAction(state, { currentTick }) || resolved;
+  }
+  if (playerLive.action.currentActionType === "ABILITY" && playerLive.action.actionState === "windup" && currentTick >= playerLive.action.actionResolveTick) {
+    resolved = resolveLivePlayerAbilityAction(state, { currentTick }) || resolved;
+  }
+  if (playerLive.action.currentActionType === "ATTACK" && playerLive.action.actionState === "windup" && currentTick >= playerLive.action.actionResolveTick) {
+    resolved = resolveLivePlayerBasicAttack(state, { currentTick }) || resolved;
+  }
+  if (state.player.dead) return { started: false, resolved };
+  if (playerLive.action.actionState !== "idle") return { started: false, resolved };
+  const target = resolveLivePlayerAttackTarget(state);
+  if (!target) return { started: false, resolved };
+  const started = startLivePlayerBasicAttack(state, target, { currentTick });
+  return { started, resolved };
+}
+
+function liveMonsterMoveCadenceTicks(monster = null, spec = null, ai = "") {
+  const speed = Math.max(0.5, Number(monster?.spd ?? spec?.spd ?? 1) || 1);
+  const rangedAi = String(ai ?? "").includes("ranged");
+  const baseTicks = rangedAi ? 6 : 5;
+  return Math.max(1, Math.min(10, Math.round(baseTicks / speed)));
+}
+
+function initializeLiveMonsterAiState(monster = null, currentTick = 0) {
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  if (!monsterLive.ai.leashAnchor && monster && Number.isFinite(Number(monster.x)) && Number.isFinite(Number(monster.y)) && Number.isFinite(Number(monster.z))) {
+    monsterLive.ai.leashAnchor = {
+      x: Math.floor(Number(monster.x)),
+      y: Math.floor(Number(monster.y)),
+      z: Math.floor(Number(monster.z)),
+    };
+  }
+  if (!Number.isFinite(Number(monsterLive.ai.nextPathTick))) monsterLive.ai.nextPathTick = Math.max(0, Math.floor(Number(currentTick) || 0));
+  if (!Number.isFinite(Number(monsterLive.ai.nextDecisionTick))) monsterLive.ai.nextDecisionTick = Math.max(0, Math.floor(Number(currentTick) || 0));
+  return monsterLive;
+}
+
+function noteLiveMonsterAiDecision(monster = null, currentTick = 0, stateId = "", reason = "", options = null) {
+  const monsterLive = initializeLiveMonsterAiState(monster, currentTick);
+  const opts = (options && typeof options === "object") ? options : {};
+  if (stateId) monsterLive.ai.state = String(stateId ?? "").trim().toLowerCase() || monsterLive.ai.state;
+  if (reason !== undefined) monsterLive.ai.decisionReason = String(reason ?? "").trim().toLowerCase();
+  monsterLive.ai.lastDecisionTick = Math.max(0, Math.floor(Number(currentTick) || 0));
+  if (opts.behaviorId !== undefined) {
+    monsterLive.ai.behaviorId = String(opts.behaviorId ?? "").trim().toLowerCase();
+  }
+  if (Number.isFinite(Number(opts.preferredRange))) {
+    monsterLive.ai.preferredRange = Math.max(0, Math.floor(Number(opts.preferredRange)));
+  }
+  if (opts.stance !== undefined) {
+    monsterLive.ai.stance = String(opts.stance ?? "").trim().toLowerCase() || monsterLive.ai.stance;
+  }
+  return monsterLive.ai;
+}
+
+function liveRememberMonsterPlayer(state, monster = null, currentTick = 0) {
+  if (!state?.player || !monster) return;
+  rememberMonsterPlayerPosition(monster, state.player, currentTick);
+  alertMonsterPack(state, monster, state.player, monsterAlertRadius(monsterStatsForDepth(monster.type, monster.z ?? state.player.z)), currentTick);
+  const monsterLive = initializeLiveMonsterAiState(monster, currentTick);
+  monsterLive.combat.combatTargetId = liveSimulationActorId(state, state.player, "player");
+  monsterLive.combat.lastKnownEnemyPos = {
+    x: Math.floor(Number(state.player.x ?? 0)),
+    y: Math.floor(Number(state.player.y ?? 0)),
+    z: Math.floor(Number(state.player.z ?? 0)),
+  };
+  monsterLive.combat.aggroState = "engaged";
+  noteLiveMonsterAiDecision(monster, currentTick, "tracking", "saw_player", {
+    stance: "engaged",
+  });
+  persistMonsterOverride(state, monster);
+}
+
+function tryCommitLiveMonsterMove(state, monster = null, nextPos = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster" || !nextPos || typeof nextPos !== "object") return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const nx = Math.floor(Number(nextPos.x ?? NaN));
+  const ny = Math.floor(Number(nextPos.y ?? NaN));
+  const nz = Math.floor(Number(nextPos.z ?? monster.z ?? state.player.z));
+  if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(nz)) return false;
+  if (!state.world.isPassable(nx, ny, nz)) return false;
+  if (nx === Math.floor(Number(state.player.x ?? 0)) && ny === Math.floor(Number(state.player.y ?? 0)) && nz === Math.floor(Number(state.player.z ?? 0))) {
+    return false;
+  }
+  const occ = buildOccupancy(state);
+  const occMonsterId = occ.monsters.get(keyXYZ(nx, ny, nz));
+  if (occMonsterId && occMonsterId !== monster.id) return false;
+  const occItemId = occ.items.get(keyXYZ(nx, ny, nz));
+  if (occItemId && state.entities?.get?.(occItemId)?.type === "shopkeeper") return false;
+
+  const live = ensureLiveSimulationState(state);
+  const monsterLive = initializeLiveMonsterAiState(monster, opts.currentTick ?? live.tick ?? 0);
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? live.tick ?? 0) || 0));
+  const actionType = opts.blink === true ? "BLINK" : "MOVE";
+  const recoveryTicks = liveMonsterMoveCadenceTicks(monster, opts.spec ?? null, opts.ai ?? "");
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+
+  monster.x = nx;
+  monster.y = ny;
+  monster.z = nz;
+  monster.awake = true;
+  clearMonsterIntent(monster);
+  monsterLive.action.currentActionType = actionType;
+  monsterLive.action.currentActionId = `${actionType.toLowerCase()}_${actionSeq}`;
+  monsterLive.action.actionState = "recovery";
+  monsterLive.action.actionStartTick = currentTick;
+  monsterLive.action.actionResolveTick = currentTick;
+  monsterLive.action.actionRecoveryEndTick = currentTick + recoveryTicks;
+  monsterLive.action.gcdEndTick = monsterLive.action.actionRecoveryEndTick;
+  monsterLive.action.moveLockUntilTick = currentTick + recoveryTicks;
+  monsterLive.action.sequence = actionSeq;
+  monsterLive.action.targetId = "";
+  monsterLive.action.targetPos = {
+    x: nx,
+    y: ny,
+    z: nz,
+  };
+  monsterLive.ai.nextPathTick = currentTick + recoveryTicks;
+  monsterLive.ai.nextDecisionTick = currentTick + Math.max(1, Math.floor(recoveryTicks / 2));
+  noteLiveMonsterAiDecision(monster, currentTick, opts.blink === true ? "blink" : "moving", opts.blink === true ? "blink_reposition" : "step_commit", {
+    behaviorId: String(opts.ai ?? "").trim().toLowerCase(),
+    preferredRange: Number.isFinite(Number(opts.preferredRange)) ? Math.floor(Number(opts.preferredRange)) : monsterLive.ai.preferredRange,
+  });
+  if (opts.blink === true) {
+    monsterLive.cooldowns.abilityTicks = Math.max(monsterLive.cooldowns.abilityTicks, liveTicksFromLegacyTurns(Math.max(1, Math.floor(Number(opts.abilityTurns ?? 1) || 1))));
+  }
+
+  pushLiveSimulationEvent(state, opts.blink === true ? "monster_blink" : "monster_move", {
+    tick: currentTick,
+    actorId: monster.id,
+    actionId: monsterLive.action.currentActionId,
+    payload: {
+      x: nx,
+      y: ny,
+      z: nz,
+      recoveryTicks,
+      ai: String(opts.ai ?? "").trim().toLowerCase(),
+    },
+  });
+
+  persistMonsterOverride(state, monster);
+  const trap = getTrapAt(state, nx, ny, nz, { requireArmed: true });
+  if (trap) {
+    triggerTrapForEntity(state, trap, monster);
+  }
+  return state.entities?.has?.(monster.id) !== false && (monster.hp ?? 0) > 0;
+}
+
+function advanceSingleLiveMonsterMovement(state, monster = null, options = null) {
+  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return { moved: false, reason: "invalid" };
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const p = state.player;
+  if (p.dead || monster.z !== p.z) return { moved: false, reason: "depth" };
+  const monsterLive = initializeLiveMonsterAiState(monster, currentTick);
+  if (monsterLive.action.actionState !== "idle") return { moved: false, reason: "busy" };
+  if (currentTick < Math.max(0, Math.floor(Number(monsterLive.ai.nextPathTick ?? 0) || 0))) return { moved: false, reason: "cadence" };
+
+  const spec = monsterStatsForDepth(monster.type, monster.z ?? p.z);
+  const ai = String(spec.ai ?? (spec.range ? "ranged_hold" : "melee_chase")).trim().toLowerCase() || "melee_chase";
+  const preferredRange = Math.max(2, Math.floor(Number(spec.preferredRange ?? (spec.range ? Math.max(2, spec.range - 1) : 2)) || 2));
+  const minRange = Math.max(1, Math.floor(Number(spec.minRange ?? (spec.range ? 2 : 1)) || 1));
+  const distMan = Math.abs((monster.x ?? 0) - p.x) + Math.abs((monster.y ?? 0) - p.y);
+  const adj = distMan === 1;
+  const seesPlayer = hasLineOfSight(state.world, p.z, monster.x, monster.y, p.x, p.y);
+  const canAttack = monsterCanHitPlayerNow(state, monster, spec);
+  const cadenceTicks = liveMonsterMoveCadenceTicks(monster, spec, ai);
+  const memoryWindowTicks = Math.max(6, liveTicksFromLegacyTurns(10));
+  noteLiveMonsterAiDecision(monster, currentTick, monsterLive.ai.state || "idle", monsterLive.ai.decisionReason || "", {
+    behaviorId: ai,
+    preferredRange,
+    stance: seesPlayer ? "engaged" : (monster.awake ? "searching" : "idle"),
+  });
+
+  if (seesPlayer) {
+    monster.awake = true;
+    liveRememberMonsterPlayer(state, monster, currentTick);
+  }
+
+  const markNoMove = (reason = "hold") => {
+    monsterLive.ai.nextPathTick = currentTick + cadenceTicks;
+    monsterLive.ai.nextDecisionTick = currentTick + Math.max(1, Math.floor(cadenceTicks / 2));
+    noteLiveMonsterAiDecision(monster, currentTick, reason === "attack_range" ? "holding_range" : "holding", reason, {
+      behaviorId: ai,
+      preferredRange,
+      stance: seesPlayer ? "engaged" : (monster.awake ? "searching" : "idle"),
+    });
+    if (
+      monster.awake
+      || monsterLive.combat.aggroState === "engaged"
+      || monsterLive.cooldowns.attackTicks > 0
+      || monsterLive.cooldowns.abilityTicks > 0
+    ) {
+      persistMonsterOverride(state, monster);
+    }
+    return { moved: false, reason };
+  };
+
+  const tryMoveTo = (nx, ny, extraOptions = null) => {
+    const nextOpts = (extraOptions && typeof extraOptions === "object") ? extraOptions : {};
+    const moved = tryCommitLiveMonsterMove(state, monster, { x: nx, y: ny, z: p.z }, {
+      currentTick,
+      spec,
+      ai,
+      preferredRange,
+      ...nextOpts,
+    });
+    return moved ? { moved: true, reason: nextOpts.blink === true ? "blink" : "move" } : { moved: false, reason: "blocked" };
+  };
+  const tryStepTowardPoint = (goalX, goalY) => {
+    const next = bfsNextStep(state, { x: monster.x, y: monster.y }, { x: goalX, y: goalY });
+    if (!next) return { moved: false, reason: "no_path" };
+    return tryMoveTo(next.x, next.y);
+  };
+  const tryStepAwayFromPlayer = () => {
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5);
+    let best = null;
+    let bestDist = distMan;
+    for (const [dx, dy] of dirs) {
+      const nx = monster.x + dx;
+      const ny = monster.y + dy;
+      if (!state.world.isPassable(nx, ny, p.z)) continue;
+      const occ = buildOccupancy(state);
+      const occMonsterId = occ.monsters.get(keyXYZ(nx, ny, p.z));
+      if (occMonsterId && occMonsterId !== monster.id) continue;
+      if (nx === p.x && ny === p.y) continue;
+      const nd = Math.abs(nx - p.x) + Math.abs(ny - p.y);
+      if (nd <= bestDist) continue;
+      bestDist = nd;
+      best = { x: nx, y: ny };
+    }
+    if (!best) return { moved: false, reason: "no_space" };
+    return tryMoveTo(best.x, best.y);
+  };
+  const tryBlinkCloser = (maxBlinkRange = 2) => {
+    const range = Math.max(1, Math.floor(Number(maxBlinkRange ?? 2) || 2));
+    const occ = buildOccupancy(state);
+    const candidates = [];
+    for (let dy = -range; dy <= range; dy += 1) {
+      for (let dx = -range; dx <= range; dx += 1) {
+        if (Math.abs(dx) + Math.abs(dy) > range) continue;
+        const nx = monster.x + dx;
+        const ny = monster.y + dy;
+        if (nx === monster.x && ny === monster.y) continue;
+        if (!state.world.isPassable(nx, ny, p.z)) continue;
+        const occMonsterId = occ.monsters.get(keyXYZ(nx, ny, p.z));
+        if (occMonsterId && occMonsterId !== monster.id) continue;
+        if (nx === p.x && ny === p.y) continue;
+        const nd = Math.abs(nx - p.x) + Math.abs(ny - p.y);
+        candidates.push({ x: nx, y: ny, dist: nd });
+      }
+    }
+    if (!candidates.length) return { moved: false, reason: "no_blink_space" };
+    candidates.sort((a, b) => a.dist - b.dist || ((a.x + a.y) - (b.x + b.y)));
+    const pick = candidates[0];
+    const moved = tryMoveTo(pick.x, pick.y, {
+      blink: true,
+      abilityTurns: Math.max(1, Math.floor(Number(spec.cdTurns ?? 2) || 2)),
+    });
+    if (moved.moved && pick.dist <= 1) monster.blinkStrikeBonus = true;
+    return moved;
+  };
+
+  if (canAttack.canHit) return markNoMove("attack_range");
+
+  if (ai === "blink_flanker" && seesPlayer && !adj && monsterLive.cooldowns.abilityTicks <= 0) {
+    if (Math.random() < 0.58) {
+      const blink = tryBlinkCloser(spec.blinkRange ?? 2);
+      if (blink.moved) return blink;
+    }
+  }
+
+  if (ai === "ranged_artillery") {
+    if (seesPlayer && distMan < minRange) {
+      const stepAway = tryStepAwayFromPlayer();
+      if (stepAway.moved) return stepAway;
+    }
+    if (seesPlayer && spec.range && distMan > Math.max(minRange, Math.floor(Number(spec.range ?? minRange) || minRange))) {
+      const toward = tryStepTowardPoint(p.x, p.y);
+      if (toward.moved) return toward;
+    }
+    return markNoMove(seesPlayer ? "artillery_hold" : "idle");
+  }
+
+  if (ai === "ranged_kite") {
+    if (adj || distMan < preferredRange) {
+      const stepAway = tryStepAwayFromPlayer();
+      if (stepAway.moved) return stepAway;
+    }
+    if (seesPlayer && spec.range && distMan > Math.max(minRange, Math.floor(Number(spec.range ?? minRange) || minRange))) {
+      const toward = tryStepTowardPoint(p.x, p.y);
+      if (toward.moved) return toward;
+    }
+    return markNoMove(seesPlayer ? "kite_hold" : "idle");
+  }
+
+  if (ai === "ranged_hold") {
+    if (seesPlayer && distMan < minRange) {
+      const away = tryStepAwayFromPlayer();
+      if (away.moved) return away;
+    }
+    if (seesPlayer && (!spec.range || distMan > Math.max(minRange, Math.floor(Number(spec.range ?? minRange) || minRange)) || !canAttack.canHit)) {
+      const toward = tryStepTowardPoint(p.x, p.y);
+      if (toward.moved) return toward;
+    }
+    return markNoMove(seesPlayer ? "hold_lane" : "idle");
+  }
+
+  if (seesPlayer) {
+    const toward = tryStepTowardPoint(p.x, p.y);
+    if (toward.moved) return toward;
+  } else if (monster.awake && monsterHasFreshPlayerMemory(monster, currentTick, memoryWindowTicks)) {
+    const memory = ensureMonsterMemory(monster);
+    if (memory && monster.x === memory.lastSeenPlayerX && monster.y === memory.lastSeenPlayerY) {
+      memory.lastSeenTurn = -9999;
+    } else if (memory) {
+      const towardMemory = tryStepTowardPoint(memory.lastSeenPlayerX, memory.lastSeenPlayerY);
+      if (towardMemory.moved) return towardMemory;
+    }
+  }
+
+  const wanderChance = monster.awake ? 0.60 : 0.22;
+  if (Math.random() < wanderChance) {
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1]].sort(() => Math.random() - 0.5);
+    for (const [dx, dy] of dirs) {
+      const move = tryMoveTo(monster.x + dx, monster.y + dy);
+      if (move.moved) return move;
+    }
+  }
+
+  return markNoMove(monster.awake ? "searching" : "idle");
+}
+
+function advanceLiveMonstersMovementOnTick(state, options = null) {
+  if (!state?.player || state.player.dead) return { moved: 0 };
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const z = Math.floor(Number(state.player.z ?? 0));
+  let moved = 0;
+  for (const monster of Array.from(state.entities?.values?.() ?? [])) {
+    if (!monster || monster.kind !== "monster" || monster.z !== z || (monster.hp ?? 0) <= 0) continue;
+    const result = advanceSingleLiveMonsterMovement(state, monster, { currentTick });
+    if (result.moved) {
+      moved += 1;
+      if (state.player.dead) break;
+    }
+  }
+  return { moved };
+}
+
+function advanceLiveMonstersCombatOnTick(state, options = null) {
+  if (!state?.player || state.player.dead) return { started: 0, resolved: 0 };
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const z = Math.floor(Number(state.player.z ?? 0));
+  let started = 0;
+  let resolved = 0;
+  for (const monster of state.entities?.values?.() ?? []) {
+    if (!monster || monster.kind !== "monster" || monster.z !== z || (monster.hp ?? 0) <= 0) continue;
+    const monsterLive = ensureLiveActorState(monster, "monster");
+    const spec = monsterStatsForDepth(monster.type, monster.z ?? z);
+    if (monsterLive.action.currentActionType === "ABILITY" && monsterLive.action.actionState === "windup" && currentTick >= monsterLive.action.actionResolveTick) {
+      if (resolveLiveMonsterAbilityAction(state, monster, spec, { currentTick })) resolved += 1;
+      if (state.player.dead) break;
+      continue;
+    }
+    if (monsterLive.action.currentActionType === "ATTACK" && monsterLive.action.actionState === "windup" && currentTick >= monsterLive.action.actionResolveTick) {
+      if (resolveLiveMonsterBasicAttack(state, monster, spec, { currentTick })) resolved += 1;
+      if (state.player.dead) break;
+      continue;
+    }
+    if (monsterLive.action.actionState !== "idle") continue;
+    const abilityDescriptor = chooseLiveMonsterAbilityAction(state, monster, spec, { currentTick });
+    if (abilityDescriptor && startLiveMonsterAbilityAction(state, monster, spec, abilityDescriptor, { currentTick })) {
+      started += 1;
+      if (state.player.dead) break;
+      continue;
+    }
+    const attackCheck = monsterCanHitPlayerNow(state, monster, spec);
+    if (!attackCheck.canHit) continue;
+    if (startLiveMonsterBasicAttack(state, monster, spec, { currentTick })) {
+      started += 1;
+      if (state.player.dead) break;
+    }
+  }
+  return { started, resolved };
+}
+
+function tryStepLivePlayerMovement(state, dir = "", options = null) {
+  if (!state?.player || state.player.dead) return { moved: false, reason: "dead" };
+  const opts = (options && typeof options === "object") ? options : {};
+  const normalizedDir = normalizeCardinalDirection(dir);
+  if (!normalizedDir) return { moved: false, reason: "invalid_dir" };
+  const delta = dirToDelta(normalizedDir);
+  if (!delta) return { moved: false, reason: "invalid_dir" };
+
+  const live = ensureLiveSimulationState(state);
+  const playerLive = ensureLiveActorState(state.player, "player");
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? live.tick ?? 0) || 0));
+  if (currentTick < Math.max(0, Math.floor(Number(playerLive.action.moveLockUntilTick ?? 0) || 0))) {
+    return { moved: false, reason: "move_locked" };
+  }
+
+  const p = state.player;
+  const nx = p.x + delta.dx;
+  const ny = p.y + delta.dy;
+  const nz = p.z;
+  hydrateNearby(state);
+  const tile = state.world.getTile(nx, ny, nz);
+  if (tileIsLocked(tile)) return { moved: false, reason: "locked_door" };
+  if (tile === DOOR_CLOSED) return { moved: false, reason: "closed_door" };
+
+  const occ = buildOccupancy(state);
+  const blockingMonsterId = occ.monsters.get(keyXYZ(nx, ny, nz));
+  if (blockingMonsterId) {
+    playerLive.intent.attackTargetId = blockingMonsterId;
+    playerLive.combat.combatTargetId = blockingMonsterId;
+    playerLive.combat.lastKnownEnemyPos = { x: nx, y: ny, z: nz };
+    playerLive.combat.aggroState = "engaged";
+    return { moved: false, reason: "monster_blocked", targetId: blockingMonsterId };
+  }
+  if (!state.world.isPassable(nx, ny, nz)) return { moved: false, reason: "wall" };
+
+  const recoveryTicks = liveMovementRecoveryTicks(p, "player");
+  const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
+  live.stepSeq = actionSeq;
+  markDisengageGraceFromStep(state, p.x, p.y, nx, ny, nz);
+  if (isOpenDoorTile(tile)) state.visitedDoors?.add(keyXYZ(nx, ny, nz));
+  p.x = nx;
+  p.y = ny;
+  p.attackAfterMove = true;
+  state.lastPlayerActionKind = "move";
+  recordAnalyticsMovement(ensureAnalyticsState(state), p.z, 1);
+
+  playerLive.action.currentActionType = "MOVE";
+  playerLive.action.currentActionId = `move_${actionSeq}`;
+  playerLive.action.actionState = "recovery";
+  playerLive.action.actionStartTick = currentTick;
+  playerLive.action.actionResolveTick = currentTick;
+  playerLive.action.actionRecoveryEndTick = currentTick + recoveryTicks;
+  playerLive.action.gcdEndTick = currentTick + recoveryTicks;
+  playerLive.action.moveLockUntilTick = currentTick + recoveryTicks;
+  playerLive.action.sequence = actionSeq;
+
+  pushLiveSimulationEvent(state, "move_commit", {
+    tick: currentTick,
+    actorId: liveSimulationActorId(state, p, "player"),
+    actionId: playerLive.action.currentActionId,
+    payload: {
+      dir: normalizedDir,
+      x: nx,
+      y: ny,
+      z: nz,
+      recoveryTicks,
+    },
+  });
+  return { moved: true, reason: "", recoveryTicks };
+}
+
+function advanceLiveSimulationOnState(state, options = null) {
+  if (!state || typeof state !== "object") {
+    return { ok: false, advancedTicks: 0, moved: false, movedCount: 0, blockedReason: "invalid_state" };
+  }
+  const opts = (options && typeof options === "object") ? options : {};
+  const live = ensureLiveSimulationState(state);
+  const stepCount = Math.max(1, Math.floor(Number(opts.ticks ?? 1) || 1));
+  const oneShotMoveDir = normalizeCardinalDirection(opts.playerMoveDir ?? "");
+  const clearMoveIntent = opts.clearMoveIntent !== false;
+  let advancedTicks = 0;
+  let movedCount = 0;
+  let blockedReason = "";
+
+  if (oneShotMoveDir) {
+    ensureLiveActorState(state.player, "player").intent.moveDir = oneShotMoveDir;
+  }
+
+  for (let i = 0; i < stepCount; i += 1) {
+    live.tick = Math.max(0, Math.floor(Number(live.tick ?? 0) || 0)) + 1;
+    live.lastStepAtMs = Date.now();
+    advancedTicks += 1;
+    tickDownLiveCooldownsForActor(state.player, "player");
+    for (const entity of state.entities?.values?.() ?? []) {
+      if (!entity || typeof entity !== "object") continue;
+      if (entity.kind !== "monster" && entity.kind !== "trap" && entity.kind !== "actor") continue;
+      tickDownLiveCooldownsForActor(entity, entity.kind);
+      const actorLive = ensureLiveActorState(entity, entity.kind);
+      if (
+        actorLive.action.actionState === "recovery"
+        && live.tick >= Math.max(0, Math.floor(Number(actorLive.action.actionRecoveryEndTick ?? 0) || 0))
+      ) {
+        actorLive.action.actionState = "idle";
+        actorLive.action.currentActionType = "";
+        actorLive.action.currentActionId = "";
+        actorLive.action.targetId = "";
+        actorLive.action.targetPos = null;
+      }
+    }
+    const playerLive = ensureLiveActorState(state.player, "player");
+    if (
+      playerLive.action.actionState === "recovery"
+      && live.tick >= Math.max(0, Math.floor(Number(playerLive.action.actionRecoveryEndTick ?? 0) || 0))
+    ) {
+      playerLive.action.actionState = "idle";
+      playerLive.action.currentActionType = "";
+      playerLive.action.currentActionId = "";
+      playerLive.action.targetId = "";
+      playerLive.action.targetPos = null;
+    }
+
+    advanceLiveTrapTimingOnTick(state, { currentTick: live.tick });
+    advanceLiveMonstersCombatOnTick(state, { currentTick: live.tick });
+    if (state.player.dead) break;
+
+    const activeDir = normalizeCardinalDirection(ensureLiveActorState(state.player, "player").intent.moveDir ?? "");
+    if (activeDir) {
+      const stepResult = tryStepLivePlayerMovement(state, activeDir, { currentTick: live.tick });
+      if (stepResult.moved) {
+        movedCount += 1;
+      } else if (!blockedReason && stepResult.reason) {
+        blockedReason = stepResult.reason;
+      }
+    }
+    advanceLiveMonstersMovementOnTick(state, { currentTick: live.tick });
+    if (state.player.dead) break;
+    advanceLivePlayerCombatOnTick(state, { currentTick: live.tick });
+    if (state.player.dead) break;
+    if (oneShotMoveDir && clearMoveIntent) {
+      ensureLiveActorState(state.player, "player").intent.moveDir = "";
+    }
+  }
+
+  applyLiveCooldownMirrors(state);
+  return {
+    ok: true,
+    advancedTicks,
+    moved: movedCount > 0,
+    movedCount,
+    blockedReason,
+    tick: live.tick,
+  };
+}
+
+function advanceLiveSimulationToWallClock(state, options = null) {
+  if (!state || typeof state !== "object") {
+    return {
+      ok: false,
+      advancedTicks: 0,
+      moved: false,
+      movedCount: 0,
+      blockedReason: "invalid_state",
+      catchup: {
+        nowMs: 0,
+        tickMs: LIVE_SIM_DEFAULT_TICK_MS,
+        elapsedMs: 0,
+        dueTicks: 0,
+        appliedTicks: 0,
+        clamped: false,
+      },
+    };
+  }
+  const opts = (options && typeof options === "object") ? options : {};
+  const nowMs = Math.max(0, Math.floor(Number(opts.nowMs ?? Date.now()) || Date.now()));
+  const maxTicks = Math.max(
+    0,
+    Math.floor(Number(opts.maxTicks ?? LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS) || LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS)
+  );
+  const live = ensureLiveSimulationState(state);
+  const tickMs = Math.max(10, Math.floor(Number(live.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS));
+  const lastStepAtMs = Math.max(0, Math.floor(Number(live.lastStepAtMs ?? 0) || 0));
+  if (lastStepAtMs <= 0) {
+    live.lastStepAtMs = nowMs;
+    return {
+      ok: true,
+      advancedTicks: 0,
+      moved: false,
+      movedCount: 0,
+      blockedReason: "",
+      tick: live.tick,
+      catchup: {
+        nowMs,
+        tickMs,
+        elapsedMs: 0,
+        dueTicks: 0,
+        appliedTicks: 0,
+        clamped: false,
+      },
+    };
+  }
+  const elapsedMs = Math.max(0, nowMs - lastStepAtMs);
+  const dueTicksRaw = Math.max(0, Math.floor(elapsedMs / tickMs));
+  const dueTicks = Math.max(0, Math.min(maxTicks, dueTicksRaw));
+  if (dueTicks <= 0) {
+    return {
+      ok: true,
+      advancedTicks: 0,
+      moved: false,
+      movedCount: 0,
+      blockedReason: "",
+      tick: live.tick,
+      catchup: {
+        nowMs,
+        tickMs,
+        elapsedMs,
+        dueTicks: dueTicksRaw,
+        appliedTicks: 0,
+        clamped: dueTicksRaw > maxTicks,
+      },
+    };
+  }
+  const clamped = dueTicksRaw > maxTicks;
+  const stepped = advanceLiveSimulationOnState(state, { ticks: dueTicks });
+  live.lastStepAtMs = clamped
+    ? nowMs
+    : Math.min(nowMs, lastStepAtMs + (dueTicks * tickMs));
+  return {
+    ...stepped,
+    catchup: {
+      nowMs,
+      tickMs,
+      elapsedMs,
+      dueTicks: dueTicksRaw,
+      appliedTicks: Math.max(0, Math.floor(Number(stepped?.advancedTicks ?? dueTicks) || dueTicks)),
+      clamped,
+    },
+  };
+}
+
+function executeLiveTickCommandOnState(state, rawCommand = null, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const perfNow = () => ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
+  const perfStartMs = perfNow();
+  const command = (rawCommand && typeof rawCommand === "object") ? rawCommand : {};
+  const type = String(command.type ?? "").trim().toUpperCase();
+  const buildHotDelta = AUTHORITATIVE_HOT_DELTA_TYPES.has(type);
+  const hotBaseline = buildHotDelta ? captureAuthoritativeHotBaseline(state) : null;
+  const logStart = Array.isArray(state?.log) ? state.log.length : 0;
+  const beforePayload = String(opts.basePayload ?? "").trim() || exportSave(state);
+  const snapshotWithAreaRespawn = () => {
+    updateAreaRespawnSystem(state, Date.now());
+    hydrateNearby(state);
+    return buildHeadlessStateSnapshot(state, { logStart });
+  };
+  const catchupNowMs = Math.max(0, Math.floor(Number(opts.nowMs ?? Date.now()) || Date.now()));
+  const skipAutomaticCatchup = type === "LIVE_POLL_TICK";
+  let catchupMs = 0;
+  let catchupAppliedTicks = 0;
+  if (!skipAutomaticCatchup) {
+    const catchupStartMs = perfNow();
+    const catchupResult = advanceLiveSimulationToWallClock(state, {
+      nowMs: catchupNowMs,
+      maxTicks: Math.max(
+        0,
+        Math.floor(Number(opts.maxCatchupTicks ?? LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS) || LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS)
+      ),
+    });
+    catchupMs = Math.max(0, perfNow() - catchupStartMs);
+    catchupAppliedTicks = Math.max(0, Math.floor(Number(catchupResult?.catchup?.appliedTicks ?? 0) || 0));
+  }
+
+  let stepResult = { ok: false, advancedTicks: 0, moved: false, movedCount: 0, blockedReason: "" };
+  if (type === "MOVE") {
+    const dir = normalizeCardinalDirection(command.dir ?? "");
+    if (!dir) {
+      return {
+        ok: false,
+        error: "Invalid move direction.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    stepResult = advanceLiveSimulationOnState(state, {
+      ticks: 1,
+      playerMoveDir: dir,
+      clearMoveIntent: true,
+    });
+  } else if (type === "MOVE_BATCH") {
+    const dirs = (Array.isArray(command.dirs) ? command.dirs : [])
+      .map((dir) => normalizeCardinalDirection(dir))
+      .filter(Boolean)
+      .slice(0, AUTHORITATIVE_MOVE_BATCH_MAX);
+    if (!dirs.length) {
+      return {
+        ok: false,
+        error: "Invalid move batch.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    let movedCount = 0;
+    let advancedTicks = 0;
+    let blockedReason = "";
+    for (const dir of dirs) {
+      const next = advanceLiveSimulationOnState(state, {
+        ticks: 1,
+        playerMoveDir: dir,
+        clearMoveIntent: true,
+      });
+      movedCount += Math.max(0, Math.floor(Number(next.movedCount ?? 0) || 0));
+      advancedTicks += Math.max(0, Math.floor(Number(next.advancedTicks ?? 0) || 0));
+      if (!blockedReason && next.blockedReason) blockedReason = next.blockedReason;
+    }
+    stepResult = {
+      ok: true,
+      advancedTicks,
+      moved: movedCount > 0,
+      movedCount,
+      blockedReason,
+    };
+  } else if (type === "LIVE_POLL_TICK") {
+    const playerLive = ensureLiveActorState(state.player, "player");
+    const holdDir = normalizeCardinalDirection(command.holdDir ?? "");
+    const activeHold = command.active === true && !!holdDir;
+    const queuedDir = normalizeCardinalDirection(command.enqueueDir ?? "");
+    if (activeHold) playerLive.intent.moveDir = holdDir;
+    else if (command.active === false || !holdDir) playerLive.intent.moveDir = "";
+    if (queuedDir) {
+      stepResult = advanceLiveSimulationOnState(state, {
+        ticks: 1,
+        playerMoveDir: queuedDir,
+        clearMoveIntent: true,
+      });
+      if (activeHold) playerLive.intent.moveDir = holdDir;
+    } else {
+      stepResult = advanceLiveSimulationOnState(state, { ticks: 1 });
+    }
+  } else if (type === "WAIT") {
+    ensureLiveActorState(state.player, "player").intent.moveDir = "";
+    state.player.attackAfterMove = false;
+    state.lastPlayerActionKind = "wait";
+    pushLog(state, "You wait.");
+    stepResult = advanceLiveSimulationOnState(state, { ticks: 1 });
+  } else if (type === "ATTACK") {
+    const playerLive = ensureLiveActorState(state.player, "player");
+    const target = findMonsterForAuthoritativeCommand(state, command) ?? resolveLivePlayerAttackTarget(state);
+    if (!target) {
+      return {
+        ok: false,
+        error: "No valid target.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    playerLive.intent.attackTargetId = target.id;
+    playerLive.combat.combatTargetId = target.id;
+    stepResult = advanceLiveSimulationOnState(state, { ticks: 1 });
+  } else if (type === "ACTIVATE_ABILITY") {
+    const ability = playerActiveAbility(state);
+    const requestedAbilityId = String(command.abilityId ?? "").trim();
+    if (!ability || (requestedAbilityId && requestedAbilityId !== ability.id)) {
+      return {
+        ok: false,
+        error: "Ability is not available.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    const occupancy = getCachedOccupancy(state);
+    const target = resolveLiveAbilityTargetForPlayer(state, ability, findMonsterForAuthoritativeCommand(state, command), occupancy);
+    const started = startLivePlayerAbilityAction(state, ability, target, {
+      currentTick: currentLiveSimulationTick(state),
+      occupancy,
+    });
+    if (!started) {
+      return {
+        ok: false,
+        error: "Ability could not be activated.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    stepResult = advanceLiveSimulationOnState(state, { ticks: 1 });
+  } else if (
+    type === "OPEN_DOOR"
+    || type === "CLOSE_DOOR"
+    || type === "PICKUP"
+    || type === "OPEN_CHEST"
+    || type === "DISARM_TRAP"
+    || type === "USE_SHRINE"
+    || type === "USE_STAIRS"
+    || type === "INTERACT"
+  ) {
+    const descriptor = resolveLiveInteractionDescriptor(state, type, command);
+    if (!descriptor) {
+      return {
+        ok: false,
+        error: "Interaction is not available.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    if (descriptor.transactional === true) return null;
+    const started = startLivePlayerInteractionAction(state, descriptor, {
+      currentTick: currentLiveSimulationTick(state),
+    });
+    if (!started) {
+      return {
+        ok: false,
+        error: "Interaction could not be started.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    stepResult = advanceLiveSimulationOnState(state, { ticks: 1 });
+  } else {
+    return null;
+  }
+
+  if (stepResult.ok) {
+    ensureLiveSimulationState(state).lastStepAtMs = Date.now();
+  }
+
+  const snapshotStartMs = perfNow();
+  const snapshot = snapshotWithAreaRespawn();
+  const snapshotMs = Math.max(0, perfNow() - snapshotStartMs);
+  const snapshotPayload = String(snapshot?.payload ?? "");
+  const diffStartMs = perfNow();
+  const diff = stepResult.ok ? buildAuthoritativePayloadDiff(beforePayload, snapshotPayload) : null;
+  const diffMs = Math.max(0, perfNow() - diffStartMs);
+  const hotDeltaStartMs = perfNow();
+  const hotDelta = (stepResult.ok && buildHotDelta) ? buildAuthoritativeHotDelta(hotBaseline, state, type, logStart) : null;
+  const hotDeltaMs = Math.max(0, perfNow() - hotDeltaStartMs);
+  const totalMs = Math.max(0, perfNow() - perfStartMs);
+  return {
+    ok: stepResult.ok,
+    error: stepResult.ok ? "" : `Command ${type} could not be completed.`,
+    turnSpent: stepResult.advancedTicks > 0,
+    moved: stepResult.moved === true,
+    blockedReason: String(stepResult.blockedReason ?? "").trim(),
+    snapshot,
+    diff,
+    hotDelta,
+    tick: Math.max(0, Math.floor(Number(state?.live?.tick ?? 0) || 0)),
+    perf: {
+      totalMs: Math.round(totalMs * 1000) / 1000,
+      catchupMs: Math.round(catchupMs * 1000) / 1000,
+      catchupTicks: catchupAppliedTicks,
+      snapshotMs: Math.round(snapshotMs * 1000) / 1000,
+      diffMs: Math.round(diffMs * 1000) / 1000,
+      hotDeltaMs: Math.round(hotDeltaMs * 1000) / 1000,
+    },
+  };
+}
+
 function normalizeDynamicEntries(items, options = null) {
   const out = [];
   for (const raw of items ?? []) {
@@ -20722,6 +23970,7 @@ function normalizeDynamicEntries(items, options = null) {
         cd: Math.max(0, Math.floor(Number(raw.cd ?? 0))),
         abilityCd: Math.max(0, Math.floor(Number(raw.abilityCd ?? 0))),
         awake: !!raw.awake,
+        live: normalizeLiveCombatActorState(raw.live ?? null, "monster"),
       };
       if (effects.length > 0) entry.effects = effects;
       else delete entry.effects;
@@ -20753,6 +24002,7 @@ function normalizeDynamicEntries(items, options = null) {
         payload,
         friendlyTo: String(raw.friendlyTo ?? "").trim().toLowerCase(),
         ownerId: raw.ownerId === null || raw.ownerId === undefined ? "" : String(raw.ownerId),
+        live: normalizeLiveCombatActorState(raw.live ?? null, "trap"),
       });
       continue;
     }
@@ -20773,6 +24023,7 @@ function normalizeDynamicEntries(items, options = null) {
         y,
         z,
         ai: "none",
+        live: normalizeLiveCombatActorState(raw.live ?? null, "actor"),
       });
       continue;
     }
@@ -20986,6 +24237,31 @@ function migrateV9toV10(payload) {
   payload.v = 10;
   return payload;
 }
+function migrateV10toV11(payload) {
+  payload.player = payload.player ?? {};
+  payload.player.live = normalizeLiveCombatActorState(payload.player.live ?? null, "player");
+  payload.dynamic = normalizeDynamicEntries(payload.dynamic ?? [], {
+    speciesId: payload?.player?.speciesId ?? payload?.character?.speciesId,
+    classId: payload?.player?.classId ?? payload?.character?.classId,
+  });
+  payload.entOv = (payload.entOv ?? []).map(([id, ov]) => {
+    if (!ov || typeof ov !== "object") return [id, ov];
+    const next = { ...ov };
+    if (Object.prototype.hasOwnProperty.call(next, "trapFamily") || Object.prototype.hasOwnProperty.call(next, "trapType")) {
+      next.live = normalizeLiveCombatActorState(next.live ?? null, "trap");
+    } else if (
+      Object.prototype.hasOwnProperty.call(next, "awake")
+      || Object.prototype.hasOwnProperty.call(next, "abilityCd")
+      || Array.isArray(next.effects)
+    ) {
+      next.live = normalizeLiveCombatActorState(next.live ?? null, "monster");
+    }
+    return [id, next];
+  });
+  payload.live = normalizeLiveSimulationState(payload.live ?? null);
+  payload.v = 11;
+  return payload;
+}
 
 function importSave(saveStr) {
   try {
@@ -21000,7 +24276,8 @@ function importSave(saveStr) {
     if (payload.v === 7) payload = migrateV7toV8(payload);
     if (payload.v === 8) payload = migrateV8toV9(payload);
     if (payload.v === 9) payload = migrateV9toV10(payload);
-    if (payload.v !== 10) return null;
+    if (payload.v === 10) payload = migrateV10toV11(payload);
+    if (payload.v !== 11) return null;
 
     const tileOverrides = new Map(payload.tileOv ?? []);
     const world = new World(payload.seed, tileOverrides);
@@ -21059,6 +24336,7 @@ function importSave(saveStr) {
       quickSwitch: { active: false, baseCharacterId: "", baseClassId: "", baseSpeciesId: "", baseName: "", startedAt: 0 },
       debug: normalizeDebugFlags(payload.debug),
       analytics: null,
+      live: normalizeLiveSimulationState(payload.live ?? null),
     };
 
     fogEnabled = !!payload.fog;
@@ -21078,6 +24356,7 @@ function importSave(saveStr) {
     state.player.hp = clamp(Math.floor(state.player.hp ?? state.player.maxHp), 0, state.player.maxHp);
     if (!Number.isFinite(state.player.abilityCd)) state.player.abilityCd = 0;
     ensureCharacterState(state);
+    state.player.live = normalizeLiveCombatActorState(state.player.live ?? null, "player");
     state.surfaceLink = resolveSurfaceLink(state);
     state.startSpawn = state.startSpawn ?? computeInitialDepth0Spawn(world);
     if (!normalizeLadderLanding(state.lastLadderLanding)) {
@@ -21123,6 +24402,7 @@ function importSave(saveStr) {
     }
 
     recalcDerivedStats(state);
+    ensureLiveSimulationState(state);
     if (!Number.isFinite(state.player.energy)) state.player.energy = state.player.energyMax;
     state.analytics = initializeAnalyticsForState(state, payload.analytics ?? null, "import-save");
 
@@ -21360,13 +24640,83 @@ function resolveAuthoritativeResponsePayload(data = null) {
   return { payload: patched, source: "diff" };
 }
 
+function normalizeAuthoritativeResponseMeta(data = null) {
+  const sessionId = String(data?.sessionId ?? "").trim();
+  const acceptedSeqRaw = Number(data?.acceptedCommandSeq ?? 0);
+  const serverRevisionRaw = Number(data?.serverRevision ?? 0);
+  const acceptedSeq = Number.isFinite(acceptedSeqRaw) ? Math.max(0, Math.floor(acceptedSeqRaw)) : 0;
+  const serverRevision = Number.isFinite(serverRevisionRaw) ? Math.max(0, Math.floor(serverRevisionRaw)) : 0;
+  return { sessionId, acceptedSeq, serverRevision };
+}
+
+function isAuthoritativeResponseStale(data = null) {
+  const incoming = normalizeAuthoritativeResponseMeta(data);
+  const runtimeSessionId = String(authoritativePredictionRuntime.lastSessionId ?? "").trim();
+  if (incoming.sessionId && runtimeSessionId && incoming.sessionId !== runtimeSessionId) return false;
+  if (!runtimeSessionId && incoming.sessionId) return false;
+  if (incoming.serverRevision < authoritativePredictionRuntime.lastAppliedServerRevision) return true;
+  if (
+    incoming.serverRevision === authoritativePredictionRuntime.lastAppliedServerRevision &&
+    incoming.acceptedSeq < authoritativePredictionRuntime.lastAppliedAcceptedSeq
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function noteAppliedAuthoritativeResponse(data = null) {
+  const incoming = normalizeAuthoritativeResponseMeta(data);
+  const mirrorSessionId = String(authoritativeMirror?.sessionId ?? "").trim();
+  const sessionId = incoming.sessionId || mirrorSessionId || String(authoritativePredictionRuntime.lastSessionId ?? "").trim();
+  if (sessionId && sessionId !== authoritativePredictionRuntime.lastSessionId) {
+    resetAuthoritativePredictionRuntime(sessionId);
+  } else if (sessionId) {
+    authoritativePredictionRuntime.lastSessionId = sessionId;
+  }
+  const mirrorSeqRaw = Number(authoritativeMirror?.clientCommandSeq ?? 0);
+  const mirrorRevRaw = Number(authoritativeMirror?.serverRevision ?? 0);
+  const mirrorSeq = Number.isFinite(mirrorSeqRaw) ? Math.max(0, Math.floor(mirrorSeqRaw)) : 0;
+  const mirrorRev = Number.isFinite(mirrorRevRaw) ? Math.max(0, Math.floor(mirrorRevRaw)) : 0;
+  authoritativePredictionRuntime.lastAppliedAcceptedSeq = Math.max(incoming.acceptedSeq, mirrorSeq);
+  authoritativePredictionRuntime.lastAppliedServerRevision = Math.max(incoming.serverRevision, mirrorRev);
+  authoritativePredictionRuntime.inFlightMovePredicted = false;
+}
+
+function shouldApplyAuthoritativeHotDelta(data = null) {
+  const delta = (data?.hotDelta && typeof data.hotDelta === "object") ? data.hotDelta : null;
+  if (!delta) return false;
+  const type = String(delta.type ?? "").trim().toUpperCase();
+  if (type === "MOVE" || type === "MOVE_BATCH") {
+    const player = (delta.player && typeof delta.player === "object") ? delta.player : null;
+    if (!player || !game?.player) return false;
+    const authX = Math.floor(Number(player.x ?? NaN));
+    const authY = Math.floor(Number(player.y ?? NaN));
+    const authZ = Math.floor(Number(player.z ?? NaN));
+    const localX = Math.floor(Number(game.player.x ?? NaN));
+    const localY = Math.floor(Number(game.player.y ?? NaN));
+    const localZ = Math.floor(Number(game.player.z ?? NaN));
+    // In compatibility mode we may not have a full predicted chain, so accept
+    // movement hot deltas as long as the floor matches to avoid expensive full
+    // snapshot imports between rapid turns.
+    if (authoritativeMovementChannelRuntime.disabled) {
+      return authZ === localZ;
+    }
+    // Only hot-apply movement when the authoritative tile matches the already
+    // visible local tile, so this stays a confirmation path rather than a correction path.
+    return authX === localX && authY === localY && authZ === localZ;
+  }
+  return true;
+}
+
 function onKeyUp(e) {
   const movementInput = keyboardMovementFromEvent(e);
   if (!movementInput) return;
   const released = releaseKeyboardMovementHold(movementInput.source, String(e.code ?? ""));
   if (!released) return;
   clearAuthoritativeMovementIntent(movementInput.source);
-  dropQueuedAuthoritativeMovementBySourceKeep(movementInput.source, 1);
+  if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
+    void syncAuthoritativeMovementControl();
+  }
 }
 
 function saveNow(state) {
@@ -21524,6 +24874,7 @@ function cloneAuthoritativeHotEntity(entity = null) {
       abilityCd: Math.max(0, Math.floor(Number(entity.abilityCd ?? 0))),
       alertedTurn: Math.max(0, Math.floor(Number(entity.alertedTurn ?? 0))),
       effects: normalizeMonsterEffects(entity.effects ?? []),
+      live: normalizeLiveCombatActorState(entity.live ?? null, "monster"),
     };
   }
   if (kind === "item") {
@@ -21558,6 +24909,7 @@ function cloneAuthoritativeHotEntity(entity = null) {
       payload: (entity.payload && typeof entity.payload === "object") ? { ...entity.payload } : {},
       friendlyTo: String(entity.friendlyTo ?? "").trim().toLowerCase(),
       ownerId: entity.ownerId === null || entity.ownerId === undefined ? "" : String(entity.ownerId),
+      live: normalizeLiveCombatActorState(entity.live ?? null, "trap"),
     };
   }
   if (kind === "actor") {
@@ -21566,6 +24918,7 @@ function cloneAuthoritativeHotEntity(entity = null) {
       type: String(entity.type ?? "hero_actor").trim() || "hero_actor",
       spriteId: String(entity.spriteId ?? "hero").trim() || "hero",
       ai: String(entity.ai ?? "none").trim() || "none",
+      live: normalizeLiveCombatActorState(entity.live ?? null, "actor"),
     };
   }
   return null;
@@ -21637,6 +24990,12 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
     type: String(commandType ?? "").trim().toUpperCase(),
     depth,
     turn: Math.max(0, Math.floor(Number(state.turn ?? 0))),
+    live: {
+      tick: Math.max(0, Math.floor(Number(state.live?.tick ?? 0) || 0)),
+      lastServerTick: Math.max(0, Math.floor(Number(state.live?.lastServerTick ?? state.live?.tick ?? 0) || 0)),
+      telegraphs: normalizeLiveTelegraphEntries(state.live?.telegraphs ?? null),
+      events: normalizeLiveEventEntries(state.live?.events ?? null),
+    },
     player: {
       x: Math.floor(Number(state.player.x ?? 0)),
       y: Math.floor(Number(state.player.y ?? 0)),
@@ -21650,6 +25009,7 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
       gold: Math.max(0, Math.floor(Number(state.player.gold ?? 0))),
       dead: !!state.player.dead,
       abilityCd: Math.max(0, Math.floor(Number(state.player.abilityCd ?? 0))),
+      live: normalizeLiveCombatActorState(state.player.live ?? null, "player"),
     },
     entitiesUpsert,
     entitiesRemove,
@@ -21679,10 +25039,18 @@ function applyAuthoritativeHotDeltaToState(state, rawDelta = null) {
   if (Number.isFinite(Number(player.xp))) state.player.xp = Math.max(0, Math.floor(Number(player.xp)));
   if (Number.isFinite(Number(player.gold))) state.player.gold = Math.max(0, Math.floor(Number(player.gold)));
   if (Number.isFinite(Number(player.abilityCd))) state.player.abilityCd = Math.max(0, Math.floor(Number(player.abilityCd)));
+  state.player.live = normalizeLiveCombatActorState(player.live ?? state.player.live ?? null, "player");
   state.player.dead = !!player.dead;
 
   if (Number.isFinite(Number(delta.turn))) {
     state.turn = Math.max(0, Math.floor(Number(delta.turn)));
+  }
+  if (delta.live && typeof delta.live === "object") {
+    const live = ensureLiveSimulationState(state);
+    if (Number.isFinite(Number(delta.live.tick))) live.tick = Math.max(0, Math.floor(Number(delta.live.tick)));
+    if (Number.isFinite(Number(delta.live.lastServerTick))) live.lastServerTick = Math.max(0, Math.floor(Number(delta.live.lastServerTick)));
+    live.telegraphs = normalizeLiveTelegraphEntries(delta.live.telegraphs ?? live.telegraphs ?? null);
+    live.events = normalizeLiveEventEntries(delta.live.events ?? live.events ?? null);
   }
 
   const removeIds = Array.isArray(delta.entitiesRemove) ? delta.entitiesRemove : [];
@@ -21736,6 +25104,28 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null, options = 
   const perfStartMs = perfNow();
   const command = (rawCommand && typeof rawCommand === "object") ? rawCommand : {};
   const type = String(command.type ?? "").trim().toUpperCase();
+  if (
+    liveTickCombatEnabled(state)
+    && (
+      type === "MOVE"
+      || type === "MOVE_BATCH"
+      || type === "WAIT"
+      || type === "ATTACK"
+      || type === "ACTIVATE_ABILITY"
+      || type === "OPEN_DOOR"
+      || type === "CLOSE_DOOR"
+      || type === "PICKUP"
+      || type === "OPEN_CHEST"
+      || type === "DISARM_TRAP"
+      || type === "USE_SHRINE"
+      || type === "USE_STAIRS"
+      || type === "INTERACT"
+      || type === "LIVE_POLL_TICK"
+    )
+  ) {
+    const liveResult = executeLiveTickCommandOnState(state, command, opts);
+    if (liveResult) return liveResult;
+  }
   const buildHotDelta = AUTHORITATIVE_HOT_DELTA_TYPES.has(type);
   const hotBaseline = buildHotDelta ? captureAuthoritativeHotBaseline(state) : null;
   const logStart = Array.isArray(state?.log) ? state.log.length : 0;
@@ -21750,6 +25140,16 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null, options = 
       error: "Invalid authoritative command.",
       turnSpent: false,
       snapshot: state ? snapshotWithAreaRespawn() : null,
+    };
+  }
+
+  const liveTransactionalError = liveTransactionalCommandError(state, type);
+  if (liveTransactionalError) {
+    return {
+      ok: false,
+      error: liveTransactionalError,
+      turnSpent: false,
+      snapshot: snapshotWithAreaRespawn(),
     };
   }
 
@@ -21820,8 +25220,12 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null, options = 
   } else if (type === "DROP_ITEM") {
     const idx = resolveInventoryIndexFromCommand(state, command);
     ok = idx >= 0 ? !!dropInventoryIndex(state, idx) : false;
-    turnSpent = ok;
-    takeTurn(state, ok);
+    if (liveTickCombatEnabled(state)) {
+      turnSpent = false;
+    } else {
+      turnSpent = ok;
+      takeTurn(state, ok);
+    }
   } else if (type === "USE_ITEM" || type === "EQUIP_ITEM") {
     const idx = resolveInventoryIndexFromCommand(state, command);
     if (idx >= 0) useInventoryIndex(state, idx);
@@ -21968,6 +25372,7 @@ function headlessBootstrapState(options = null) {
   const worldPayload = String(opts.worldPayload ?? "").trim();
   const characterPayload = String(opts.characterPayload ?? "").trim();
   const forceEntrance = opts.forceEntrance === true;
+  const liveTickCombat = parseLiveTickCombatFlagValue(opts.liveTickCombat);
 
   let state = worldPayload ? headlessStateFromPayload(worldPayload) : null;
   const snapshot = characterPayload ? decodeCharacterSnapshotPayload(characterPayload) : null;
@@ -21988,6 +25393,7 @@ function headlessBootstrapState(options = null) {
     placePlayerAtDungeonEntrance(state, { resetVision: true });
   }
 
+  coerceLiveTickCombatState(state, liveTickCombat);
   return buildHeadlessStateSnapshot(state);
 }
 
@@ -21996,6 +25402,7 @@ function headlessSwitchCharacterPayload(worldPayload = "", characterPayload = ""
   const state = headlessStateFromPayload(worldPayload);
   const snapshot = decodeCharacterSnapshotPayload(characterPayload);
   if (!state || !snapshot) return null;
+  coerceLiveTickCombatState(state, parseLiveTickCombatFlagValue(opts.liveTickCombat));
   applyCharacterSnapshot(state, snapshot);
   if (opts.forceEntrance === true) {
     placePlayerAtDungeonEntrance(state, { resetVision: true });
@@ -22719,6 +26126,7 @@ if (!HEADLESS_RUNTIME) {
             if (action) takeTurn(game, action.run());
           } else {
             const opts = (options && typeof options === "object") ? options : {};
+            if (!Number.isFinite(Number(opts.inputAt))) opts.inputAt = Date.now();
             takeTurn(game, playerMoveOrAttack(game, dx, dy, opts));
           }
         };
@@ -22752,15 +26160,12 @@ if (!HEADLESS_RUNTIME) {
               // Fire immediately on press to remove tap latency.
               try {
                 if (entry.movementSource) {
-                  setAuthoritativeMovementIntent(entry.movementSource, dx, dy, {
-                    delayMs: AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS,
-                    resetCooldown: true,
-                  });
+                  setAuthoritativeMovementIntent(entry.movementSource, dx, dy);
                 }
                 handleDpad(dx, dy, { movementSource: entry.movementSource });
                 entry.firedInitial = true;
               } catch {}
-              if (isAuthoritativeSessionActive()) {
+              if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
                 activePointers.set(ev.pointerId, entry);
                 return;
               }
@@ -22784,10 +26189,12 @@ if (!HEADLESS_RUNTIME) {
             // clear timers
             if (entry.initialTimeout) { clearTimeout(entry.initialTimeout); entry.initialTimeout = null; }
             if (entry.repeatInterval) { clearInterval(entry.repeatInterval); entry.repeatInterval = null; }
-            if (entry.movementSource) {
-              clearAuthoritativeMovementIntent(entry.movementSource);
-              dropQueuedAuthoritativeMovementBySourceKeep(entry.movementSource, 1);
-            }
+              if (entry.movementSource) {
+                clearAuthoritativeMovementIntent(entry.movementSource);
+                if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
+                  void syncAuthoritativeMovementControl();
+                }
+              }
 
             const elapsed = Date.now() - (entry.start || 0);
             if (entry.type === 'dpad') {
@@ -22819,9 +26226,6 @@ if (!HEADLESS_RUNTIME) {
       const frameBudgetMs = isAuthoritativeSessionActive() ? targetAuthoritativeFrameMs : targetFrameMs;
       if (now - lastFrameTs >= frameBudgetMs) {
         try {
-          if (isAuthoritativeSessionActive()) {
-            pumpAuthoritativeMovementIntent(game, Date.now());
-          }
           draw(game);
         } catch (err) {
           showFatal(err);

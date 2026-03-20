@@ -204,7 +204,9 @@ function authoritative_worker_call_via_daemon(array $input): ?array
     return null;
   }
 
-  $stream = authoritative_worker_socket_connect(1.5);
+  $operation = trim((string) ($input['operation'] ?? ''));
+  $timeoutSeconds = $operation === 'poll_movement' ? 35.0 : 1.5;
+  $stream = authoritative_worker_socket_connect($timeoutSeconds);
   if (!is_resource($stream)) {
     return null;
   }
@@ -219,12 +221,16 @@ function authoritative_worker_call_via_daemon(array $input): ?array
   stream_socket_shutdown($stream, STREAM_SHUT_WR);
   $stdout = stream_get_contents($stream);
   fclose($stream);
-  try {
-    return authoritative_worker_decode_response($stdout, '');
-  } catch (RuntimeException $err) {
-    @unlink(authoritative_worker_socket_path());
-    return null;
+  $decoded = is_string($stdout) ? json_decode($stdout, true) : null;
+  if (is_array($decoded)) {
+    if (($decoded['ok'] ?? false) !== true) {
+      $detail = trim((string) ($decoded['error'] ?? 'Authoritative worker failed.'));
+      throw new RuntimeException($detail !== '' ? $detail : 'Authoritative worker failed.');
+    }
+    return $decoded;
   }
+  @unlink(authoritative_worker_socket_path());
+  return null;
 }
 
 /**
@@ -303,6 +309,9 @@ function authoritative_worker_bootstrap(?string $worldPayload, ?string $characte
       'worldPayload' => trim((string) ($worldPayload ?? '')),
       'characterPayload' => trim((string) ($characterPayload ?? '')),
       'forceEntrance' => !empty($options['force_entrance']),
+      'liveTickCombat' => (array_key_exists('live_tick_combat', $options) && $options['live_tick_combat'] !== null)
+        ? (bool) $options['live_tick_combat']
+        : null,
     ],
   ];
   $sid = trim((string) ($options['session_id'] ?? ''));
@@ -324,6 +333,9 @@ function authoritative_worker_switch_character(string $worldPayload, string $cha
     'characterPayload' => $characterPayload,
     'options' => [
       'forceEntrance' => !empty($options['force_entrance']),
+      'liveTickCombat' => (array_key_exists('live_tick_combat', $options) && $options['live_tick_combat'] !== null)
+        ? (bool) $options['live_tick_combat']
+        : null,
     ],
   ];
   $sid = trim((string) ($options['session_id'] ?? ''));
@@ -355,4 +367,50 @@ function authoritative_worker_execute_command(
     $input['sessionId'] = $sid;
   }
   return authoritative_worker_call($input);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function authoritative_worker_set_movement_intent(
+  string $worldPayload,
+  string $sessionId,
+  string $holdDir = '',
+  bool $active = false,
+  string $enqueueDir = '',
+  int $intentSeq = 0
+): array {
+  $sid = trim($sessionId);
+  if ($sid === '') {
+    throw new RuntimeException('Missing authoritative session id.');
+  }
+  return authoritative_worker_call([
+    'operation' => 'set_movement_intent',
+    'sessionId' => $sid,
+    'worldPayload' => $worldPayload,
+    'holdDir' => trim($holdDir),
+    'active' => $active,
+    'enqueueDir' => trim($enqueueDir),
+    'intentSeq' => max(0, $intentSeq),
+  ]);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function authoritative_worker_poll_movement(
+  string $worldPayload,
+  string $sessionId,
+  int $timeoutMs = 25000
+): array {
+  $sid = trim($sessionId);
+  if ($sid === '') {
+    throw new RuntimeException('Missing authoritative session id.');
+  }
+  return authoritative_worker_call([
+    'operation' => 'poll_movement',
+    'sessionId' => $sid,
+    'worldPayload' => $worldPayload,
+    'timeoutMs' => max(100, min(30000, $timeoutMs)),
+  ]);
 }

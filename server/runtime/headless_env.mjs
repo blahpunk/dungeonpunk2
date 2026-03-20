@@ -106,6 +106,11 @@ function createElementStore() {
 
 export function createHeadlessBrowserEnv(options = {}) {
   globalThis.__DUNGEONPUNK_HEADLESS__ = true;
+  if (typeof options.liveTickCombat === "boolean") {
+    globalThis.__DUNGEONPUNK_LIVE_TICK_COMBAT__ = options.liveTickCombat;
+  } else {
+    delete globalThis.__DUNGEONPUNK_LIVE_TICK_COMBAT__;
+  }
 
   const store = createElementStore();
   const body = store.get("body");
@@ -115,6 +120,7 @@ export function createHeadlessBrowserEnv(options = {}) {
     saveCsrf: String(options.csrfToken ?? ""),
     saveMaxSlots: String(options.saveMaxSlots ?? "10"),
     characterMaxSlots: String(options.characterMaxSlots ?? "5"),
+    liveTickCombat: typeof options.liveTickCombat === "boolean" ? (options.liveTickCombat ? "1" : "0") : "",
   };
 
   const documentRef = {

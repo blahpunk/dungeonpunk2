@@ -2923,6 +2923,9 @@ if ($apiMode === 'authoritative') {
   }
 
   $action = strtolower(trim((string) ($body['action'] ?? '')));
+  $liveTickCombat = array_key_exists('live_tick_combat', $body)
+    ? filter_var($body['live_tick_combat'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)
+    : null;
   try {
     if ($action === 'open_session') {
       $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
@@ -2933,6 +2936,7 @@ if ($apiMode === 'authoritative') {
         'force_entrance' => !empty($body['force_entrance']),
         'fresh_world' => !empty($body['fresh_world']),
         'browser_instance_id' => $browserInstanceId,
+        'live_tick_combat' => $liveTickCombat,
       ]));
     }
     if ($action === 'switch_character') {
@@ -2943,6 +2947,7 @@ if ($apiMode === 'authoritative') {
       }
       json_response(authoritative_switch_session_character($userEmail, $saveSecret, $sessionId, $characterId, [
         'force_entrance' => !empty($body['force_entrance']),
+        'live_tick_combat' => $liveTickCombat,
       ]));
     }
     if ($action === 'new_dungeon') {
@@ -2950,7 +2955,9 @@ if ($apiMode === 'authoritative') {
       if ($sessionId === '') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
       }
-      json_response(authoritative_start_new_dungeon($userEmail, $saveSecret, $sessionId));
+      json_response(authoritative_start_new_dungeon($userEmail, $saveSecret, $sessionId, [
+        'live_tick_combat' => $liveTickCombat,
+      ]));
     }
     if ($action === 'command') {
       $sessionId = trim((string) ($body['session_id'] ?? ''));
@@ -2960,6 +2967,32 @@ if ($apiMode === 'authoritative') {
         json_response(['ok' => false, 'error' => 'Missing session, command, or command sequence.'], 400);
       }
       json_response(authoritative_handle_command($userEmail, $saveSecret, $sessionId, $clientCommandSeq, $command));
+    }
+    if ($action === 'set_movement_intent') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      $holdDir = trim((string) ($body['hold_dir'] ?? ''));
+      $enqueueDir = trim((string) ($body['enqueue_dir'] ?? ''));
+      $intentSeq = max(0, (int) ($body['intent_seq'] ?? 0));
+      json_response(authoritative_set_movement_intent(
+        $userEmail,
+        $saveSecret,
+        $sessionId,
+        $holdDir,
+        !empty($body['active']),
+        $enqueueDir,
+        $intentSeq
+      ));
+    }
+    if ($action === 'poll_movement') {
+      $sessionId = trim((string) ($body['session_id'] ?? ''));
+      if ($sessionId === '') {
+        json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
+      }
+      $timeoutMs = max(100, min(30000, (int) ($body['timeout_ms'] ?? 25000)));
+      json_response(authoritative_poll_movement($userEmail, $saveSecret, $sessionId, $timeoutMs));
     }
     if ($action === 'touch_session') {
       $sessionId = trim((string) ($body['session_id'] ?? ''));
@@ -3018,7 +3051,8 @@ if ($apiMode === 'authoritative') {
         $saveSecret,
         $sessionId,
         $characterPayload,
-        $characterName
+        $characterName,
+        ['live_tick_combat' => $liveTickCombat]
       ));
     }
     if ($action === 'manual_save') {

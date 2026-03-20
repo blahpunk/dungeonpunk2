@@ -26,8 +26,10 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
 let appliedMonsterConfigRaw = "";
 const SESSION_STATE_CACHE_TTL_MS = 300000;
 const SESSION_STATE_CACHE_MAX = 128;
-const AUTHORITATIVE_TICK_MS = 50;
-const AUTHORITATIVE_INPUT_WINDOW_MS = 50;
+const AUTHORITATIVE_TICK_MS = 28;
+const AUTHORITATIVE_INPUT_WINDOW_MS = 28;
+const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 84;
+const AUTHORITATIVE_POLL_MAX_BATCH_CHANGED_TICKS = 4;
 const sessionStateCache = new Map();
 
 if (!socketPath) {
@@ -37,6 +39,11 @@ if (!socketPath) {
 function normalizeSessionId(value = "") {
   const id = String(value ?? "").trim();
   return /^[a-z0-9_\-]{8,160}$/i.test(id) ? id : "";
+}
+
+function normalizeMoveDir(value = "") {
+  const dir = String(value ?? "").trim().toUpperCase();
+  return (dir === "N" || dir === "S" || dir === "E" || dir === "W") ? dir : "";
 }
 
 function pruneSessionStateCache(nowMs = Date.now()) {
@@ -56,13 +63,17 @@ function pruneSessionStateCache(nowMs = Date.now()) {
   }
 }
 
-function getCachedSessionState(sessionId = "", worldPayload = "") {
+function getCachedSessionState(sessionId = "", worldPayload = "", options = null) {
   const key = normalizeSessionId(sessionId);
   if (!key) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const allowPayloadMismatch = opts.allowPayloadMismatch === true;
   pruneSessionStateCache(Date.now());
   const entry = sessionStateCache.get(key);
   if (!entry || typeof entry !== "object") return null;
-  if (String(entry.worldPayload ?? "") !== String(worldPayload ?? "")) return null;
+  if (String(entry.worldPayload ?? "") !== String(worldPayload ?? "")) {
+    if (!allowPayloadMismatch) return null;
+  }
   entry.updatedAt = Date.now();
   return entry;
 }
@@ -77,6 +88,22 @@ function setCachedSessionState(sessionId = "", worldPayload = "", state = null) 
     state,
     lastTick: Number.isFinite(prev?.lastTick) ? Math.max(0, Math.floor(prev.lastTick)) : 0,
     updatedAt: Date.now(),
+    movementIntent: {
+      active: prev?.movementIntent?.active === true,
+      dir: normalizeMoveDir(prev?.movementIntent?.dir ?? ""),
+      updatedAt: Number.isFinite(prev?.movementIntent?.updatedAt)
+        ? Math.max(0, Math.floor(prev.movementIntent.updatedAt))
+        : 0,
+      seq: Number.isFinite(prev?.movementIntent?.seq)
+        ? Math.max(0, Math.floor(prev.movementIntent.seq))
+        : 0,
+      enqueueSeq: Number.isFinite(prev?.movementIntent?.enqueueSeq)
+        ? Math.max(0, Math.floor(prev.movementIntent.enqueueSeq))
+        : 0,
+    },
+    pendingMoves: Array.isArray(prev?.pendingMoves)
+      ? prev.pendingMoves.map((dir) => normalizeMoveDir(dir)).filter(Boolean).slice(-8)
+      : [],
   });
 }
 
@@ -84,6 +111,149 @@ function clearCachedSessionState(sessionId = "") {
   const key = normalizeSessionId(sessionId);
   if (!key) return;
   sessionStateCache.delete(key);
+}
+
+function sleep(ms = 0) {
+  const delay = Math.max(0, Math.floor(Number(ms) || 0));
+  if (delay <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function ensureMovementState(entry = null) {
+  if (!entry || typeof entry !== "object") return null;
+  if (!entry.movementIntent || typeof entry.movementIntent !== "object") {
+    entry.movementIntent = {
+      active: false,
+      dir: "",
+      updatedAt: 0,
+      seq: 0,
+      enqueueSeq: 0,
+    };
+  }
+  entry.movementIntent.active = entry.movementIntent.active === true;
+  entry.movementIntent.dir = normalizeMoveDir(entry.movementIntent.dir ?? "");
+  entry.movementIntent.updatedAt = Number.isFinite(entry.movementIntent.updatedAt)
+    ? Math.max(0, Math.floor(entry.movementIntent.updatedAt))
+    : 0;
+  entry.movementIntent.seq = Number.isFinite(entry.movementIntent.seq)
+    ? Math.max(0, Math.floor(entry.movementIntent.seq))
+    : 0;
+  entry.movementIntent.enqueueSeq = Number.isFinite(entry.movementIntent.enqueueSeq)
+    ? Math.max(0, Math.floor(entry.movementIntent.enqueueSeq))
+    : 0;
+  if (!Array.isArray(entry.pendingMoves)) entry.pendingMoves = [];
+  entry.pendingMoves = entry.pendingMoves.map((dir) => normalizeMoveDir(dir)).filter(Boolean).slice(-8);
+  return entry;
+}
+
+function sessionHasPendingMovement(entry = null) {
+  const normalized = ensureMovementState(entry);
+  if (!normalized) return false;
+  if (normalized.pendingMoves.length > 0) return true;
+  return normalized.movementIntent.active === true && !!normalized.movementIntent.dir;
+}
+
+function dequeueSessionMoveDir(entry = null) {
+  const normalized = ensureMovementState(entry);
+  if (!normalized) return "";
+  if (normalized.pendingMoves.length > 0) {
+    return normalizeMoveDir(normalized.pendingMoves.shift() ?? "");
+  }
+  if (normalized.movementIntent.active === true) {
+    return normalizeMoveDir(normalized.movementIntent.dir ?? "");
+  }
+  return "";
+}
+
+function updateSessionMovementIntent(entry = null, options = null) {
+  const normalized = ensureMovementState(entry);
+  if (!normalized) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const seq = Math.max(0, Math.floor(Number(opts.intentSeq ?? 0) || 0));
+  if (seq > 0 && seq < normalized.movementIntent.seq) {
+    const staleEnqueueDir = normalizeMoveDir(opts.enqueueDir ?? "");
+    if (staleEnqueueDir && seq > normalized.movementIntent.enqueueSeq) {
+      normalized.pendingMoves.push(staleEnqueueDir);
+      normalized.pendingMoves = normalized.pendingMoves.slice(-8);
+      normalized.movementIntent.enqueueSeq = seq;
+    }
+    return normalized.movementIntent;
+  }
+  if (seq > 0) normalized.movementIntent.seq = seq;
+  const holdDir = normalizeMoveDir(opts.holdDir ?? opts.dir ?? "");
+  normalized.movementIntent.active = opts.active === true && !!holdDir;
+  normalized.movementIntent.dir = normalized.movementIntent.active ? holdDir : "";
+  normalized.movementIntent.updatedAt = Date.now();
+  const enqueueDir = normalizeMoveDir(opts.enqueueDir ?? "");
+  if (enqueueDir && seq > normalized.movementIntent.enqueueSeq) {
+    normalized.pendingMoves.push(enqueueDir);
+    normalized.pendingMoves = normalized.pendingMoves.slice(-8);
+    normalized.movementIntent.enqueueSeq = seq;
+  }
+  return normalized.movementIntent;
+}
+
+function movementIntentSummary(entry = null) {
+  const normalized = ensureMovementState(entry);
+  if (!normalized) {
+    return {
+      active: false,
+      dir: "",
+      queued: 0,
+      seq: 0,
+    };
+  }
+  return {
+    active: normalized.movementIntent.active === true,
+    dir: normalizeMoveDir(normalized.movementIntent.dir ?? ""),
+    queued: normalized.pendingMoves.length,
+    seq: Math.max(0, Math.floor(Number(normalized.movementIntent.seq ?? 0) || 0)),
+  };
+}
+
+function capturePollStateProbe(state = null) {
+  const player = (state && typeof state === "object" && state.player && typeof state.player === "object")
+    ? state.player
+    : {};
+  const live = (state && typeof state === "object" && state.live && typeof state.live === "object")
+    ? state.live
+    : {};
+  const events = Array.isArray(live.events) ? live.events : [];
+  const log = Array.isArray(state?.log) ? state.log : [];
+  const lastEvent = events.length > 0 ? events[events.length - 1] : null;
+  return {
+    x: Math.floor(Number(player.x ?? 0)),
+    y: Math.floor(Number(player.y ?? 0)),
+    z: Math.floor(Number(player.z ?? 0)),
+    hp: Math.max(0, Math.floor(Number(player.hp ?? 0))),
+    energy: Math.max(0, Math.floor(Number(player.energy ?? 0))),
+    dead: !!player.dead,
+    logLen: log.length,
+    eventLen: events.length,
+    stepSeq: Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)),
+    lastEventTick: Math.max(0, Math.floor(Number(lastEvent?.tick ?? 0) || 0)),
+    lastEventType: String(lastEvent?.type ?? "").trim().toLowerCase(),
+    lastEventActionId: String(lastEvent?.actionId ?? "").trim(),
+  };
+}
+
+function pollStateProbeChanged(before = null, after = null) {
+  const a = (before && typeof before === "object") ? before : capturePollStateProbe(null);
+  const b = (after && typeof after === "object") ? after : capturePollStateProbe(null);
+  return (
+    a.x !== b.x
+    || a.y !== b.y
+    || a.z !== b.z
+    || a.hp !== b.hp
+    || a.energy !== b.energy
+    || a.dead !== b.dead
+    || a.logLen !== b.logLen
+    || a.eventLen !== b.eventLen
+    || a.stepSeq !== b.stepSeq
+    || a.lastEventTick !== b.lastEventTick
+    || a.lastEventType !== b.lastEventType
+    || a.lastEventActionId !== b.lastEventActionId
+  );
 }
 
 function fail(message, extra = {}) {
@@ -155,7 +325,7 @@ async function handleOperation(raw = "") {
 
   if (operation === "snapshot") {
     const worldPayload = String(input.worldPayload ?? "");
-    let entry = getCachedSessionState(sessionId, worldPayload);
+    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
     let state = entry?.state ?? null;
     if (!state) {
       state = engine.headlessStateFromPayload(worldPayload);
@@ -187,7 +357,7 @@ async function handleOperation(raw = "") {
   if (operation === "command") {
     const opStartMs = Date.now();
     const worldPayload = String(input.worldPayload ?? "");
-    let entry = getCachedSessionState(sessionId, worldPayload);
+    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
     let state = entry?.state ?? null;
     if (!state) {
       state = engine.headlessStateFromPayload(worldPayload);
@@ -201,14 +371,22 @@ async function handleOperation(raw = "") {
     const nowMs = Date.now();
     const nowTick = Math.max(0, Math.floor(nowMs / AUTHORITATIVE_TICK_MS));
     const previousTick = Number.isFinite(entry?.lastTick) ? Math.max(0, Math.floor(entry.lastTick)) : 0;
-    const serverTick = Math.max(previousTick + 1, nowTick);
+    const serverTick = Math.max(previousTick + 1, nowTick + 1);
+    const executeAtMs = serverTick * AUTHORITATIVE_TICK_MS;
+    const waitMs = Math.max(0, executeAtMs - nowMs);
     if (entry && typeof entry === "object") {
       entry.lastTick = serverTick;
       entry.updatedAt = nowMs;
     }
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
 
     const result = typeof engine.headlessExecuteCommandOnState === "function"
-      ? engine.headlessExecuteCommandOnState(state, input.command ?? {}, "", { basePayload: worldPayload })
+      ? engine.headlessExecuteCommandOnState(state, input.command ?? {}, "", {
+          basePayload: String(entry?.worldPayload ?? worldPayload),
+          nowMs: executeAtMs,
+        })
       : engine.headlessExecuteCommandPayload(worldPayload, input.command ?? {}, "");
     if (sessionId && result && typeof result === "object") {
       const nextPayload = String(result?.snapshot?.payload ?? "");
@@ -230,6 +408,202 @@ async function handleOperation(raw = "") {
       };
     }
     return result;
+  }
+
+  if (operation === "set_movement_intent") {
+    const worldPayload = String(input.worldPayload ?? "");
+    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
+    let state = entry?.state ?? null;
+    if (!state) {
+      state = engine.headlessStateFromPayload(worldPayload);
+      if (!state) return fail("Invalid canonical run payload.");
+      if (sessionId) {
+        setCachedSessionState(sessionId, worldPayload, state);
+        entry = getCachedSessionState(sessionId, worldPayload);
+      }
+    }
+    ensureMovementState(entry);
+    updateSessionMovementIntent(entry, {
+      holdDir: input.holdDir ?? input.dir ?? "",
+      active: input.active === true,
+      enqueueDir: input.enqueueDir ?? "",
+      intentSeq: input.intentSeq ?? 0,
+    });
+    if (entry && typeof entry === "object") {
+      entry.updatedAt = Date.now();
+    }
+    return {
+      ok: true,
+      sessionId,
+      intent: movementIntentSummary(entry),
+      tick: {
+        serverTick: Number.isFinite(entry?.lastTick) ? Math.max(0, Math.floor(entry.lastTick)) : 0,
+        tickMs: AUTHORITATIVE_TICK_MS,
+        inputWindowMs: AUTHORITATIVE_INPUT_WINDOW_MS,
+      },
+    };
+  }
+
+  if (operation === "poll_movement") {
+    const opStartMs = Date.now();
+    const worldPayload = String(input.worldPayload ?? "");
+    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
+    let state = entry?.state ?? null;
+    if (!state) {
+      state = engine.headlessStateFromPayload(worldPayload);
+      if (!state) return fail("Invalid canonical run payload.");
+      if (sessionId) {
+        setCachedSessionState(sessionId, worldPayload, state);
+        entry = getCachedSessionState(sessionId, worldPayload);
+      }
+    }
+    ensureMovementState(entry);
+    const timeoutMs = Math.max(100, Math.min(30000, Math.floor(Number(input.timeoutMs ?? 0) || 25000)));
+    const deadlineMs = Date.now() + timeoutMs;
+    const minResponseMs = Math.max(
+      0,
+      Math.min(
+        Math.floor(timeoutMs / 2),
+        Math.floor(Number(input.minResponseMs ?? AUTHORITATIVE_POLL_MIN_RESPONSE_MS) || AUTHORITATIVE_POLL_MIN_RESPONSE_MS)
+      )
+    );
+    const earliestResponseAtMs = opStartMs + minResponseMs;
+    let lastTick = Number.isFinite(entry?.lastTick)
+      ? Math.max(0, Math.floor(entry.lastTick))
+      : Math.max(0, Math.floor(Date.now() / AUTHORITATIVE_TICK_MS));
+    let changedTickCount = 0;
+    let changedResult = null;
+    let changedServerTick = lastTick;
+
+    while (Date.now() < deadlineMs) {
+      const nowMs = Date.now();
+      const currentTick = Math.max(0, Math.floor(nowMs / AUTHORITATIVE_TICK_MS));
+      const previousTick = Number.isFinite(entry?.lastTick)
+        ? Math.max(0, Math.floor(entry.lastTick))
+        : Math.max(lastTick, currentTick);
+      const serverTick = Math.max(previousTick + 1, currentTick + 1);
+      const executeAtMs = serverTick * AUTHORITATIVE_TICK_MS;
+      if (executeAtMs > deadlineMs) break;
+
+      const waitMs = Math.max(0, executeAtMs - nowMs);
+      if (waitMs > 0) await sleep(waitMs);
+
+      if (entry && typeof entry === "object") {
+        entry.lastTick = serverTick;
+        entry.updatedAt = Date.now();
+      }
+      lastTick = serverTick;
+
+      const intentActive = entry?.movementIntent?.active === true;
+      const holdDir = intentActive ? normalizeMoveDir(entry?.movementIntent?.dir ?? "") : "";
+      let enqueueDir = "";
+      if (Array.isArray(entry?.pendingMoves) && entry.pendingMoves.length > 0) {
+        enqueueDir = normalizeMoveDir(entry.pendingMoves.shift() ?? "");
+      }
+
+      const beforeProbe = capturePollStateProbe(state);
+      const basePayload = String(entry?.worldPayload ?? worldPayload);
+      const result = typeof engine.headlessExecuteCommandOnState === "function"
+        ? engine.headlessExecuteCommandOnState(state, {
+            type: "LIVE_POLL_TICK",
+            holdDir,
+            active: intentActive,
+            enqueueDir,
+          }, "", {
+            basePayload,
+            nowMs: executeAtMs,
+            maxCatchupTicks: 1,
+          })
+        : engine.headlessExecuteCommandPayload(basePayload, { type: "WAIT" }, "");
+      if (!result || typeof result !== "object") {
+        return fail("Movement poll tick failed.");
+      }
+
+      const afterProbe = capturePollStateProbe(state);
+      const changed = pollStateProbeChanged(beforeProbe, afterProbe) || result.moved === true;
+      if (changed) {
+        changedTickCount += 1;
+        changedResult = result;
+        changedServerTick = serverTick;
+        const nowAfterChange = Date.now();
+        if (
+          nowAfterChange >= earliestResponseAtMs
+          || changedTickCount >= AUTHORITATIVE_POLL_MAX_BATCH_CHANGED_TICKS
+          || (deadlineMs - nowAfterChange) <= AUTHORITATIVE_TICK_MS
+        ) {
+          const nextPayload = String(changedResult?.snapshot?.payload ?? "");
+          if (nextPayload && entry && typeof entry === "object") {
+            entry.worldPayload = nextPayload;
+            entry.updatedAt = nowAfterChange;
+          }
+          const perf = (changedResult?.perf && typeof changedResult.perf === "object")
+            ? { ...changedResult.perf }
+            : {};
+          if (changedTickCount > 1) {
+            // Multi-tick batches produce a payload diff from the cached base payload;
+            // suppress single-tick hot delta to avoid partial client application.
+            changedResult.hotDelta = null;
+          }
+          perf.daemonMs = Math.max(0, Date.now() - opStartMs);
+          return {
+            ...changedResult,
+            ok: changedResult?.ok !== false,
+            changed: true,
+            sessionId,
+            intent: movementIntentSummary(entry),
+            perf,
+            tick: {
+              serverTick: changedServerTick,
+              tickMs: AUTHORITATIVE_TICK_MS,
+              inputWindowMs: AUTHORITATIVE_INPUT_WINDOW_MS,
+            },
+          };
+        }
+      }
+    }
+
+    if (changedResult) {
+      const nextPayload = String(changedResult?.snapshot?.payload ?? "");
+      if (nextPayload && entry && typeof entry === "object") {
+        entry.worldPayload = nextPayload;
+        entry.updatedAt = Date.now();
+      }
+      const perf = (changedResult?.perf && typeof changedResult.perf === "object")
+        ? { ...changedResult.perf }
+        : {};
+      if (changedTickCount > 1) {
+        changedResult.hotDelta = null;
+      }
+      perf.daemonMs = Math.max(0, Date.now() - opStartMs);
+      return {
+        ...changedResult,
+        ok: changedResult?.ok !== false,
+        changed: true,
+        sessionId,
+        intent: movementIntentSummary(entry),
+        perf,
+        tick: {
+          serverTick: changedServerTick,
+          tickMs: AUTHORITATIVE_TICK_MS,
+          inputWindowMs: AUTHORITATIVE_INPUT_WINDOW_MS,
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      changed: false,
+      sessionId,
+      intent: movementIntentSummary(entry),
+      tick: {
+        serverTick: Math.max(0, Math.floor(lastTick)),
+        tickMs: AUTHORITATIVE_TICK_MS,
+        inputWindowMs: AUTHORITATIVE_INPUT_WINDOW_MS,
+      },
+      perf: {
+        daemonMs: Math.max(0, Date.now() - opStartMs),
+      },
+    };
   }
 
   return fail(`Unsupported worker operation: ${operation}`);
