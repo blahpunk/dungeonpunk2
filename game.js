@@ -23118,7 +23118,7 @@ function advanceLivePlayerCombatOnTick(state, options = null) {
 function liveMonsterMoveCadenceTicks(monster = null, spec = null, ai = "") {
   const speed = Math.max(0.5, Number(monster?.spd ?? spec?.spd ?? 1) || 1);
   const rangedAi = String(ai ?? "").includes("ranged");
-  const baseTicks = rangedAi ? 6 : 5;
+  const baseTicks = rangedAi ? 5 : 4;
   return Math.max(1, Math.min(10, Math.round(baseTicks / speed)));
 }
 

@@ -530,26 +530,18 @@ function authoritative_poll_movement(
 
   $moved = !empty($result['ok']);
   if ($moved) {
+    $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
     $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
-    $runUpdatedAtRaw = trim((string) ($runRecord['updated_at'] ?? ''));
-    $runUpdatedAtTs = $runUpdatedAtRaw !== '' ? strtotime($runUpdatedAtRaw) : false;
-    $lastPersistMs = ($runUpdatedAtTs !== false && $runUpdatedAtTs > 0) ? ((int) $runUpdatedAtTs * 1000) : 0;
-    $nowMs = (int) floor(microtime(true) * 1000);
-    $persistIntervalMs = 1200;
-    $forcePersist = !empty($snapshot['player']['dead']);
-    $shouldPersist = $forcePersist || $lastPersistMs <= 0 || (($nowMs - $lastPersistMs) >= $persistIntervalMs);
-    if ($shouldPersist) {
-      $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
-      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord);
-      if (!authoritative_persist_session($session)) {
-        throw new RuntimeException('Could not persist authoritative movement session.');
-      }
+    authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord);
+    if (!authoritative_persist_session($session)) {
+      throw new RuntimeException('Could not persist authoritative movement session.');
     }
   }
 
   $resultDiff = is_array($result['diff'] ?? null) ? $result['diff'] : null;
   $resultHotDelta = is_array($result['hotDelta'] ?? null) ? $result['hotDelta'] : null;
-  $sendDiff = $moved && is_array($resultDiff);
+  // Consistency-first movement polling: always send full snapshot payload.
+  $sendDiff = false;
 
   $response = authoritative_build_snapshot_response($session, $snapshot, [
     'ok' => $moved,

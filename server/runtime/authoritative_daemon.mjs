@@ -28,7 +28,7 @@ const SESSION_STATE_CACHE_TTL_MS = 300000;
 const SESSION_STATE_CACHE_MAX = 128;
 const AUTHORITATIVE_TICK_MS = 28;
 const AUTHORITATIVE_INPUT_WINDOW_MS = 28;
-const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 84;
+const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 70;
 const AUTHORITATIVE_POLL_MAX_BATCH_CHANGED_TICKS = 4;
 const sessionStateCache = new Map();
 
@@ -63,17 +63,13 @@ function pruneSessionStateCache(nowMs = Date.now()) {
   }
 }
 
-function getCachedSessionState(sessionId = "", worldPayload = "", options = null) {
+function getCachedSessionState(sessionId = "", worldPayload = "") {
   const key = normalizeSessionId(sessionId);
   if (!key) return null;
-  const opts = (options && typeof options === "object") ? options : {};
-  const allowPayloadMismatch = opts.allowPayloadMismatch === true;
   pruneSessionStateCache(Date.now());
   const entry = sessionStateCache.get(key);
   if (!entry || typeof entry !== "object") return null;
-  if (String(entry.worldPayload ?? "") !== String(worldPayload ?? "")) {
-    if (!allowPayloadMismatch) return null;
-  }
+  if (String(entry.worldPayload ?? "") !== String(worldPayload ?? "")) return null;
   entry.updatedAt = Date.now();
   return entry;
 }
@@ -325,7 +321,7 @@ async function handleOperation(raw = "") {
 
   if (operation === "snapshot") {
     const worldPayload = String(input.worldPayload ?? "");
-    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
+    let entry = getCachedSessionState(sessionId, worldPayload);
     let state = entry?.state ?? null;
     if (!state) {
       state = engine.headlessStateFromPayload(worldPayload);
@@ -357,7 +353,7 @@ async function handleOperation(raw = "") {
   if (operation === "command") {
     const opStartMs = Date.now();
     const worldPayload = String(input.worldPayload ?? "");
-    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
+    let entry = getCachedSessionState(sessionId, worldPayload);
     let state = entry?.state ?? null;
     if (!state) {
       state = engine.headlessStateFromPayload(worldPayload);
@@ -384,7 +380,7 @@ async function handleOperation(raw = "") {
 
     const result = typeof engine.headlessExecuteCommandOnState === "function"
       ? engine.headlessExecuteCommandOnState(state, input.command ?? {}, "", {
-          basePayload: String(entry?.worldPayload ?? worldPayload),
+          basePayload: worldPayload,
           nowMs: executeAtMs,
         })
       : engine.headlessExecuteCommandPayload(worldPayload, input.command ?? {}, "");
@@ -412,7 +408,7 @@ async function handleOperation(raw = "") {
 
   if (operation === "set_movement_intent") {
     const worldPayload = String(input.worldPayload ?? "");
-    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
+    let entry = getCachedSessionState(sessionId, worldPayload);
     let state = entry?.state ?? null;
     if (!state) {
       state = engine.headlessStateFromPayload(worldPayload);
@@ -447,7 +443,7 @@ async function handleOperation(raw = "") {
   if (operation === "poll_movement") {
     const opStartMs = Date.now();
     const worldPayload = String(input.worldPayload ?? "");
-    let entry = getCachedSessionState(sessionId, worldPayload, { allowPayloadMismatch: true });
+    let entry = getCachedSessionState(sessionId, worldPayload);
     let state = entry?.state ?? null;
     if (!state) {
       state = engine.headlessStateFromPayload(worldPayload);
@@ -559,6 +555,36 @@ async function handleOperation(raw = "") {
             },
           };
         }
+      }
+
+      // If we already captured a changed result, flush it as soon as the
+      // minimum response window has elapsed even when subsequent ticks are idle.
+      if (changedResult && Date.now() >= earliestResponseAtMs) {
+        const nextPayload = String(changedResult?.snapshot?.payload ?? "");
+        if (nextPayload && entry && typeof entry === "object") {
+          entry.worldPayload = nextPayload;
+          entry.updatedAt = Date.now();
+        }
+        const perf = (changedResult?.perf && typeof changedResult.perf === "object")
+          ? { ...changedResult.perf }
+          : {};
+        if (changedTickCount > 1) {
+          changedResult.hotDelta = null;
+        }
+        perf.daemonMs = Math.max(0, Date.now() - opStartMs);
+        return {
+          ...changedResult,
+          ok: changedResult?.ok !== false,
+          changed: true,
+          sessionId,
+          intent: movementIntentSummary(entry),
+          perf,
+          tick: {
+            serverTick: changedServerTick,
+            tickMs: AUTHORITATIVE_TICK_MS,
+            inputWindowMs: AUTHORITATIVE_INPUT_WINDOW_MS,
+          },
+        };
       }
     }
 
