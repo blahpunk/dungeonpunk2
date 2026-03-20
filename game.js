@@ -1731,10 +1731,37 @@ const authoritativePendingAction = createPendingActionState();
 let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
 const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
-const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 3;
+const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 1;
+const AUTHORITATIVE_MOVE_BATCH_MAX = 1;
 const authoritativeCommandQueue = [];
-const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 300;
+const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 90;
+const AUTHORITATIVE_PAYLOAD_DIFF_FORMAT = "save_payload_delta_v1";
+const AUTHORITATIVE_PAYLOAD_DIFF_MAX_OPS = 1600;
+const AUTHORITATIVE_PAYLOAD_DIFF_MAX_BYTES = 120000;
 const AUTHORITATIVE_LOCK_AUDIT_INTERVAL_MS = 20000;
+const AUTHORITATIVE_FAST_UI_REASONS = new Set([
+  "move",
+  "attack",
+  "wait",
+  "open-door",
+  "close-door",
+  "interact",
+  "shop-interact",
+  "shop-refresh",
+  "use-stairs",
+  "use-shrine",
+  "disarm-trap",
+]);
+const AUTHORITATIVE_HOT_DELTA_TYPES = new Set([
+  "MOVE",
+  "MOVE_BATCH",
+  "ATTACK",
+  "WAIT",
+  "OPEN_DOOR",
+  "CLOSE_DOOR",
+  "INTERACT",
+  "DISARM_TRAP",
+]);
 const authoritativeSessionRuntime = {
   touchTimer: 0,
   touchInFlight: false,
@@ -1750,6 +1777,73 @@ const authoritativeRateLimitRuntime = {
   drainTimer: 0,
   lastWarnAt: 0,
 };
+const authoritativeQueuedMovePreviewRuntime = {
+  active: false,
+  source: "",
+};
+const AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED = false;
+const authoritativeVisualMotionRuntime = {
+  initialized: false,
+  fromX: 0,
+  fromY: 0,
+  toX: 0,
+  toY: 0,
+  startAtMs: 0,
+  durationMs: 45,
+};
+
+function resolveAuthoritativeVisualPlayerPosition(fallbackX = 0, fallbackY = 0, nowMs = Date.now()) {
+  if (!AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) {
+    return { x: Number(fallbackX) || 0, y: Number(fallbackY) || 0 };
+  }
+  if (!authoritativeVisualMotionRuntime.initialized) {
+    return { x: Number(fallbackX) || 0, y: Number(fallbackY) || 0 };
+  }
+  const start = Number(authoritativeVisualMotionRuntime.startAtMs ?? 0);
+  const duration = Math.max(1, Number(authoritativeVisualMotionRuntime.durationMs ?? 45));
+  const progress = Math.max(0, Math.min(1, (Number(nowMs) - start) / duration));
+  const x = authoritativeVisualMotionRuntime.fromX + (authoritativeVisualMotionRuntime.toX - authoritativeVisualMotionRuntime.fromX) * progress;
+  const y = authoritativeVisualMotionRuntime.fromY + (authoritativeVisualMotionRuntime.toY - authoritativeVisualMotionRuntime.fromY) * progress;
+  if (progress >= 1) {
+    authoritativeVisualMotionRuntime.fromX = authoritativeVisualMotionRuntime.toX;
+    authoritativeVisualMotionRuntime.fromY = authoritativeVisualMotionRuntime.toY;
+  }
+  return { x, y };
+}
+
+function resetAuthoritativeVisualMotion(x = 0, y = 0) {
+  authoritativeVisualMotionRuntime.initialized = true;
+  authoritativeVisualMotionRuntime.fromX = Number(x) || 0;
+  authoritativeVisualMotionRuntime.fromY = Number(y) || 0;
+  authoritativeVisualMotionRuntime.toX = Number(x) || 0;
+  authoritativeVisualMotionRuntime.toY = Number(y) || 0;
+  authoritativeVisualMotionRuntime.startAtMs = Date.now();
+  authoritativeVisualMotionRuntime.durationMs = 1;
+}
+
+function noteAuthoritativeVisualPlayerTarget(nextX = 0, nextY = 0, previousX = null, previousY = null) {
+  if (!AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) {
+    resetAuthoritativeVisualMotion(nextX, nextY);
+    return;
+  }
+  const nx = Number(nextX) || 0;
+  const ny = Number(nextY) || 0;
+  if (!authoritativeVisualMotionRuntime.initialized) {
+    resetAuthoritativeVisualMotion(nx, ny);
+    return;
+  }
+  const px = Number.isFinite(Number(previousX)) ? Number(previousX) : nx;
+  const py = Number.isFinite(Number(previousY)) ? Number(previousY) : ny;
+  const nowMs = Date.now();
+  const current = resolveAuthoritativeVisualPlayerPosition(px, py, nowMs);
+  const dist = Math.abs(nx - current.x) + Math.abs(ny - current.y);
+  authoritativeVisualMotionRuntime.fromX = current.x;
+  authoritativeVisualMotionRuntime.fromY = current.y;
+  authoritativeVisualMotionRuntime.toX = nx;
+  authoritativeVisualMotionRuntime.toY = ny;
+  authoritativeVisualMotionRuntime.startAtMs = nowMs;
+  authoritativeVisualMotionRuntime.durationMs = Math.max(28, Math.min(80, 32 + dist * 14));
+}
 
 function resolveBrowserInstanceId() {
   const fallback = () => `browser_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
@@ -1803,6 +1897,7 @@ function setAuthoritativeInputLock(locked = false, descriptor = null) {
 
 function clearAuthoritativeCommandQueue() {
   authoritativeCommandQueue.length = 0;
+  clearQueuedAuthoritativeMovePreview();
 }
 
 function pruneAuthoritativeCommandQueue(predicate) {
@@ -1845,7 +1940,7 @@ function enqueueAuthoritativeCommand(command, options = null) {
       if (!queuedSource || queuedSource === movementSource) continue;
       authoritativeCommandQueue.splice(i, 1);
     }
-    // Keep a short move buffer per source to smooth latency without excessive catch-up.
+    // Keep a short buffered run per source so we can batch-send movement on drain.
     let sameSourceCount = 0;
     for (let i = authoritativeCommandQueue.length - 1; i >= 0; i -= 1) {
       const queued = authoritativeCommandQueue[i];
@@ -1890,7 +1985,28 @@ function dropQueuedAuthoritativeMovementBySourceKeep(source = "", keepLast = 0) 
     authoritativeCommandQueue.splice(i, 1);
     removed += 1;
   }
+  if (
+    removed > 0 &&
+    authoritativeQueuedMovePreviewRuntime.active &&
+    authoritativeQueuedMovePreviewRuntime.source === normalized
+  ) {
+    clearQueuedAuthoritativeMovePreview();
+  }
   return removed;
+}
+
+function hasQueuedAuthoritativeMove() {
+  for (const entry of authoritativeCommandQueue) {
+    if (!entry || typeof entry !== "object") continue;
+    const cmdType = String(entry?.command?.type ?? "").trim().toUpperCase();
+    if (cmdType === "MOVE") return true;
+  }
+  return false;
+}
+
+function clearQueuedAuthoritativeMovePreview() {
+  authoritativeQueuedMovePreviewRuntime.active = false;
+  authoritativeQueuedMovePreviewRuntime.source = "";
 }
 
 function clearAuthoritativeRateLimitTimer() {
@@ -1941,6 +2057,51 @@ function shouldDropAuthoritativeCommand(command, options = null) {
   return true;
 }
 
+function tryApplyImmediateAuthoritativeMovePrediction(command) {
+  if (!command || typeof command !== "object") return false;
+  if (String(command.type ?? "").trim().toUpperCase() !== "MOVE") return false;
+  if (!game?.player || !game?.world) return false;
+  const delta = dirToDelta(command.dir);
+  if (!delta) return false;
+  const p = game.player;
+  if (p.dead) return false;
+  const nx = p.x + delta.dx;
+  const ny = p.y + delta.dy;
+  const nz = p.z;
+  hydrateNearby(game);
+  const tile = game.world.getTile(nx, ny, nz);
+  if (tile === DOOR_CLOSED || tileIsLocked(tile)) return false;
+  const { monsters } = getCachedOccupancy(game);
+  if (monsters.get(keyXYZ(nx, ny, nz))) return false;
+  if (!game.world.isPassable(nx, ny, nz)) return false;
+  if (isOpenDoorTile(tile)) game.visitedDoors?.add(keyXYZ(nx, ny, nz));
+  p.x = nx;
+  p.y = ny;
+  p.attackAfterMove = true;
+  game.lastPlayerActionKind = "move";
+  computeVisibility(game);
+  hydrateNearby(game);
+  updateContextActionButton(game);
+  return true;
+}
+
+function tryApplyImmediateAuthoritativeAttackPrediction(command) {
+  if (!command || typeof command !== "object") return false;
+  const type = String(command.type ?? "").trim().toUpperCase();
+  if (type !== "ATTACK" && type !== "ACTIVATE_ABILITY") return false;
+  if (!game?.player || !game?.entities) return false;
+  const target = findMonsterForAuthoritativeCommand(game, command);
+  if (!target || target.kind !== "monster") return false;
+  markCombatEvent(game, target);
+  const hpBefore = Math.max(0, Math.floor(Number(target.hp ?? 0)));
+  if (hpBefore <= 0) return false;
+  const atkLo = Math.max(1, Math.floor(Number(game?.player?.atkLo ?? 1)));
+  const atkHi = Math.max(atkLo, Math.floor(Number(game?.player?.atkHi ?? atkLo)));
+  const estimate = Math.max(1, Math.floor((atkLo + atkHi) / 2));
+  target.hp = Math.max(0, hpBefore - estimate);
+  return true;
+}
+
 function drainAuthoritativeCommandQueue() {
   if (!isAuthoritativeSessionActive()) {
     clearAuthoritativeCommandQueue();
@@ -1956,8 +2117,36 @@ function drainAuthoritativeCommandQueue() {
   while (authoritativeCommandQueue.length > 0 && !authoritativeMirror.inFlight) {
     const next = authoritativeCommandQueue.shift();
     if (!next?.command || typeof next.command !== "object") continue;
-    if (shouldDropAuthoritativeCommand(next.command, { suppressWallLog: true })) continue;
-    void performAuthoritativeCommand(next.command, next.options);
+    const nextType = String(next.command.type ?? "").trim().toUpperCase();
+    let commandToSend = next.command;
+    let optionsToSend = next.options;
+    if (nextType === "MOVE") {
+      const dirs = [];
+      const firstDir = String(next.command.dir ?? "").trim().toUpperCase();
+      if (firstDir === "N" || firstDir === "S" || firstDir === "E" || firstDir === "W") {
+        dirs.push(firstDir);
+      }
+      while (dirs.length < AUTHORITATIVE_MOVE_BATCH_MAX && authoritativeCommandQueue.length > 0) {
+        const peek = authoritativeCommandQueue[0];
+        if (!peek?.command || typeof peek.command !== "object") break;
+        const peekType = String(peek.command.type ?? "").trim().toUpperCase();
+        if (peekType !== "MOVE") break;
+        authoritativeCommandQueue.shift();
+        const peekDir = String(peek.command.dir ?? "").trim().toUpperCase();
+        if (peekDir === "N" || peekDir === "S" || peekDir === "E" || peekDir === "W") {
+          dirs.push(peekDir);
+        }
+      }
+      if (dirs.length > 1) {
+        commandToSend = { type: "MOVE_BATCH", dirs };
+        optionsToSend = {
+          ...(next.options && typeof next.options === "object" ? next.options : {}),
+          reason: "move-batch",
+        };
+      }
+    }
+    if (shouldDropAuthoritativeCommand(commandToSend, { suppressWallLog: true })) continue;
+    void performAuthoritativeCommand(commandToSend, optionsToSend);
     return true;
   }
   return false;
@@ -1970,6 +2159,11 @@ function authoritativeErrorMessage(err, fallback = "Authoritative action failed.
 
 function ensureArray(value, fallback = []) {
   return Array.isArray(value) ? value : fallback.slice();
+}
+
+function isFastAuthoritativeUiReason(reason = "") {
+  const key = String(reason ?? "").trim().toLowerCase();
+  return AUTHORITATIVE_FAST_UI_REASONS.has(key);
 }
 
 function normalizeLoadedStateCollections(state) {
@@ -1990,20 +2184,36 @@ function normalizeLoadedStateCollections(state) {
 
 function activateLoadedGameState(nextGame, reason = "load") {
   if (!nextGame?.player || !nextGame?.world) return false;
+  const prevPlayer = game?.player
+    ? { x: Number(game.player.x ?? 0), y: Number(game.player.y ?? 0) }
+    : null;
+  const reasonKey = String(reason ?? "").trim().toLowerCase();
+  const fastUiUpdate = isAuthoritativeSessionActive() && isFastAuthoritativeUiReason(reasonKey);
   normalizeLoadedStateCollections(nextGame);
   game = nextGame;
+  if (isAuthoritativeSessionActive()) {
+    noteAuthoritativeVisualPlayerTarget(
+      Number(game.player.x ?? 0),
+      Number(game.player.y ?? 0),
+      prevPlayer?.x ?? null,
+      prevPlayer?.y ?? null
+    );
+  } else {
+    resetAuthoritativeVisualMotion(Number(game.player.x ?? 0), Number(game.player.y ?? 0));
+  }
   computeVisibility(game);
   hydrateNearby(game);
   enforceAdminControlPolicy(game);
   updateDebugMenuUi(game);
   setDebugMenuOpen(false);
-  renderInventory(game);
-  renderEquipment(game);
+  if (!fastUiUpdate) {
+    renderInventory(game);
+    renderEquipment(game);
+  }
   renderEffects(game);
   renderLog(game);
   renderInfoOverlay(game);
-  renderCharacterStatsPanel(game);
-    if (shopUi.open) renderShopOverlay(game);
+  if (shopUi.open) renderShopOverlay(game);
   updateContextActionButton(game);
   updateDeathOverlay(game);
   refreshSaveNameFromLive(true);
@@ -2021,12 +2231,31 @@ function activateLoadedGameState(nextGame, reason = "load") {
 function applyAuthoritativeSnapshotToGame(response, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const data = (response && typeof response === "object") ? response : {};
-  applyAuthoritativeResponseToMirror(authoritativeMirror, data);
-  const payload = String(data?.snapshot?.payload ?? "").trim();
+  const resolvedPayload = resolveAuthoritativeResponsePayload(data);
+  const payload = String(resolvedPayload?.payload ?? "").trim();
   if (!payload) return false;
-  const loaded = importSave(payload);
-  if (!loaded) return false;
-  if (!activateLoadedGameState(loaded, String(opts.reason ?? "authoritative"))) return false;
+  const reason = String(opts.reason ?? "authoritative");
+  const snapshotBase = (data.snapshot && typeof data.snapshot === "object") ? data.snapshot : {};
+  const mirrorSnapshot = String(snapshotBase?.payload ?? "").trim()
+    ? snapshotBase
+    : { ...snapshotBase, payload };
+  const mirrorResponse = { ...data, snapshot: mirrorSnapshot };
+  let nextState = null;
+  const hotDeltaApplied = (
+    isAuthoritativeSessionActive() &&
+    game &&
+    data?.hotDelta &&
+    applyAuthoritativeHotDeltaToState(game, data.hotDelta)
+  );
+  if (hotDeltaApplied) {
+    nextState = game;
+  } else {
+    const loaded = importSave(payload);
+    if (!loaded) return false;
+    nextState = loaded;
+  }
+  applyAuthoritativeResponseToMirror(authoritativeMirror, mirrorResponse);
+  if (!activateLoadedGameState(nextState, reason)) return false;
   if (Array.isArray(data?.saves)) saveMenuUi.saves = data.saves;
   if (data?.save?.id) {
     const saveId = String(data.save.id ?? "").trim();
@@ -2039,6 +2268,7 @@ function applyAuthoritativeSnapshotToGame(response, options = null) {
     saveRuntime.dirtyReason = String(opts.dirtyReason ?? "authoritative");
     saveRuntime.lastDirtyAt = Date.now();
   }
+  clearQueuedAuthoritativeMovePreview();
   lifecycleAuthoritativeCloseRequested = false;
   restartAuthoritativeSessionTouchLoop();
   return true;
@@ -2063,25 +2293,42 @@ async function requestAuthoritativeResync(reason = "resync") {
 async function performAuthoritativeCommand(command, options = null) {
   if (!isAuthoritativeSessionActive()) return false;
   if (!command || typeof command !== "object") return false;
+  const opts = (options && typeof options === "object") ? options : {};
   const queueable = canQueueAuthoritativeCommand(command);
+  const commandType = String(command.type ?? "").trim().toUpperCase();
+  const movementSource = String(opts.movementSource ?? "").trim();
+  let optimisticMoveApplied = false;
+  let optimisticAttackApplied = false;
   const now = Date.now();
   if (now < authoritativeRateLimitRuntime.blockedUntil) {
     if (queueable) {
-      enqueueAuthoritativeCommand(command, options);
+      enqueueAuthoritativeCommand(command, opts);
       scheduleAuthoritativeQueueDrain(authoritativeRateLimitRuntime.blockedUntil - now);
     }
     return Promise.resolve(false);
   }
   if (authoritativeMirror.inFlight) {
-    if (queueable) enqueueAuthoritativeCommand(command, options);
+    if (queueable) {
+      enqueueAuthoritativeCommand(command, opts);
+      if (commandType === "MOVE") {
+        tryApplyImmediateAuthoritativeMovePrediction(command);
+      }
+    }
     return Promise.resolve(false);
   }
   if (shouldDropAuthoritativeCommand(command)) return false;
-  const opts = (options && typeof options === "object") ? options : {};
-    setAuthoritativeInputLock(true, {
-      type: String(command.type ?? "").trim().toUpperCase(),
-      reason: String(opts.reason ?? command.type ?? "authoritative-command"),
-    });
+  if (queueable) optimisticMoveApplied = tryApplyImmediateAuthoritativeMovePrediction(command);
+  else if (commandType === "ATTACK" || commandType === "ACTIVATE_ABILITY") {
+    optimisticAttackApplied = tryApplyImmediateAuthoritativeAttackPrediction(command);
+  }
+  if (commandType === "ATTACK" || commandType === "ACTIVATE_ABILITY") {
+    const target = findMonsterForAuthoritativeCommand(game, command);
+    if (target) markCombatEvent(game, target);
+  }
+  setAuthoritativeInputLock(true, {
+    type: commandType,
+    reason: String(opts.reason ?? command.type ?? "authoritative-command"),
+  });
   try {
     const response = await authoritativeApi.sendCommand({
       sessionId: authoritativeMirror.sessionId,
@@ -2093,7 +2340,10 @@ async function performAuthoritativeCommand(command, options = null) {
       dirtyReason: String(opts.dirtyReason ?? command.type ?? "authoritative-command"),
       reason: String(opts.reason ?? command.type ?? "authoritative-command"),
     });
-    if (!applied) throw new Error("Authoritative snapshot was invalid.");
+    if (!applied) {
+      void requestAuthoritativeResync("command-apply-failed");
+      throw new Error("Authoritative snapshot was invalid.");
+    }
     if (!response?.ok && response?.error) {
       pushLog(game, String(response.error));
       renderLog(game);
@@ -2104,7 +2354,7 @@ async function performAuthoritativeCommand(command, options = null) {
       const delayMs = authoritativeRateLimitDelayMs(err);
       authoritativeRateLimitRuntime.blockedUntil = Date.now() + delayMs;
       if (queueable) {
-        enqueueAuthoritativeCommand(command, options);
+        enqueueAuthoritativeCommand(command, opts);
         scheduleAuthoritativeQueueDrain(delayMs + 5);
         const warnNow = Date.now();
         if ((warnNow - authoritativeRateLimitRuntime.lastWarnAt) > 2000 && game?.log) {
@@ -2112,6 +2362,14 @@ async function performAuthoritativeCommand(command, options = null) {
           renderLog(game);
           authoritativeRateLimitRuntime.lastWarnAt = warnNow;
         }
+      } else if (String(command?.type ?? "").trim().toUpperCase() === "MOVE_BATCH") {
+        const dirs = Array.isArray(command?.dirs) ? command.dirs : [];
+        for (const dirRaw of dirs) {
+          const dir = String(dirRaw ?? "").trim().toUpperCase();
+          if (dir !== "N" && dir !== "S" && dir !== "E" && dir !== "W") continue;
+          enqueueAuthoritativeCommand({ type: "MOVE", dir }, opts);
+        }
+        scheduleAuthoritativeQueueDrain(delayMs + 5);
       }
       return false;
     }
@@ -2119,6 +2377,12 @@ async function performAuthoritativeCommand(command, options = null) {
     if (game?.log) {
       pushLog(game, message);
       renderLog(game);
+    }
+    if (optimisticMoveApplied) {
+      void requestAuthoritativeResync("move-prediction-recover");
+    }
+    if (optimisticAttackApplied) {
+      void requestAuthoritativeResync("attack-prediction-recover");
     }
     if (String(err?.response?.status_code ?? "") === "409") {
       void requestAuthoritativeResync("command-conflict");
@@ -14420,7 +14684,7 @@ function tryKnockbackMonster(state, monster, sourceX, sourceY) {
   const ty = (monster.y ?? 0) + dy;
   const tz = monster.z ?? state.player.z;
   if (!state.world.isPassable(tx, ty, tz)) return false;
-  const occ = buildOccupancy(state);
+  const occ = getCachedOccupancy(state);
   const occKey = keyXYZ(tx, ty, tz);
   if (occ.monsters.has(occKey) || occ.items.has(occKey)) return false;
   monster.x = tx;
@@ -15425,7 +15689,7 @@ function monstersTurn(state) {
   computeVisibility(state);
 
   const z = p.z;
-  const { monsters } = buildOccupancy(state);
+  const { monsters } = getCachedOccupancy(state);
   const monsterOccupancy = new Map(monsters);
   const toAct = [];
   const disengage = ensureDisengageState(state);
@@ -19219,6 +19483,21 @@ function draw(state) {
   if (!state || !state.world || !state.player) return;
   const frameStartMs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const nowMs = Date.now();
+  const visualPlayer = isAuthoritativeSessionActive()
+    ? resolveAuthoritativeVisualPlayerPosition(state.player.x, state.player.y, nowMs)
+    : { x: Number(state.player.x ?? 0), y: Number(state.player.y ?? 0) };
+  const cameraOffsetXPx = isAuthoritativeSessionActive()
+    ? Math.round((Number(state.player.x ?? 0) - Number(visualPlayer.x ?? 0)) * TILE)
+    : 0;
+  const cameraOffsetYPx = isAuthoritativeSessionActive()
+    ? Math.round((Number(state.player.y ?? 0) - Number(visualPlayer.y ?? 0)) * TILE)
+    : 0;
+  const applyWorldTransform = () => {
+    ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+    if (cameraOffsetXPx || cameraOffsetYPx) {
+      ctx.translate(cameraOffsetXPx, cameraOffsetYPx);
+    }
+  };
   const canSimulateLocally = canMutateGameplayStateLocally();
   if (canSimulateLocally) {
     touchCharacterProgress(state);
@@ -19271,7 +19550,7 @@ function draw(state) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+  applyWorldTransform();
 
   for (let sy = 0; sy < viewTilesY; sy++) {
     for (let sx = 0; sx < viewTilesX; sx++) {
@@ -19788,7 +20067,7 @@ function draw(state) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     drawAtmospherePass(ctx, theme, player.z, timeSec, canvas.width, canvas.height, visualFxQuality);
   }
-  ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+  applyWorldTransform();
   drawCombatHudOverlay(ctx, state, nowMs);
 
   const { cx, cy, lx, ly } = splitWorldToChunk(player.x, player.y);
@@ -19917,6 +20196,9 @@ function shouldIgnoreGameHotkeys(e) {
 }
 
 const keyboardMovementHolds = new Map();
+const authoritativeMovementIntentBySource = new Map();
+const AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS = 90;
+const AUTHORITATIVE_MOVE_INTENT_REPEAT_MS = 36;
 
 function keyboardMovementFromEvent(e) {
   const code = String(e?.code ?? "").trim();
@@ -19962,6 +20244,59 @@ function clearHeldKeyboardMovement() {
     dropQueuedAuthoritativeMovementBySource(source);
   }
   keyboardMovementHolds.clear();
+  authoritativeMovementIntentBySource.clear();
+}
+
+function setAuthoritativeMovementIntent(source = "", dx = 0, dy = 0, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const key = String(source ?? "").trim();
+  if (!key) return;
+  const nowMs = Date.now();
+  const delayMs = Math.max(0, Math.floor(Number(opts.delayMs) || 0));
+  const nextAt = nowMs + delayMs;
+  const entry = authoritativeMovementIntentBySource.get(key);
+  if (entry && typeof entry === "object") {
+    entry.dx = Math.trunc(Number(dx) || 0);
+    entry.dy = Math.trunc(Number(dy) || 0);
+    entry.updatedAt = nowMs;
+    if (opts.resetCooldown === true) entry.nextAt = nextAt;
+    else if (!Number.isFinite(Number(entry.nextAt)) || Number(entry.nextAt) < nowMs) entry.nextAt = nextAt;
+    return;
+  }
+  authoritativeMovementIntentBySource.set(key, {
+    dx: Math.trunc(Number(dx) || 0),
+    dy: Math.trunc(Number(dy) || 0),
+    updatedAt: nowMs,
+    nextAt,
+  });
+}
+
+function clearAuthoritativeMovementIntent(source = "") {
+  const key = String(source ?? "").trim();
+  if (!key) return;
+  authoritativeMovementIntentBySource.delete(key);
+}
+
+function pumpAuthoritativeMovementIntent(state, nowMs = Date.now()) {
+  if (!isAuthoritativeSessionActive()) return false;
+  if (!state?.player || state.player.dead) return false;
+  let selectedSource = "";
+  let selectedIntent = null;
+  for (const [source, entry] of authoritativeMovementIntentBySource.entries()) {
+    if (!entry || typeof entry !== "object") continue;
+    if (nowMs < Number(entry.nextAt ?? 0)) continue;
+    if (!selectedIntent || Number(entry.updatedAt ?? 0) >= Number(selectedIntent.updatedAt ?? 0)) {
+      selectedSource = source;
+      selectedIntent = entry;
+    }
+  }
+  if (!selectedIntent) return false;
+  selectedIntent.nextAt = nowMs + AUTHORITATIVE_MOVE_INTENT_REPEAT_MS;
+  takeTurn(
+    state,
+    playerMoveOrAttack(state, selectedIntent.dx, selectedIntent.dy, { movementSource: selectedSource })
+  );
+  return true;
 }
 
 function onKey(state, e) {
@@ -20054,6 +20389,18 @@ function onKey(state, e) {
   if (movementInput) {
     e.preventDefault();
     markKeyboardMovementHeld(movementInput.source, String(e.code ?? ""));
+    if (isAuthoritativeSessionActive()) {
+      if (e.repeat) return;
+      setAuthoritativeMovementIntent(
+        movementInput.source,
+        movementInput.dx,
+        movementInput.dy,
+        {
+          delayMs: AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS,
+          resetCooldown: true,
+        }
+      );
+    }
     takeTurn(state, playerMoveOrAttack(state, movementInput.dx, movementInput.dy, { movementSource: movementInput.source }));
   }
   else if (k === "." || k === " " || k === "spacebar") { e.preventDefault(); takeTurn(state, waitTurn(state)); }
@@ -20794,11 +21141,231 @@ function importSave(saveStr) {
   }
 }
 
+function decodeSavePayloadObject(payload = "") {
+  const raw = String(payload ?? "").trim();
+  if (!raw) return null;
+  try {
+    const json = decodeURIComponent(escape(atob(raw)));
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function encodeSavePayloadObject(payloadObj = null) {
+  if (!payloadObj || typeof payloadObj !== "object" || Array.isArray(payloadObj)) return "";
+  try {
+    return btoa(unescape(encodeURIComponent(JSON.stringify(payloadObj))));
+  } catch {
+    return "";
+  }
+}
+
+function hashPayloadSignature(payload = "") {
+  const raw = String(payload ?? "");
+  let h = 2166136261;
+  for (let i = 0; i < raw.length; i += 1) {
+    h ^= raw.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function deepJsonEqual(a, b) {
+  if (Object.is(a, b)) return true;
+  const aObj = a && typeof a === "object";
+  const bObj = b && typeof b === "object";
+  if (!aObj || !bObj) return false;
+  const aArray = Array.isArray(a);
+  const bArray = Array.isArray(b);
+  if (aArray || bArray) {
+    if (!aArray || !bArray) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (!deepJsonEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    if (!deepJsonEqual(a[key], b[key])) return false;
+  }
+  return true;
+}
+
+function buildAuthoritativePayloadDiff(beforePayload = "", afterPayload = "") {
+  const beforeObj = decodeSavePayloadObject(beforePayload);
+  const afterObj = decodeSavePayloadObject(afterPayload);
+  if (!beforeObj || !afterObj) return null;
+
+  const ops = [];
+  let exceeded = false;
+  const pushOp = (op) => {
+    if (exceeded) return;
+    ops.push(op);
+    if (ops.length > AUTHORITATIVE_PAYLOAD_DIFF_MAX_OPS) exceeded = true;
+  };
+  const walk = (path, beforeValue, afterValue) => {
+    if (exceeded) return;
+    if (deepJsonEqual(beforeValue, afterValue)) return;
+    const beforeObjLike = beforeValue && typeof beforeValue === "object";
+    const afterObjLike = afterValue && typeof afterValue === "object";
+    const beforeArray = Array.isArray(beforeValue);
+    const afterArray = Array.isArray(afterValue);
+    if (!beforeObjLike || !afterObjLike || beforeArray || afterArray) {
+      pushOp({ op: "set", path: path.slice(), value: afterValue });
+      return;
+    }
+
+    const beforeKeys = Object.keys(beforeValue).sort();
+    const afterKeys = Object.keys(afterValue).sort();
+    for (const key of beforeKeys) {
+      if (!Object.prototype.hasOwnProperty.call(afterValue, key)) {
+        pushOp({ op: "remove", path: [...path, key] });
+      }
+    }
+    for (const key of afterKeys) {
+      if (!Object.prototype.hasOwnProperty.call(beforeValue, key)) {
+        pushOp({ op: "set", path: [...path, key], value: afterValue[key] });
+        continue;
+      }
+      walk([...path, key], beforeValue[key], afterValue[key]);
+    }
+  };
+
+  walk([], beforeObj, afterObj);
+  if (exceeded) return null;
+
+  const diff = {
+    format: AUTHORITATIVE_PAYLOAD_DIFF_FORMAT,
+    baseHash: hashPayloadSignature(beforePayload),
+    nextHash: hashPayloadSignature(afterPayload),
+    ops,
+  };
+  const encoded = JSON.stringify(diff);
+  if (!encoded) return null;
+  if (encoded.length > AUTHORITATIVE_PAYLOAD_DIFF_MAX_BYTES) return null;
+  if (ops.length > 0 && encoded.length >= Math.floor(String(afterPayload ?? "").length * 0.92)) {
+    return null;
+  }
+  return diff;
+}
+
+function normalizeAuthoritativePayloadDiff(raw = null) {
+  if (!raw || typeof raw !== "object") return null;
+  const format = String(raw.format ?? "").trim();
+  if (format !== AUTHORITATIVE_PAYLOAD_DIFF_FORMAT) return null;
+  const opsRaw = Array.isArray(raw.ops) ? raw.ops : [];
+  const ops = [];
+  for (const entry of opsRaw) {
+    if (!entry || typeof entry !== "object") return null;
+    const op = String(entry.op ?? "").trim().toLowerCase();
+    const pathRaw = Array.isArray(entry.path) ? entry.path : null;
+    if (!pathRaw) return null;
+    const path = pathRaw.map((segment) => String(segment ?? ""));
+    if (op === "set") {
+      if (!Object.prototype.hasOwnProperty.call(entry, "value")) return null;
+      ops.push({ op: "set", path, value: entry.value });
+    } else if (op === "remove") {
+      ops.push({ op: "remove", path });
+    } else {
+      return null;
+    }
+  }
+  return {
+    format,
+    baseHash: String(raw.baseHash ?? "").trim(),
+    nextHash: String(raw.nextHash ?? "").trim(),
+    ops,
+  };
+}
+
+function setPayloadDiffValueByPath(rootValue, path = [], value = null) {
+  const segments = Array.isArray(path) ? path : [];
+  if (!segments.length) return value;
+  if (!rootValue || typeof rootValue !== "object" || Array.isArray(rootValue)) return rootValue;
+  let node = rootValue;
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    const key = String(segments[i] ?? "");
+    if (!key) return rootValue;
+    const next = node[key];
+    if (!next || typeof next !== "object" || Array.isArray(next)) {
+      node[key] = {};
+    }
+    node = node[key];
+  }
+  const finalKey = String(segments[segments.length - 1] ?? "");
+  if (!finalKey) return rootValue;
+  node[finalKey] = value;
+  return rootValue;
+}
+
+function removePayloadDiffValueByPath(rootValue, path = []) {
+  const segments = Array.isArray(path) ? path : [];
+  if (!segments.length) return rootValue;
+  if (!rootValue || typeof rootValue !== "object" || Array.isArray(rootValue)) return rootValue;
+  let node = rootValue;
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    const key = String(segments[i] ?? "");
+    if (!key) return rootValue;
+    const next = node[key];
+    if (!next || typeof next !== "object" || Array.isArray(next)) return rootValue;
+    node = next;
+  }
+  const finalKey = String(segments[segments.length - 1] ?? "");
+  if (!finalKey) return rootValue;
+  if (Object.prototype.hasOwnProperty.call(node, finalKey)) {
+    delete node[finalKey];
+  }
+  return rootValue;
+}
+
+function applyAuthoritativePayloadDiff(basePayload = "", rawDiff = null) {
+  const diff = normalizeAuthoritativePayloadDiff(rawDiff);
+  if (!diff) return "";
+  const base = String(basePayload ?? "").trim();
+  if (!base) return "";
+  let nextObj = decodeSavePayloadObject(base);
+  if (!nextObj) return "";
+  for (const op of diff.ops) {
+    if (op.op === "set") {
+      nextObj = setPayloadDiffValueByPath(nextObj, op.path, op.value);
+      continue;
+    }
+    if (op.op === "remove") {
+      nextObj = removePayloadDiffValueByPath(nextObj, op.path);
+      continue;
+    }
+    return "";
+  }
+  const nextPayload = encodeSavePayloadObject(nextObj);
+  if (!nextPayload) return "";
+  // Payload key ordering may differ after patch application while still producing
+  // a semantically equivalent save object; validate base hash only.
+  return nextPayload;
+}
+
+function resolveAuthoritativeResponsePayload(data = null) {
+  const direct = String(data?.snapshot?.payload ?? "").trim();
+  if (direct) return { payload: direct, source: "snapshot" };
+  const basePayload = String(authoritativeMirror?.lastSnapshot?.payload ?? "").trim();
+  if (!basePayload) return { payload: "", source: "" };
+  const patched = applyAuthoritativePayloadDiff(basePayload, data?.diff ?? null);
+  if (!patched) return { payload: "", source: "" };
+  return { payload: patched, source: "diff" };
+}
+
 function onKeyUp(e) {
   const movementInput = keyboardMovementFromEvent(e);
   if (!movementInput) return;
   const released = releaseKeyboardMovementHold(movementInput.source, String(e.code ?? ""));
   if (!released) return;
+  clearAuthoritativeMovementIntent(movementInput.source);
   dropQueuedAuthoritativeMovementBySourceKeep(movementInput.source, 1);
 }
 
@@ -20933,9 +21500,244 @@ function resolveInventoryIndexFromCommand(state, command = null) {
   return -1;
 }
 
-function executeAuthoritativeCommandOnState(state, rawCommand = null) {
+function cloneAuthoritativeHotEntity(entity = null) {
+  if (!entity || typeof entity !== "object") return null;
+  const kind = String(entity.kind ?? "").trim().toLowerCase();
+  const id = String(entity.id ?? "").trim();
+  if (!id || !kind) return null;
+  const base = {
+    id,
+    kind,
+    origin: String(entity.origin ?? "").trim().toLowerCase() || "base",
+    x: Math.floor(Number(entity.x ?? 0)),
+    y: Math.floor(Number(entity.y ?? 0)),
+    z: Math.floor(Number(entity.z ?? 0)),
+  };
+  if (kind === "monster") {
+    return {
+      ...base,
+      type: normalizeMonsterTypeId(entity.type),
+      hp: Math.max(0, Math.floor(Number(entity.hp ?? 0))),
+      maxHp: Math.max(1, Math.floor(Number(entity.maxHp ?? entity.hp ?? 1))),
+      awake: !!entity.awake,
+      cd: Math.max(0, Math.floor(Number(entity.cd ?? 0))),
+      abilityCd: Math.max(0, Math.floor(Number(entity.abilityCd ?? 0))),
+      alertedTurn: Math.max(0, Math.floor(Number(entity.alertedTurn ?? 0))),
+      effects: normalizeMonsterEffects(entity.effects ?? []),
+    };
+  }
+  if (kind === "item") {
+    return {
+      ...base,
+      type: normalizeItemType(entity.type),
+      amount: Math.max(1, Math.floor(Number(entity.amount ?? 1))),
+      templateId: itemTemplateIdForType(entity.templateId ?? entity.type) ?? itemTemplateIdForType(entity.type) ?? entity.type,
+      instanceId: String(entity.instanceId ?? "").trim(),
+      ownerType: String(entity.ownerType ?? "world").trim() || "world",
+      ownerId: entity.ownerId === null || entity.ownerId === undefined ? null : String(entity.ownerId),
+      locked: !!entity.locked,
+      keyType: String(entity.keyType ?? entity.lockKeyType ?? "").trim(),
+      rewardChest: !!entity.rewardChest,
+      lootDepth: Number.isFinite(Number(entity.lootDepth)) ? Math.max(0, Math.floor(Number(entity.lootDepth))) : undefined,
+      lockKeyType: String(entity.lockKeyType ?? entity.keyType ?? "").trim(),
+    };
+  }
+  if (kind === "trap") {
+    const trapFamily = trapFamilyDef(entity.trapFamily ?? entity.trapType ?? "pressure_plate")?.id ?? "pressure_plate";
+    return {
+      ...base,
+      trapType: trapFamily,
+      trapFamily,
+      depth: Math.max(0, Math.floor(Number(entity.depth ?? entity.z ?? 0))),
+      armed: entity.armed !== false,
+      detected: !!entity.detected,
+      triggered: !!entity.triggered,
+      disarmed: !!entity.disarmed,
+      charges: Math.max(1, Math.floor(Number(entity.charges ?? 1))),
+      factionId: String(entity.factionId ?? "").trim().toLowerCase(),
+      payload: (entity.payload && typeof entity.payload === "object") ? { ...entity.payload } : {},
+      friendlyTo: String(entity.friendlyTo ?? "").trim().toLowerCase(),
+      ownerId: entity.ownerId === null || entity.ownerId === undefined ? "" : String(entity.ownerId),
+    };
+  }
+  if (kind === "actor") {
+    return {
+      ...base,
+      type: String(entity.type ?? "hero_actor").trim() || "hero_actor",
+      spriteId: String(entity.spriteId ?? "hero").trim() || "hero",
+      ai: String(entity.ai ?? "none").trim() || "none",
+    };
+  }
+  return null;
+}
+
+function captureAuthoritativeHotEntities(state, z = 0) {
+  const out = new Map();
+  for (const entity of state?.entities?.values?.() ?? []) {
+    if (!entity || Math.floor(Number(entity.z ?? 0)) !== z) continue;
+    const cloned = cloneAuthoritativeHotEntity(entity);
+    if (!cloned?.id) continue;
+    const sig = JSON.stringify(cloned);
+    out.set(cloned.id, { entity: cloned, sig });
+  }
+  return out;
+}
+
+function captureAuthoritativeHotTileOverrides(state, z = 0) {
+  const out = new Map();
+  for (const [key, value] of state?.world?.tileOverrides?.entries?.() ?? []) {
+    const rawKey = String(key ?? "");
+    if (!rawKey.startsWith(`${z}|`)) continue;
+    out.set(rawKey, String(value ?? ""));
+  }
+  return out;
+}
+
+function captureAuthoritativeHotBaseline(state) {
+  if (!state?.player || !state?.world) return null;
+  const z = Math.floor(Number(state.player.z ?? 0));
+  return {
+    depth: z,
+    turn: Math.max(0, Math.floor(Number(state.turn ?? 0))),
+    entities: captureAuthoritativeHotEntities(state, z),
+    tiles: captureAuthoritativeHotTileOverrides(state, z),
+  };
+}
+
+function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 0) {
+  if (!before || !state?.player || !state?.world) return null;
+  const depth = Math.floor(Number(state.player.z ?? 0));
+  if (depth !== Math.floor(Number(before.depth ?? depth))) return null;
+  const afterEntities = captureAuthoritativeHotEntities(state, depth);
+  const afterTiles = captureAuthoritativeHotTileOverrides(state, depth);
+
+  const entitiesUpsert = [];
+  const entitiesRemove = [];
+  for (const [id, entry] of afterEntities.entries()) {
+    const prev = before.entities.get(id);
+    if (!prev || prev.sig !== entry.sig) entitiesUpsert.push(entry.entity);
+  }
+  for (const id of before.entities.keys()) {
+    if (!afterEntities.has(id)) entitiesRemove.push(id);
+  }
+
+  const tileUpsert = [];
+  const tileRemove = [];
+  for (const [key, tile] of afterTiles.entries()) {
+    const prev = before.tiles.get(key);
+    if (prev !== tile) tileUpsert.push({ key, tile });
+  }
+  for (const key of before.tiles.keys()) {
+    if (!afterTiles.has(key)) tileRemove.push(key);
+  }
+
+  const combat = ensureCombatState(state);
+  return {
+    version: 1,
+    type: String(commandType ?? "").trim().toUpperCase(),
+    depth,
+    turn: Math.max(0, Math.floor(Number(state.turn ?? 0))),
+    player: {
+      x: Math.floor(Number(state.player.x ?? 0)),
+      y: Math.floor(Number(state.player.y ?? 0)),
+      z: Math.floor(Number(state.player.z ?? 0)),
+      hp: Math.max(0, Math.floor(Number(state.player.hp ?? 0))),
+      maxHp: Math.max(1, Math.floor(Number(state.player.maxHp ?? 1))),
+      energy: Math.max(0, Math.floor(Number(state.player.energy ?? 0))),
+      energyMax: Math.max(0, Math.floor(Number(state.player.energyMax ?? 0))),
+      level: Math.max(1, Math.floor(Number(state.player.level ?? 1))),
+      xp: Math.max(0, Math.floor(Number(state.player.xp ?? 0))),
+      gold: Math.max(0, Math.floor(Number(state.player.gold ?? 0))),
+      dead: !!state.player.dead,
+      abilityCd: Math.max(0, Math.floor(Number(state.player.abilityCd ?? 0))),
+    },
+    entitiesUpsert,
+    entitiesRemove,
+    tileUpsert,
+    tileRemove,
+    events: Array.isArray(state.log) ? state.log.slice(Math.max(0, Math.floor(logStart ?? 0))) : [],
+    logTail: Array.isArray(state.log) ? state.log.slice(-110) : [],
+    hudTargets: normalizeCombatHudTargets(combat?.hudTargets ?? {}),
+  };
+}
+
+function applyAuthoritativeHotDeltaToState(state, rawDelta = null) {
+  const delta = (rawDelta && typeof rawDelta === "object") ? rawDelta : null;
+  if (!delta || Math.floor(Number(delta.version ?? 0)) !== 1) return false;
+  if (!state?.player || !state?.world) return false;
+  const player = (delta.player && typeof delta.player === "object") ? delta.player : null;
+  if (!player) return false;
+
+  if (Number.isFinite(Number(player.x))) state.player.x = Math.floor(Number(player.x));
+  if (Number.isFinite(Number(player.y))) state.player.y = Math.floor(Number(player.y));
+  if (Number.isFinite(Number(player.z))) state.player.z = Math.floor(Number(player.z));
+  if (Number.isFinite(Number(player.hp))) state.player.hp = Math.max(0, Math.floor(Number(player.hp)));
+  if (Number.isFinite(Number(player.maxHp))) state.player.maxHp = Math.max(1, Math.floor(Number(player.maxHp)));
+  if (Number.isFinite(Number(player.energy))) state.player.energy = Math.max(0, Math.floor(Number(player.energy)));
+  if (Number.isFinite(Number(player.energyMax))) state.player.energyMax = Math.max(0, Math.floor(Number(player.energyMax)));
+  if (Number.isFinite(Number(player.level))) state.player.level = Math.max(1, Math.floor(Number(player.level)));
+  if (Number.isFinite(Number(player.xp))) state.player.xp = Math.max(0, Math.floor(Number(player.xp)));
+  if (Number.isFinite(Number(player.gold))) state.player.gold = Math.max(0, Math.floor(Number(player.gold)));
+  if (Number.isFinite(Number(player.abilityCd))) state.player.abilityCd = Math.max(0, Math.floor(Number(player.abilityCd)));
+  state.player.dead = !!player.dead;
+
+  if (Number.isFinite(Number(delta.turn))) {
+    state.turn = Math.max(0, Math.floor(Number(delta.turn)));
+  }
+
+  const removeIds = Array.isArray(delta.entitiesRemove) ? delta.entitiesRemove : [];
+  for (const rawId of removeIds) {
+    const id = String(rawId ?? "").trim();
+    if (!id) continue;
+    const existing = state.entities.get(id);
+    if (existing?.origin === "base") state.removedIds.add(id);
+    state.entities.delete(id);
+    state.dynamic.delete(id);
+  }
+
+  const upserts = Array.isArray(delta.entitiesUpsert) ? delta.entitiesUpsert : [];
+  for (const rawEntry of upserts) {
+    const entry = cloneAuthoritativeHotEntity(rawEntry);
+    if (!entry?.id) continue;
+    state.entities.set(entry.id, { ...entry });
+    if (entry.origin === "dynamic") state.dynamic.set(entry.id, { ...entry });
+    else state.dynamic.delete(entry.id);
+    state.removedIds.delete(entry.id);
+  }
+
+  const tileUpsert = Array.isArray(delta.tileUpsert) ? delta.tileUpsert : [];
+  for (const rawTile of tileUpsert) {
+    if (!rawTile || typeof rawTile !== "object") continue;
+    const key = String(rawTile.key ?? "").trim();
+    if (!key) continue;
+    state.world.tileOverrides.set(key, String(rawTile.tile ?? ""));
+  }
+  const tileRemove = Array.isArray(delta.tileRemove) ? delta.tileRemove : [];
+  for (const rawKey of tileRemove) {
+    const key = String(rawKey ?? "").trim();
+    if (!key) continue;
+    state.world.tileOverrides.delete(key);
+  }
+
+  if (Array.isArray(delta.logTail)) {
+    state.log = delta.logTail.map((line) => String(line ?? "")).filter(Boolean).slice(-110);
+  }
+  state.lastPlayerActionKind = "";
+  ensureCombatState(state).hudTargets = normalizeCombatHudTargets(delta.hudTargets ?? {});
+  occupancySig = "";
+  hydrationSig = "";
+  visibilitySig = "";
+  return true;
+}
+
+function executeAuthoritativeCommandOnState(state, rawCommand = null, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const perfNow = () => ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
+  const perfStartMs = perfNow();
   const command = (rawCommand && typeof rawCommand === "object") ? rawCommand : {};
   const type = String(command.type ?? "").trim().toUpperCase();
+  const buildHotDelta = AUTHORITATIVE_HOT_DELTA_TYPES.has(type);
+  const hotBaseline = buildHotDelta ? captureAuthoritativeHotBaseline(state) : null;
   const logStart = Array.isArray(state?.log) ? state.log.length : 0;
   const snapshotWithAreaRespawn = () => {
     updateAreaRespawnSystem(state, Date.now());
@@ -20953,7 +21755,7 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
 
   let ok = false;
   let turnSpent = false;
-  const beforePayload = exportSave(state);
+  const beforePayload = String(opts.basePayload ?? "").trim() || exportSave(state);
 
   if (type === "MOVE") {
     const delta = dirToDelta(command.dir);
@@ -20968,6 +21770,32 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
     ok = !!playerMoveOrAttack(state, delta.dx, delta.dy);
     turnSpent = ok;
     takeTurn(state, ok);
+  } else if (type === "MOVE_BATCH") {
+    const rawDirs = Array.isArray(command.dirs) ? command.dirs : [];
+    const dirs = rawDirs
+      .map((dir) => String(dir ?? "").trim().toUpperCase())
+      .filter((dir) => dir === "N" || dir === "S" || dir === "E" || dir === "W")
+      .slice(0, AUTHORITATIVE_MOVE_BATCH_MAX);
+    if (!dirs.length) {
+      return {
+        ok: false,
+        error: "Invalid move batch.",
+        turnSpent: false,
+        snapshot: snapshotWithAreaRespawn(),
+      };
+    }
+    let movedCount = 0;
+    for (const dir of dirs) {
+      const delta = dirToDelta(dir);
+      if (!delta) break;
+      const moved = !!playerMoveOrAttack(state, delta.dx, delta.dy);
+      if (!moved) break;
+      movedCount += 1;
+      takeTurn(state, true);
+      if (state?.player?.dead) break;
+    }
+    ok = movedCount > 0;
+    turnSpent = ok;
   } else if (type === "WAIT") {
     ok = !!waitTurn(state);
     turnSpent = ok;
@@ -21085,11 +21913,31 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null) {
     };
   }
 
+  const snapshotStartMs = perfNow();
+  const snapshot = snapshotWithAreaRespawn();
+  const snapshotMs = Math.max(0, perfNow() - snapshotStartMs);
+  const snapshotPayload = String(snapshot?.payload ?? "");
+  const diffStartMs = perfNow();
+  const diff = ok ? buildAuthoritativePayloadDiff(beforePayload, snapshotPayload) : null;
+  const diffMs = Math.max(0, perfNow() - diffStartMs);
+  const hotDeltaStartMs = perfNow();
+  const hotDelta = (ok && buildHotDelta) ? buildAuthoritativeHotDelta(hotBaseline, state, type, logStart) : null;
+  const hotDeltaMs = Math.max(0, perfNow() - hotDeltaStartMs);
+  const totalMs = Math.max(0, perfNow() - perfStartMs);
   return {
     ok,
     error: ok ? "" : `Command ${type} could not be completed.`,
     turnSpent,
-    snapshot: snapshotWithAreaRespawn(),
+    snapshot,
+    diff,
+    hotDelta,
+    tick: null,
+    perf: {
+      totalMs: Math.round(totalMs * 1000) / 1000,
+      snapshotMs: Math.round(snapshotMs * 1000) / 1000,
+      diffMs: Math.round(diffMs * 1000) / 1000,
+      hotDeltaMs: Math.round(hotDeltaMs * 1000) / 1000,
+    },
   };
 }
 
@@ -21157,8 +22005,7 @@ function headlessSwitchCharacterPayload(worldPayload = "", characterPayload = ""
   return buildHeadlessStateSnapshot(state);
 }
 
-function headlessExecuteCommandPayload(worldPayload = "", command = null, characterPayload = "") {
-  const state = headlessStateFromPayload(worldPayload);
+function headlessExecuteCommandOnState(state, command = null, characterPayload = "", options = null) {
   if (!state) {
     return {
       ok: false,
@@ -21167,15 +22014,18 @@ function headlessExecuteCommandPayload(worldPayload = "", command = null, charac
       snapshot: null,
     };
   }
-  const payload = String(characterPayload ?? "").trim();
-  if (payload) {
-    const snapshot = decodeCharacterSnapshotPayload(payload);
-    if (snapshot) {
-      applyCharacterSnapshot(state, snapshot);
-      placePlayerFromCharacterSnapshot(state, snapshot, { resetVision: false });
-    }
-  }
-  return executeAuthoritativeCommandOnState(state, command);
+  const opts = (options && typeof options === "object") ? options : {};
+  void characterPayload;
+  return executeAuthoritativeCommandOnState(state, command, {
+    basePayload: String(opts.basePayload ?? "").trim(),
+  });
+}
+
+function headlessExecuteCommandPayload(worldPayload = "", command = null, characterPayload = "") {
+  const state = headlessStateFromPayload(worldPayload);
+  return headlessExecuteCommandOnState(state, command, characterPayload, {
+    basePayload: String(worldPayload ?? "").trim(),
+  });
 }
 
 // ---------- Buttons ----------
@@ -21901,9 +22751,19 @@ if (!HEADLESS_RUNTIME) {
               };
               // Fire immediately on press to remove tap latency.
               try {
+                if (entry.movementSource) {
+                  setAuthoritativeMovementIntent(entry.movementSource, dx, dy, {
+                    delayMs: AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS,
+                    resetCooldown: true,
+                  });
+                }
                 handleDpad(dx, dy, { movementSource: entry.movementSource });
                 entry.firedInitial = true;
               } catch {}
+              if (isAuthoritativeSessionActive()) {
+                activePointers.set(ev.pointerId, entry);
+                return;
+              }
               entry.initialTimeout = setTimeout(() => {
                 // initial delay elapsed: start repeating
                 entry.firedRepeat = true;
@@ -21924,7 +22784,10 @@ if (!HEADLESS_RUNTIME) {
             // clear timers
             if (entry.initialTimeout) { clearTimeout(entry.initialTimeout); entry.initialTimeout = null; }
             if (entry.repeatInterval) { clearInterval(entry.repeatInterval); entry.repeatInterval = null; }
-            if (entry.movementSource) dropQueuedAuthoritativeMovementBySourceKeep(entry.movementSource, 1);
+            if (entry.movementSource) {
+              clearAuthoritativeMovementIntent(entry.movementSource);
+              dropQueuedAuthoritativeMovementBySourceKeep(entry.movementSource, 1);
+            }
 
             const elapsed = Date.now() - (entry.start || 0);
             if (entry.type === 'dpad') {
@@ -21948,12 +22811,17 @@ if (!HEADLESS_RUNTIME) {
 
     let lastFrameTs = 0;
     const targetFrameMs = 1000 / 30;
+    const targetAuthoritativeFrameMs = 1000 / 60;
     function loop(ts) {
       const now = Number.isFinite(ts)
         ? ts
         : ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
-      if (now - lastFrameTs >= targetFrameMs) {
+      const frameBudgetMs = isAuthoritativeSessionActive() ? targetAuthoritativeFrameMs : targetFrameMs;
+      if (now - lastFrameTs >= frameBudgetMs) {
         try {
+          if (isAuthoritativeSessionActive()) {
+            pumpAuthoritativeMovementIntent(game, Date.now());
+          }
           draw(game);
         } catch (err) {
           showFatal(err);
@@ -22004,6 +22872,9 @@ function tryOpenAdjacentDoor(state) {
 }
 
 export {
+  applyAuthoritativePayloadDiff,
+  applyAuthoritativeHotDeltaToState,
+  buildAuthoritativePayloadDiff,
   HEADLESS_RUNTIME,
   buildCarryoverFromCharacterSnapshot,
   buildCharacterSnapshotFromCarryover,
@@ -22018,6 +22889,7 @@ export {
   exportSave,
   applyHeadlessMonsterEditorPayload,
   headlessBootstrapState,
+  headlessExecuteCommandOnState,
   headlessExecuteCommandPayload,
   headlessStateFromPayload,
   headlessSwitchCharacterPayload,

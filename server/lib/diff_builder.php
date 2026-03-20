@@ -13,6 +13,16 @@ function authoritative_build_snapshot_response(array $session, array $snapshot, 
     $snapshot = authoritative_shop_apply_shared_to_snapshot($snapshot);
   }
 
+  $snapshotOut = $snapshot;
+  if (!empty($options['strip_snapshot_payload'])) {
+    $snapshotOut = [
+      'character' => $snapshot['character'] ?? null,
+      'summary' => $snapshot['summary'] ?? null,
+      'log' => array_values(is_array($snapshot['log'] ?? null) ? $snapshot['log'] : []),
+      'events' => array_values(is_array($snapshot['events'] ?? null) ? $snapshot['events'] : []),
+    ];
+  }
+
   $acceptedCommandSeq = max(
     0,
     (int) ($options['accepted_command_seq'] ?? ($session['last_command_seq'] ?? 0))
@@ -36,10 +46,13 @@ function authoritative_build_snapshot_response(array $session, array $snapshot, 
     'serverRevision' => max(0, (int) ($session['server_revision'] ?? 0)),
     'acceptedCommandSeq' => $acceptedCommandSeq,
     'events' => array_values(is_array($snapshot['events'] ?? null) ? $snapshot['events'] : []),
-    'diff' => null,
-    'snapshot' => $snapshot,
+    'diff' => (is_array($options['diff'] ?? null) ? $options['diff'] : null),
+    'snapshot' => $snapshotOut,
     'playerView' => $playerView,
     'uiHints' => $uiHints,
+    'tick' => (is_array($options['tick'] ?? null) ? $options['tick'] : null),
+    'perf' => (is_array($options['perf'] ?? null) ? $options['perf'] : null),
+    'hotDelta' => (is_array($options['hot_delta'] ?? null) ? $options['hot_delta'] : null),
   ];
 
   if (isset($options['save']) && is_array($options['save'])) {

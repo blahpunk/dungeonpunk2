@@ -278,12 +278,17 @@ function authoritative_worker_call(array $input): array
 /**
  * @return array<string, mixed>
  */
-function authoritative_worker_snapshot(string $worldPayload): array
+function authoritative_worker_snapshot(string $worldPayload, string $sessionId = ''): array
 {
-  return authoritative_worker_call([
+  $input = [
     'operation' => 'snapshot',
     'worldPayload' => $worldPayload,
-  ]);
+  ];
+  $sid = trim($sessionId);
+  if ($sid !== '') {
+    $input['sessionId'] = $sid;
+  }
+  return authoritative_worker_call($input);
 }
 
 /**
@@ -292,14 +297,19 @@ function authoritative_worker_snapshot(string $worldPayload): array
  */
 function authoritative_worker_bootstrap(?string $worldPayload, ?string $characterPayload, array $options = []): array
 {
-  return authoritative_worker_call([
+  $input = [
     'operation' => 'bootstrap',
     'options' => [
       'worldPayload' => trim((string) ($worldPayload ?? '')),
       'characterPayload' => trim((string) ($characterPayload ?? '')),
       'forceEntrance' => !empty($options['force_entrance']),
     ],
-  ]);
+  ];
+  $sid = trim((string) ($options['session_id'] ?? ''));
+  if ($sid !== '') {
+    $input['sessionId'] = $sid;
+  }
+  return authoritative_worker_call($input);
 }
 
 /**
@@ -308,26 +318,41 @@ function authoritative_worker_bootstrap(?string $worldPayload, ?string $characte
  */
 function authoritative_worker_switch_character(string $worldPayload, string $characterPayload, array $options = []): array
 {
-  return authoritative_worker_call([
+  $input = [
     'operation' => 'switch_character',
     'worldPayload' => $worldPayload,
     'characterPayload' => $characterPayload,
     'options' => [
       'forceEntrance' => !empty($options['force_entrance']),
     ],
-  ]);
+  ];
+  $sid = trim((string) ($options['session_id'] ?? ''));
+  if ($sid !== '') {
+    $input['sessionId'] = $sid;
+  }
+  return authoritative_worker_call($input);
 }
 
 /**
  * @param array<string, mixed> $command
  * @return array<string, mixed>
  */
-function authoritative_worker_execute_command(string $worldPayload, array $command, string $characterPayload = ''): array
+function authoritative_worker_execute_command(
+  string $worldPayload,
+  array $command,
+  string $characterPayload = '',
+  string $sessionId = ''
+): array
 {
-  return authoritative_worker_call([
+  $input = [
     'operation' => 'command',
     'worldPayload' => $worldPayload,
     'characterPayload' => trim($characterPayload),
     'command' => $command,
-  ]);
+  ];
+  $sid = trim($sessionId);
+  if ($sid !== '') {
+    $input['sessionId'] = $sid;
+  }
+  return authoritative_worker_call($input);
 }

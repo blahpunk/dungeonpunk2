@@ -24,9 +24,66 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
   path.join(PROJECT_ROOT, "src", "content", "monsters.seed.json"),
 ].filter(Boolean);
 let appliedMonsterConfigRaw = "";
+const SESSION_STATE_CACHE_TTL_MS = 300000;
+const SESSION_STATE_CACHE_MAX = 128;
+const AUTHORITATIVE_TICK_MS = 50;
+const AUTHORITATIVE_INPUT_WINDOW_MS = 50;
+const sessionStateCache = new Map();
 
 if (!socketPath) {
   throw new Error("Missing authoritative daemon socket path.");
+}
+
+function normalizeSessionId(value = "") {
+  const id = String(value ?? "").trim();
+  return /^[a-z0-9_\-]{8,160}$/i.test(id) ? id : "";
+}
+
+function pruneSessionStateCache(nowMs = Date.now()) {
+  for (const [key, entry] of sessionStateCache.entries()) {
+    const updatedAt = Number(entry?.updatedAt ?? 0);
+    if (!Number.isFinite(updatedAt) || (nowMs - updatedAt) > SESSION_STATE_CACHE_TTL_MS) {
+      sessionStateCache.delete(key);
+    }
+  }
+  if (sessionStateCache.size <= SESSION_STATE_CACHE_MAX) return;
+  const ordered = [...sessionStateCache.entries()]
+    .sort((a, b) => Number(a?.[1]?.updatedAt ?? 0) - Number(b?.[1]?.updatedAt ?? 0));
+  while (ordered.length > SESSION_STATE_CACHE_MAX) {
+    const victim = ordered.shift();
+    if (!victim) break;
+    sessionStateCache.delete(victim[0]);
+  }
+}
+
+function getCachedSessionState(sessionId = "", worldPayload = "") {
+  const key = normalizeSessionId(sessionId);
+  if (!key) return null;
+  pruneSessionStateCache(Date.now());
+  const entry = sessionStateCache.get(key);
+  if (!entry || typeof entry !== "object") return null;
+  if (String(entry.worldPayload ?? "") !== String(worldPayload ?? "")) return null;
+  entry.updatedAt = Date.now();
+  return entry;
+}
+
+function setCachedSessionState(sessionId = "", worldPayload = "", state = null) {
+  const key = normalizeSessionId(sessionId);
+  if (!key || !state) return;
+  pruneSessionStateCache(Date.now());
+  const prev = sessionStateCache.get(key);
+  sessionStateCache.set(key, {
+    worldPayload: String(worldPayload ?? ""),
+    state,
+    lastTick: Number.isFinite(prev?.lastTick) ? Math.max(0, Math.floor(prev.lastTick)) : 0,
+    updatedAt: Date.now(),
+  });
+}
+
+function clearCachedSessionState(sessionId = "") {
+  const key = normalizeSessionId(sessionId);
+  if (!key) return;
+  sessionStateCache.delete(key);
 }
 
 function fail(message, extra = {}) {
@@ -82,15 +139,31 @@ async function handleOperation(raw = "") {
   refreshMonsterRuntimeConfig();
   const input = raw.trim() ? JSON.parse(raw) : {};
   const operation = String(input.operation ?? "").trim();
+  const sessionId = normalizeSessionId(input.sessionId ?? input.session_id ?? "");
 
   if (operation === "bootstrap") {
     const snapshot = engine.headlessBootstrapState(input.options ?? {});
     if (!snapshot) return fail("Could not bootstrap authoritative state.");
+    if (sessionId) {
+      const payload = String(snapshot?.payload ?? "");
+      const state = payload ? engine.headlessStateFromPayload(payload) : null;
+      if (state) setCachedSessionState(sessionId, payload, state);
+      else clearCachedSessionState(sessionId);
+    }
     return { ok: true, snapshot };
   }
 
   if (operation === "snapshot") {
-    const state = engine.headlessStateFromPayload(String(input.worldPayload ?? ""));
+    const worldPayload = String(input.worldPayload ?? "");
+    let entry = getCachedSessionState(sessionId, worldPayload);
+    let state = entry?.state ?? null;
+    if (!state) {
+      state = engine.headlessStateFromPayload(worldPayload);
+      if (state && sessionId) {
+        setCachedSessionState(sessionId, worldPayload, state);
+        entry = getCachedSessionState(sessionId, worldPayload);
+      }
+    }
     if (!state) return fail("Invalid canonical run payload.");
     return { ok: true, snapshot: engine.buildHeadlessStateSnapshot(state) };
   }
@@ -102,15 +175,61 @@ async function handleOperation(raw = "") {
       input.options ?? {}
     );
     if (!snapshot) return fail("Could not switch authoritative character.");
+    if (sessionId) {
+      const payload = String(snapshot?.payload ?? "");
+      const state = payload ? engine.headlessStateFromPayload(payload) : null;
+      if (state) setCachedSessionState(sessionId, payload, state);
+      else clearCachedSessionState(sessionId);
+    }
     return { ok: true, snapshot };
   }
 
   if (operation === "command") {
-    return engine.headlessExecuteCommandPayload(
-      String(input.worldPayload ?? ""),
-      input.command ?? {},
-      String(input.characterPayload ?? "")
-    );
+    const opStartMs = Date.now();
+    const worldPayload = String(input.worldPayload ?? "");
+    let entry = getCachedSessionState(sessionId, worldPayload);
+    let state = entry?.state ?? null;
+    if (!state) {
+      state = engine.headlessStateFromPayload(worldPayload);
+      if (!state) return fail("Invalid canonical run payload.");
+      if (sessionId) {
+        setCachedSessionState(sessionId, worldPayload, state);
+        entry = getCachedSessionState(sessionId, worldPayload);
+      }
+    }
+
+    const nowMs = Date.now();
+    const nowTick = Math.max(0, Math.floor(nowMs / AUTHORITATIVE_TICK_MS));
+    const previousTick = Number.isFinite(entry?.lastTick) ? Math.max(0, Math.floor(entry.lastTick)) : 0;
+    const serverTick = Math.max(previousTick + 1, nowTick);
+    if (entry && typeof entry === "object") {
+      entry.lastTick = serverTick;
+      entry.updatedAt = nowMs;
+    }
+
+    const result = typeof engine.headlessExecuteCommandOnState === "function"
+      ? engine.headlessExecuteCommandOnState(state, input.command ?? {}, "", { basePayload: worldPayload })
+      : engine.headlessExecuteCommandPayload(worldPayload, input.command ?? {}, "");
+    if (sessionId && result && typeof result === "object") {
+      const nextPayload = String(result?.snapshot?.payload ?? "");
+      if (nextPayload && state) {
+        setCachedSessionState(sessionId, nextPayload, state);
+        const nextEntry = getCachedSessionState(sessionId, nextPayload);
+        if (nextEntry && typeof nextEntry === "object") {
+          nextEntry.lastTick = serverTick;
+        }
+      }
+      else clearCachedSessionState(sessionId);
+      const perf = (result.perf && typeof result.perf === "object") ? { ...result.perf } : {};
+      perf.daemonMs = Math.max(0, Date.now() - opStartMs);
+      result.perf = perf;
+      result.tick = {
+        serverTick,
+        tickMs: AUTHORITATIVE_TICK_MS,
+        inputWindowMs: AUTHORITATIVE_INPUT_WINDOW_MS,
+      };
+    }
+    return result;
   }
 
   return fail(`Unsupported worker operation: ${operation}`);

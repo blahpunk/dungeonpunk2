@@ -73,6 +73,7 @@ export function createAuthoritativeApi(options = {}) {
         session_id: sessionId,
         client_command_seq: clientCommandSeq,
         command,
+        client_sent_at: Date.now(),
       });
     },
     touchSession({ sessionId = "" } = {}) {

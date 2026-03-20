@@ -11,6 +11,8 @@ function ensureMirrorShape(mirror = null) {
   next.activeCharacterId = String(next.activeCharacterId ?? "");
   next.lastSave = next.lastSave && typeof next.lastSave === "object" ? next.lastSave : null;
   next.saves = Array.isArray(next.saves) ? next.saves : [];
+  if (!Number.isFinite(next.lastServerTick)) next.lastServerTick = 0;
+  next.lastPerf = next.lastPerf && typeof next.lastPerf === "object" ? next.lastPerf : null;
   return next;
 }
 
@@ -31,6 +33,8 @@ export function resetServerMirror(mirror = null) {
   next.activeCharacterId = "";
   next.lastSave = null;
   next.saves = [];
+  next.lastServerTick = 0;
+  next.lastPerf = null;
   return next;
 }
 
@@ -54,6 +58,9 @@ export function applyAuthoritativeResponseToMirror(mirror = null, response = nul
   next.activeCharacterId = String(data?.snapshot?.character?.id ?? next.activeCharacterId ?? "");
   next.lastSave = data.save && typeof data.save === "object" ? data.save : null;
   next.saves = Array.isArray(data.saves) ? data.saves.slice() : next.saves;
+  const tick = Number(data?.tick?.serverTick ?? data?.tick?.tick ?? 0);
+  if (Number.isFinite(tick)) next.lastServerTick = Math.max(next.lastServerTick, Math.floor(tick));
+  next.lastPerf = data?.perf && typeof data.perf === "object" ? data.perf : next.lastPerf;
   next.ready = !!next.lastSnapshot;
   return next;
 }

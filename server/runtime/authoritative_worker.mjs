@@ -22,6 +22,7 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
   path.join(PROJECT_ROOT, "src", "content", "monsters.seed.json"),
 ].filter(Boolean);
 let appliedMonsterConfigRaw = "";
+const AUTHORITATIVE_TICK_MS = 50;
 
 function loadMonsterEditorPayload() {
   for (const cfgPath of MONSTER_EDITOR_CONFIG_PATHS) {
@@ -107,11 +108,23 @@ async function main() {
   }
 
   if (operation === "command") {
-    return engine.headlessExecuteCommandPayload(
+    const opStartMs = Date.now();
+    const result = engine.headlessExecuteCommandPayload(
       String(input.worldPayload ?? ""),
       input.command ?? {},
-      String(input.characterPayload ?? "")
+      ""
     );
+    if (result && typeof result === "object") {
+      const perf = (result.perf && typeof result.perf === "object") ? { ...result.perf } : {};
+      perf.workerMs = Math.max(0, Date.now() - opStartMs);
+      result.perf = perf;
+      result.tick = {
+        serverTick: Math.max(0, Math.floor(Date.now() / AUTHORITATIVE_TICK_MS)),
+        tickMs: AUTHORITATIVE_TICK_MS,
+        inputWindowMs: AUTHORITATIVE_TICK_MS,
+      };
+    }
+    return result;
   }
 
   return fail(`Unsupported worker operation: ${operation}`);

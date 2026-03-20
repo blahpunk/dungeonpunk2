@@ -134,7 +134,7 @@ function authoritative_load_session_snapshot(
   if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
     $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
   }
-  $snapshotResponse = authoritative_worker_snapshot($worldPayload);
+  $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionId);
   $snapshot = is_array($snapshotResponse['snapshot'] ?? null) ? $snapshotResponse['snapshot'] : null;
   if (!is_array($snapshot)) {
     throw new RuntimeException('Could not build authoritative snapshot.');
@@ -204,6 +204,7 @@ function authoritative_switch_session_character(
     $targetCharacterPayload,
     [
       'force_entrance' => !empty($options['force_entrance']),
+      'session_id' => (string) ($session['session_id'] ?? ''),
     ]
   );
   $nextSnapshot = is_array($switchResponse['snapshot'] ?? null) ? $switchResponse['snapshot'] : null;
@@ -239,6 +240,7 @@ function authoritative_start_new_dungeon(
 
   $bootstrapResponse = authoritative_worker_bootstrap('', $characterPayload, [
     'force_entrance' => true,
+    'session_id' => (string) ($session['session_id'] ?? ''),
   ]);
   $nextSnapshot = is_array($bootstrapResponse['snapshot'] ?? null) ? $bootstrapResponse['snapshot'] : null;
   if (!is_array($nextSnapshot)) {
@@ -279,32 +281,24 @@ function authoritative_handle_command(
   $session = $loaded['session'];
   $runRecord = $loaded['run_record'];
   $sessionCharacterId = normalize_character_profile_id((string) ($session['character_id'] ?? ''));
-  $sessionCharacterPayload = '';
-  if ($sessionCharacterId !== '') {
-    $states = load_user_character_states($userEmail, $saveSecret);
-    if (isset($states[$sessionCharacterId])) {
-      $sessionCharacterPayload = trim((string) ($states[$sessionCharacterId]['payload'] ?? ''));
-    }
-  }
   $requiresShopLock = function_exists('authoritative_shop_command_requires_lock')
     ? authoritative_shop_command_requires_lock($command)
     : false;
+  $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
+  $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
 
-  $snapshotFromCanonicalPayload = static function (array $runRecordInput): array {
+  $snapshotFromCanonicalPayload = function (array $runRecordInput) use ($sessionIdNorm): array {
     $worldPayload = trim((string) ($runRecordInput['payload'] ?? ''));
     if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
       $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
     }
-    $snapshotResponse = authoritative_worker_snapshot($worldPayload);
+    $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionIdNorm);
     $snapshot = is_array($snapshotResponse['snapshot'] ?? null) ? $snapshotResponse['snapshot'] : null;
     if (!is_array($snapshot)) {
       throw new RuntimeException('Could not build authoritative snapshot.');
     }
     return $snapshot;
   };
-
-  $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
-  $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
   if ($sessionCharacterId !== '') {
     $conflict = authoritative_find_character_session_conflict(
       $userEmail,
@@ -350,13 +344,13 @@ function authoritative_handle_command(
     $command,
     $clientCommandSeq,
     $requiresShopLock,
-    $sessionCharacterPayload
+    $sessionIdNorm
   ): array {
     $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
     if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
       $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
     }
-    $result = authoritative_worker_execute_command($worldPayload, $command, $sessionCharacterPayload);
+    $result = authoritative_worker_execute_command($worldPayload, $command, '', $sessionIdNorm);
     $snapshot = is_array($result['snapshot'] ?? null) ? $result['snapshot'] : null;
     if (!is_array($snapshot)) {
       throw new RuntimeException('Authoritative command returned no snapshot.');
@@ -376,10 +370,21 @@ function authoritative_handle_command(
       throw new RuntimeException('Could not persist authoritative command session.');
     }
 
+    $resultDiff = is_array($result['diff'] ?? null) ? $result['diff'] : null;
+    $resultTick = is_array($result['tick'] ?? null) ? $result['tick'] : null;
+    $resultPerf = is_array($result['perf'] ?? null) ? $result['perf'] : null;
+    $resultHotDelta = is_array($result['hotDelta'] ?? null) ? $result['hotDelta'] : null;
+    $sendDiff = $commandOk && is_array($resultDiff);
+
     return authoritative_build_snapshot_response($session, $snapshot, [
       'ok' => $commandOk,
       'accepted_command_seq' => $clientCommandSeq,
       'error' => $commandOk ? '' : trim((string) ($result['error'] ?? 'Command rejected.')),
+      'diff' => $sendDiff ? $resultDiff : null,
+      'strip_snapshot_payload' => $sendDiff,
+      'tick' => $resultTick,
+      'perf' => $resultPerf,
+      'hot_delta' => $sendDiff ? $resultHotDelta : null,
       'save' => null,
       'saves' => [],
     ]);
