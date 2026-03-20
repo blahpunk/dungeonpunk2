@@ -2896,7 +2896,7 @@ if ($apiMode === 'analytics') {
 }
 if ($apiMode === 'authoritative') {
   $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
-  if ($method === 'POST' && !app_rate_limit('api_authoritative_post', 240, 60)) {
+  if ($method === 'POST' && !app_rate_limit('api_authoritative_post', 1800, 60)) {
     json_response(['ok' => false, 'error' => 'Too many authoritative requests. Please retry shortly.'], 429);
   }
   if ($user === null || $userEmail === '') {
@@ -6772,7 +6772,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
         opacity: 0.9;
       }
     </style>
-    <!-- Matomo -->
+<!-- Matomo -->
 <script>
   var _paq = window._paq = window._paq || [];
   /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
@@ -6781,7 +6781,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
   (function() {
     var u="//anal.blahpunk.com/";
     _paq.push(['setTrackerUrl', u+'matomo.php']);
-    _paq.push(['setSiteId', '7']);
+    _paq.push(['setSiteId', '16']);
     var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
     g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
   })();

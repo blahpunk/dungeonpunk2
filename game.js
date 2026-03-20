@@ -1731,6 +1731,7 @@ const authoritativePendingAction = createPendingActionState();
 let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
 const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
+const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 3;
 const authoritativeCommandQueue = [];
 const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 300;
 const AUTHORITATIVE_LOCK_AUDIT_INTERVAL_MS = 20000;
@@ -1821,10 +1822,18 @@ function pruneAuthoritativeCommandQueue(predicate) {
   return removed;
 }
 
+function canQueueAuthoritativeCommand(command) {
+  const cmdType = String(command?.type ?? "").trim().toUpperCase();
+  // Keep movement responsive under lag, but never buffer combat/actions that can
+  // execute in a dangerous burst after latency clears.
+  return cmdType === "MOVE";
+}
+
 function enqueueAuthoritativeCommand(command, options = null) {
   if (!command || typeof command !== "object") return false;
   const opts = (options && typeof options === "object") ? options : {};
   const cmdType = String(command.type ?? "").trim().toUpperCase();
+  if (!canQueueAuthoritativeCommand(command)) return false;
   const movementSource = String(opts.movementSource ?? "").trim();
   if (cmdType === "MOVE" && movementSource) {
     // If player changed direction/source, prefer newest direction over stale buffered moves.
@@ -1836,7 +1845,7 @@ function enqueueAuthoritativeCommand(command, options = null) {
       if (!queuedSource || queuedSource === movementSource) continue;
       authoritativeCommandQueue.splice(i, 1);
     }
-    // Keep at most one older move for this same source to avoid long catch-up lag.
+    // Keep a short move buffer per source to smooth latency without excessive catch-up.
     let sameSourceCount = 0;
     for (let i = authoritativeCommandQueue.length - 1; i >= 0; i -= 1) {
       const queued = authoritativeCommandQueue[i];
@@ -1844,9 +1853,8 @@ function enqueueAuthoritativeCommand(command, options = null) {
       if (queuedType !== "MOVE") continue;
       if (String(queued?.options?.movementSource ?? "").trim() !== movementSource) continue;
       sameSourceCount += 1;
-      if (sameSourceCount >= 1) {
+      if (sameSourceCount >= AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX) {
         authoritativeCommandQueue.splice(i, 1);
-        break;
       }
     }
   }
@@ -2055,17 +2063,20 @@ async function requestAuthoritativeResync(reason = "resync") {
 async function performAuthoritativeCommand(command, options = null) {
   if (!isAuthoritativeSessionActive()) return false;
   if (!command || typeof command !== "object") return false;
+  const queueable = canQueueAuthoritativeCommand(command);
   const now = Date.now();
   if (now < authoritativeRateLimitRuntime.blockedUntil) {
-    enqueueAuthoritativeCommand(command, options);
-    scheduleAuthoritativeQueueDrain(authoritativeRateLimitRuntime.blockedUntil - now);
+    if (queueable) {
+      enqueueAuthoritativeCommand(command, options);
+      scheduleAuthoritativeQueueDrain(authoritativeRateLimitRuntime.blockedUntil - now);
+    }
+    return Promise.resolve(false);
+  }
+  if (authoritativeMirror.inFlight) {
+    if (queueable) enqueueAuthoritativeCommand(command, options);
     return Promise.resolve(false);
   }
   if (shouldDropAuthoritativeCommand(command)) return false;
-  if (authoritativeMirror.inFlight) {
-    enqueueAuthoritativeCommand(command, options);
-    return Promise.resolve(false);
-  }
   const opts = (options && typeof options === "object") ? options : {};
     setAuthoritativeInputLock(true, {
       type: String(command.type ?? "").trim().toUpperCase(),
@@ -2092,13 +2103,15 @@ async function performAuthoritativeCommand(command, options = null) {
     if (String(err?.response?.status_code ?? "") === "429") {
       const delayMs = authoritativeRateLimitDelayMs(err);
       authoritativeRateLimitRuntime.blockedUntil = Date.now() + delayMs;
-      enqueueAuthoritativeCommand(command, options);
-      scheduleAuthoritativeQueueDrain(delayMs + 5);
-      const warnNow = Date.now();
-      if ((warnNow - authoritativeRateLimitRuntime.lastWarnAt) > 2000 && game?.log) {
-        pushLog(game, "Server is busy; buffering your movement.");
-        renderLog(game);
-        authoritativeRateLimitRuntime.lastWarnAt = warnNow;
+      if (queueable) {
+        enqueueAuthoritativeCommand(command, options);
+        scheduleAuthoritativeQueueDrain(delayMs + 5);
+        const warnNow = Date.now();
+        if ((warnNow - authoritativeRateLimitRuntime.lastWarnAt) > 2000 && game?.log) {
+          pushLog(game, "Server is busy; buffering your movement.");
+          renderLog(game);
+          authoritativeRateLimitRuntime.lastWarnAt = warnNow;
+        }
       }
       return false;
     }
