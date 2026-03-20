@@ -229,7 +229,7 @@ const LIVE_TIMING_ACTION_POLICY = Object.freeze({
   MOVE: "live_action_timeline",
   MOVE_BATCH: "live_action_timeline",
   ATTACK: "live_action_timeline",
-  ACTIVATE_ABILITY: "live_action_timeline",
+  ACTIVATE_ABILITY: "transactional_non_turn",
   OPEN_DOOR: "timed_interaction",
   CLOSE_DOOR: "timed_interaction",
   PICKUP: "timed_interaction",
@@ -2110,9 +2110,14 @@ function pruneAuthoritativeCommandQueue(predicate) {
 
 function canQueueAuthoritativeCommand(command) {
   const cmdType = String(command?.type ?? "").trim().toUpperCase();
-  // Keep movement responsive under lag, but never buffer combat/actions that can
-  // execute in a dangerous burst after latency clears.
-  return cmdType === "MOVE";
+  // Keep movement responsive under lag and allow a short queue for explicitly
+  // instant commands so quick-actions are not dropped during in-flight requests.
+  return cmdType === "MOVE"
+    || cmdType === "USE_ITEM"
+    || cmdType === "EQUIP_ITEM"
+    || cmdType === "UNEQUIP_ITEM"
+    || cmdType === "DROP_ITEM"
+    || cmdType === "ACTIVATE_ABILITY";
 }
 
 function isAuthoritativeMoveCommand(command) {
@@ -22218,6 +22223,15 @@ function liveInteractionTimingForCommand(commandType = "") {
   return { castTicks: 1, recoveryTicks: 1, moveLockTicks: 1, blockedInCombat: false };
 }
 
+function isLiveInstantCommandType(commandType = "") {
+  const type = String(commandType ?? "").trim().toUpperCase();
+  return type === "USE_ITEM"
+    || type === "EQUIP_ITEM"
+    || type === "UNEQUIP_ITEM"
+    || type === "DROP_ITEM"
+    || type === "ACTIVATE_ABILITY";
+}
+
 function playerIsInLiveCombat(state, currentTick = null) {
   if (!state?.player) return false;
   const tick = Math.max(0, Math.floor(Number(currentTick ?? currentLiveSimulationTick(state)) || 0));
@@ -22231,6 +22245,7 @@ function liveTransactionalCommandError(state, commandType = "", options = null) 
   void opts;
   const type = String(commandType ?? "").trim().toUpperCase();
   if (!type || type === "REQUEST_RESYNC" || type === "SAVE_AND_EXIT") return "";
+  if (isLiveInstantCommandType(type)) return "";
   const currentTick = Math.max(0, Math.floor(Number(currentLiveSimulationTick(state)) || 0));
   const playerLive = ensureLiveActorState(state.player, "player");
   if (playerLive.action.actionState === "windup" || playerLive.action.actionState === "executing") {
@@ -22242,9 +22257,6 @@ function liveTransactionalCommandError(state, commandType = "", options = null) 
   }
   if (type === "ALLOCATE_STATS" && inCombat) {
     return "You cannot allocate stats during combat.";
-  }
-  if ((type === "EQUIP_ITEM" || type === "UNEQUIP_ITEM") && inCombat) {
-    return "You cannot change equipment during combat.";
   }
   return "";
 }
@@ -23886,13 +23898,9 @@ function executeLiveTickCommandOnState(state, rawCommand = null, options = null)
         snapshot: snapshotWithAreaRespawn(),
       };
     }
-    const occupancy = getCachedOccupancy(state);
-    const target = resolveLiveAbilityTargetForPlayer(state, ability, findMonsterForAuthoritativeCommand(state, command), occupancy);
-    const started = startLivePlayerAbilityAction(state, ability, target, {
-      currentTick: currentLiveSimulationTick(state),
-      occupancy,
-    });
-    if (!started) {
+    const target = findMonsterForAuthoritativeCommand(state, command);
+    const ok = !!usePlayerActiveAbility(state, ability, target);
+    if (!ok) {
       return {
         ok: false,
         error: "Ability could not be activated.",
@@ -23900,7 +23908,13 @@ function executeLiveTickCommandOnState(state, rawCommand = null, options = null)
         snapshot: snapshotWithAreaRespawn(),
       };
     }
-    stepResult = advanceLiveSimulationOnState(state, { ticks: 1 });
+    stepResult = {
+      ok: true,
+      advancedTicks: 0,
+      moved: false,
+      movedCount: 0,
+      blockedReason: "",
+    };
   } else if (
     type === "OPEN_DOOR"
     || type === "CLOSE_DOOR"
