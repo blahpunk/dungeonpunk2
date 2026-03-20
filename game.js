@@ -23740,6 +23740,9 @@ function executeLiveTickCommandOnState(state, rawCommand = null, options = null)
   const snapshotWithAreaRespawn = () => {
     updateAreaRespawnSystem(state, Date.now());
     hydrateNearby(state);
+    // In headless authoritative execution there is no render loop, so ensure
+    // reveal history is advanced before snapshot export.
+    computeVisibility(state);
     return buildHeadlessStateSnapshot(state, { logStart });
   };
   const catchupNowMs = Math.max(0, Math.floor(Number(opts.nowMs ?? Date.now()) || Date.now()));
@@ -25132,6 +25135,8 @@ function executeAuthoritativeCommandOnState(state, rawCommand = null, options = 
   const snapshotWithAreaRespawn = () => {
     updateAreaRespawnSystem(state, Date.now());
     hydrateNearby(state);
+    // Keep persistent fog-of-war reveal in sync for authoritative snapshots.
+    computeVisibility(state);
     return buildHeadlessStateSnapshot(state, { logStart });
   };
   if (!state?.player || !type) {
