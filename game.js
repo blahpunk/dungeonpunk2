@@ -15226,6 +15226,17 @@ function normalizeDoorLockColor(lockColor) {
   return color;
 }
 
+function keyColorLabelUpper(keyType = "") {
+  const normalized = normalizeDoorLockColor(keyType);
+  if (normalized === KEY_GREEN) return "GREEN";
+  if (normalized === KEY_YELLOW) return "YELLOW";
+  if (normalized === KEY_ORANGE) return "ORANGE";
+  if (normalized === KEY_RED) return "RED";
+  if (normalized === KEY_VIOLET) return "VIOLET";
+  if (normalized === KEY_INDIGO) return "INDIGO";
+  return "";
+}
+
 function lockColorForOpenDoorTile(t) {
   if (t === DOOR_OPEN_GREEN) return KEY_GREEN;
   if (t === DOOR_OPEN_YELLOW) return KEY_YELLOW;
@@ -15275,7 +15286,9 @@ function tryUnlockDoor(state, x, y, z) {
   const keyType = lockToKeyType(t);
   const lockpickEnabled = !!stateDebug(state).lockpick;
   if (!lockpickEnabled && !invConsume(state, keyType, 1)) {
-    pushLog(state, `Locked door. Need a ${ITEM_TYPES[keyType].name}.`);
+    const keyColor = keyColorLabelUpper(keyType);
+    if (keyColor) pushLog(state, `Locked door. You need a ${keyColor} key to open this door.`);
+    else pushLog(state, "Locked door. You need a matching key to open this door.");
     renderInventory(state);
     return true;
   }
@@ -15817,8 +15830,9 @@ function pickup(state) {
     if (isLocked) {
       const lockpickEnabled = !!stateDebug(state).lockpick;
       if (!lockpickEnabled && (!keyType || !invConsume(state, keyType, 1))) {
-        const keyName = ITEM_TYPES[keyType]?.name ?? "matching key";
-        pushLog(state, `The chest is locked. Need a ${keyName}.`);
+        const keyColor = keyColorLabelUpper(keyType);
+        if (keyColor) pushLog(state, `The chest is locked. You need a ${keyColor} key to open this chest.`);
+        else pushLog(state, "The chest is locked. You need a matching key to open this chest.");
         return false;
       }
       if (lockpickEnabled) pushLog(state, "You pick the chest lock.");
@@ -23508,9 +23522,17 @@ function tryStepLivePlayerMovement(state, dir = "", options = null) {
   const ny = p.y + delta.dy;
   const nz = p.z;
   hydrateNearby(state);
-  const tile = state.world.getTile(nx, ny, nz);
-  if (tileIsLocked(tile)) return { moved: false, reason: "locked_door" };
-  if (tile === DOOR_CLOSED) return { moved: false, reason: "closed_door" };
+  let tile = state.world.getTile(nx, ny, nz);
+  if (tileIsLocked(tile)) {
+    const handled = tryUnlockDoor(state, nx, ny, nz);
+    if (!handled) return { moved: false, reason: "locked_door" };
+    tile = state.world.getTile(nx, ny, nz);
+    if (!state.world.isPassable(nx, ny, nz)) return { moved: false, reason: "locked_door" };
+  } else if (tile === DOOR_CLOSED) {
+    const opened = tryOpenClosedDoor(state, nx, ny, nz);
+    if (!opened) return { moved: false, reason: "closed_door" };
+    return { moved: false, reason: "opened_door" };
+  }
 
   const occ = buildOccupancy(state);
   const blockingMonsterId = occ.monsters.get(keyXYZ(nx, ny, nz));
