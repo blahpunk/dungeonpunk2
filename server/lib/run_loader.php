@@ -286,6 +286,19 @@ function authoritative_bootstrap_context(
     $latestForCharacter = authoritative_find_latest_save_entry($entries, $characterId);
     if (is_array($latestForCharacter)) {
       $characterPayload = authoritative_character_snapshot_payload_from_save_payload((string) ($latestForCharacter['payload'] ?? ''));
+      if ($characterPayload !== '' && $source === 'run_record') {
+        // The active canonical run is already selected; do not trust historical
+        // save position data from a different dungeon instance.
+        $decodedCharacterPayload = authoritative_decode_character_snapshot_payload($characterPayload);
+        if (is_array($decodedCharacterPayload)) {
+          $clearedCharacterPayload = authoritative_encode_character_snapshot_payload(
+            authoritative_clear_character_snapshot_position($decodedCharacterPayload)
+          );
+          if ($clearedCharacterPayload !== '') {
+            $characterPayload = $clearedCharacterPayload;
+          }
+        }
+      }
       if ($worldPayload === '' && !$freshWorld) {
         $worldPayload = trim((string) ($latestForCharacter['payload'] ?? ''));
         $source = 'character_save';

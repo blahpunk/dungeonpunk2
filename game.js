@@ -9344,7 +9344,12 @@ function placePlayerFromCharacterSnapshot(state, snapshot, options = null) {
   p.x = pos.x;
   p.y = pos.y;
   p.z = pos.depth;
-  if (!state.world.isPassable(p.x, p.y, p.z)) state.world.setTile(p.x, p.y, p.z, FLOOR);
+  if (!state.world.isPassable(p.x, p.y, p.z)) {
+    return placePlayerAtDungeonEntrance(state, {
+      message: String(opts.entranceMessage ?? "").trim(),
+      resetVision: opts.resetVision === true,
+    });
+  }
   setLastLadderLanding(state, p);
   ensureSurfaceLinkTile(state);
   ensureShopState(state);
