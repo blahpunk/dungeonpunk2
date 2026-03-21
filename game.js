@@ -2177,6 +2177,8 @@ function noteAuthoritativeMovementStreamCompatibilityFallback() {
 }
 
 function shouldDisableAuthoritativeMovementStream(err) {
+  const statusCode = Math.max(0, Math.floor(Number(err?.response?.status_code ?? 0) || 0));
+  if (statusCode === 409 || statusCode === 429) return false;
   const message = String(
     err?.response?.error
     ?? err?.message
@@ -2186,9 +2188,8 @@ function shouldDisableAuthoritativeMovementStream(err) {
   if (!message) return false;
   return (
     message.includes("unsupported worker operation") ||
-    message.includes("poll_movement") ||
-    message.includes("set_movement_intent") ||
-    message.includes("movement stream unavailable")
+    message.includes("movement stream unavailable") ||
+    message.includes("authoritative session cache miss")
   );
 }
 
@@ -2628,6 +2629,19 @@ function authoritativeResponseBytes(data = null) {
   return Math.max(0, Math.floor(Number(transport?.contentLength ?? 0) || 0));
 }
 
+function authoritativeObservedResponseBytes(data = null) {
+  const transportBytes = authoritativeResponseBytes(data);
+  if (transportBytes > 0) return transportBytes;
+  try {
+    return new TextEncoder().encode(JSON.stringify(data ?? null)).length;
+  } catch {}
+  try {
+    const serialized = JSON.stringify(data ?? null);
+    return serialized ? serialized.length : 0;
+  } catch {}
+  return 0;
+}
+
 function findPendingAuthoritativeStreamMove(intentSeq = 0) {
   const seq = Math.max(0, Math.floor(Number(intentSeq) || 0));
   if (!seq || !Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)) return null;
@@ -2688,12 +2702,21 @@ function noteAuthoritativeMovementIntentAckTelemetry(data = null, options = null
   );
   const record = findPendingAuthoritativeStreamMove(responseIntentSeq);
   if (!record) return;
-  const ackAt = authoritativeResponseReadyAt(data);
+  const ackAt = normalizeAuthoritativeMoveInputAt(
+    opts.responseReadyAt
+      ?? authoritativeResponseReadyAt(data)
+  );
   const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? record.inputAt ?? ackAt);
   const inputToIntentAckMs = Math.max(0, ackAt - inputAt);
   const transport = authoritativeResponseTransportMeta(data);
-  const transportMs = Math.max(0, Number(transport?.totalMs ?? 0) || 0);
-  const responseBytes = authoritativeResponseBytes(data);
+  const transportMs = Math.max(
+    0,
+    Number(opts.transportMs ?? transport?.totalMs ?? 0) || 0
+  );
+  const responseBytes = Math.max(
+    0,
+    Math.floor(Number(opts.responseBytes ?? authoritativeObservedResponseBytes(data)) || 0)
+  );
   record.intentAckAt = ackAt;
   record.intentAckTransportMs = transportMs;
   record.intentAckResponseBytes = responseBytes;
@@ -2721,10 +2744,19 @@ function noteAuthoritativeMovementPollResponseTelemetry(data = null, options = n
     ?? (Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)
       ? authoritativeMoveTelemetryRuntime.pendingStreamMoves[0]
       : null);
-  const responseAt = authoritativeResponseReadyAt(data);
+  const responseAt = normalizeAuthoritativeMoveInputAt(
+    opts.responseReadyAt
+      ?? authoritativeResponseReadyAt(data)
+  );
   const transport = authoritativeResponseTransportMeta(data);
-  const transportMs = Math.max(0, Number(transport?.totalMs ?? 0) || 0);
-  const responseBytes = authoritativeResponseBytes(data);
+  const transportMs = Math.max(
+    0,
+    Number(opts.transportMs ?? transport?.totalMs ?? 0) || 0
+  );
+  const responseBytes = Math.max(
+    0,
+    Math.floor(Number(opts.responseBytes ?? authoritativeObservedResponseBytes(data)) || 0)
+  );
   noteAuthoritativeMoveSample("pollTransportMs", transportMs);
   noteAuthoritativeMoveSample("pollResponseBytes", responseBytes);
   if (record) {
@@ -3826,13 +3858,14 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
     const controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
     authoritativeMovementChannelRuntime.abortController = controller;
     try {
+      const requestStartedAt = Date.now();
       const response = await authoritativeApi.pollMovement({
         sessionId: sid,
         timeoutMs: AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS,
         minResponseMs: AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS,
         signal: controller?.signal,
       });
-      const responseReadyAt = authoritativeResponseReadyAt(response);
+      const responseReadyAt = Date.now();
       authoritativeMovementChannelRuntime.lastPollResponseAt = responseReadyAt;
       noteAuthoritativeMovementStreamMode("stream");
       if (
@@ -3843,7 +3876,12 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
         break;
       }
       if (response?.changed && response?.snapshot) {
-        noteAuthoritativeMovementPollResponseTelemetry(response, { changed: true });
+        noteAuthoritativeMovementPollResponseTelemetry(response, {
+          changed: true,
+          responseReadyAt,
+          transportMs: Math.max(0, responseReadyAt - requestStartedAt),
+          responseBytes: authoritativeObservedResponseBytes(response),
+        });
         if (shouldSkipAuthoritativeMovementPollSnapshot(response)) {
           noteAuthoritativeTickFromResponse(response);
           retryCount = 0;
@@ -22178,6 +22216,7 @@ async function syncAuthoritativeMovementControl(options = null) {
     intentSeq
   );
   noteAuthoritativeMovementStreamMode("stream");
+  const requestStartedAt = Date.now();
   try {
     const response = await authoritativeApi.setMovementIntent({
       sessionId,
@@ -22186,6 +22225,7 @@ async function syncAuthoritativeMovementControl(options = null) {
       enqueueDir,
       intentSeq,
     });
+    const responseReadyAt = Date.now();
     const responseIntentSeq = Math.max(0, Math.floor(Number(response?.intent?.seq ?? 0) || 0));
     if (responseIntentSeq > 0) {
       authoritativeMovementChannelRuntime.lastAckedIntentSeq = Math.max(
@@ -22197,6 +22237,9 @@ async function syncAuthoritativeMovementControl(options = null) {
       noteAuthoritativeMovementIntentAckTelemetry(response, {
         intentSeq,
         inputAt: opts.inputAt ?? selected?.updatedAt ?? Date.now(),
+        responseReadyAt,
+        transportMs: Math.max(0, responseReadyAt - requestStartedAt),
+        responseBytes: authoritativeObservedResponseBytes(response),
       });
     }
     noteAuthoritativeMovementStreamMode("stream");

@@ -15,12 +15,15 @@ function authoritative_build_snapshot_response(array $session, array $snapshot, 
 
   $snapshotOut = $snapshot;
   if (!empty($options['strip_snapshot_payload'])) {
+    $omitSnapshotLogEvents = !empty($options['omit_snapshot_log_events']);
     $snapshotOut = [
       'character' => $snapshot['character'] ?? null,
       'summary' => $snapshot['summary'] ?? null,
-      'log' => array_values(is_array($snapshot['log'] ?? null) ? $snapshot['log'] : []),
-      'events' => array_values(is_array($snapshot['events'] ?? null) ? $snapshot['events'] : []),
     ];
+    if (!$omitSnapshotLogEvents) {
+      $snapshotOut['log'] = array_values(is_array($snapshot['log'] ?? null) ? $snapshot['log'] : []);
+      $snapshotOut['events'] = array_values(is_array($snapshot['events'] ?? null) ? $snapshot['events'] : []);
+    }
   }
 
   $acceptedCommandSeq = max(
@@ -30,8 +33,10 @@ function authoritative_build_snapshot_response(array $session, array $snapshot, 
   $playerView = [
     'character' => $snapshot['character'] ?? null,
     'summary' => $snapshot['summary'] ?? null,
-    'log' => $snapshot['log'] ?? [],
   ];
+  if (empty($options['omit_player_view_log'])) {
+    $playerView['log'] = $snapshot['log'] ?? [];
+  }
   $uiHints = array_merge(
     [
       'inputLocked' => false,
@@ -45,7 +50,9 @@ function authoritative_build_snapshot_response(array $session, array $snapshot, 
     'sessionId' => (string) ($session['session_id'] ?? ''),
     'serverRevision' => max(0, (int) ($session['server_revision'] ?? 0)),
     'acceptedCommandSeq' => $acceptedCommandSeq,
-    'events' => array_values(is_array($snapshot['events'] ?? null) ? $snapshot['events'] : []),
+    'events' => !empty($options['omit_top_level_events'])
+      ? []
+      : array_values(is_array($snapshot['events'] ?? null) ? $snapshot['events'] : []),
     'diff' => (is_array($options['diff'] ?? null) ? $options['diff'] : null),
     'snapshot' => $snapshotOut,
     'playerView' => $playerView,
