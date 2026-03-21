@@ -170,7 +170,7 @@ const BROWSER_INSTANCE_ID_CLAIM_STALE_MS = 45000;
 const BROWSER_INSTANCE_ID_CLAIM_REFRESH_MS = 10000;
 const CHARACTER_STATE_SLOT_PREFIX = "charstate:";
 const LOCAL_CHARACTER_STATE_PREFIX = "infinite_dungeon_character_state_v1:";
-const CHARACTER_SYNC_DEBOUNCE_MS = 1200;
+const CHARACTER_SYNC_DEBOUNCE_MS = 120;
 const SHARED_DUNGEON_SYNC_INTERVAL_MS = 120;
 const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 35;
 const XP_SCALE = 100;
@@ -10235,10 +10235,7 @@ function applyCharacterSnapshot(state, snapshot) {
   p.attackAfterMove = false;
   p.abilityCd = 0;
   p.dead = false;
-  p.live = normalizeLiveCombatActorState(p.live ?? null, "player");
-  p.live.cooldowns.abilityTicks = 0;
-  p.live.action = normalizeLiveActionTimelineState(null);
-  p.live.intent.autoRetaliate = true;
+  p.live = normalizeLiveCombatActorState(null, "player");
   state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
     speciesId: profile.speciesId,
     classId: profile.classId,
@@ -10566,7 +10563,7 @@ function canUseSharedDungeonSync() {
 }
 
 function activeSharedDungeonCharacterId() {
-  return normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId()) || normalizeCharacterProfileId(game?.character?.id ?? "");
+  return normalizeCharacterProfileId(game?.character?.id ?? "") || normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId());
 }
 
 function sharedDungeonActorEntityId(characterId = "") {
@@ -10612,6 +10609,7 @@ function clearRemoteCharacterActors(state) {
 function syncRemoteCharacterActors(state, sharedData = null) {
   if (!state?.entities || !canUseSharedDungeonSync()) return;
   const activeLocks = Array.isArray(sharedData?.active_character_locks) ? sharedData.active_character_locks : [];
+  const activeStates = Array.isArray(sharedData?.active_character_states) ? sharedData.active_character_states : [];
   const currentCharacterId = activeSharedDungeonCharacterId();
   const activeCharacterIds = new Set(
     activeLocks
@@ -10628,6 +10626,39 @@ function syncRemoteCharacterActors(state, sharedData = null) {
     }
   }
   removeSharedDungeonActorForCharacter(state, currentCharacterId);
+  const currentDungeonId = sharedDungeonInstanceIdForState(state);
+  for (const entry of activeStates) {
+    const remoteId = normalizeCharacterProfileId(entry?.character_id ?? "");
+    if (!remoteId || remoteId === currentCharacterId || !activeCharacterIds.has(remoteId)) continue;
+    const dungeonId = String(entry?.dungeon_instance_id ?? "").trim();
+    if (currentDungeonId && dungeonId && dungeonId !== currentDungeonId) continue;
+    const x = Math.floor(Number(entry?.x ?? NaN));
+    const y = Math.floor(Number(entry?.y ?? NaN));
+    const z = Math.floor(Number(entry?.z ?? NaN));
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    const speciesId = normalizeCharacterSpeciesId(entry?.species_id ?? DEFAULT_CHARACTER_SPECIES_ID);
+    const classId = normalizeCharacterClassId(entry?.class_id ?? DEFAULT_CHARACTER_CLASS_ID, speciesId);
+    const display = resolveCharacterSpriteDisplay(speciesId, classId);
+    const actorId = sharedDungeonActorEntityId(remoteId);
+    const actor = {
+      id: actorId,
+      kind: "actor",
+      type: "hero_actor",
+      spriteId: display.spriteId || "hero",
+      x,
+      y,
+      z,
+      ai: "none",
+      remoteCharacterId: remoteId,
+      remoteCharacterName: String(entry?.name ?? "Adventurer"),
+      hp: Math.max(0, Math.floor(Number(entry?.hp ?? 0) || 0)),
+      maxHp: Math.max(1, Math.floor(Number(entry?.max_hp ?? 1) || 1)),
+      live: normalizeLiveCombatActorState(null, "actor"),
+    };
+    state.entities.set(actorId, actor);
+    if (state.dynamic instanceof Map) state.dynamic.set(actorId, actor);
+    if (state.entityOverrides instanceof Map) state.entityOverrides.delete(actorId);
+  }
 }
 
 function buildRunForCharacterSnapshot(snapshot, options = null) {
@@ -10673,29 +10704,7 @@ function exportSharedDungeonPayload(state) {
     cloned = null;
   }
   if (!cloned) return "";
-  const profile = normalizeCharacterProfile(state?.character ?? null);
-  const cid = normalizeCharacterProfileId(profile?.id ?? "");
-  removeSharedDungeonActorForCharacter(cloned, cid);
-  if (cid && cloned?.entities && cloned?.dynamic instanceof Map) {
-    const display = resolveCharacterSpriteDisplay(profile.speciesId, profile.classId);
-    const actor = {
-      id: sharedDungeonActorEntityId(cid),
-      kind: "actor",
-      type: "hero_actor",
-      spriteId: display.spriteId || "hero",
-      x: Math.floor(Number(state?.player?.x ?? 0)),
-      y: Math.floor(Number(state?.player?.y ?? 0)),
-      z: Math.floor(Number(state?.player?.z ?? 0)),
-      ai: "none",
-      remoteCharacterId: cid,
-      remoteCharacterName: profile.name,
-      hp: Math.max(0, Math.floor(state?.player?.hp ?? 0)),
-      maxHp: Math.max(1, Math.floor(state?.player?.maxHp ?? 1)),
-      live: normalizeLiveCombatActorState(null, "actor"),
-    };
-    cloned.entities.set(actor.id, actor);
-    cloned.dynamic.set(actor.id, actor);
-  }
+  clearRemoteCharacterActors(cloned);
   return exportSave(cloned);
 }
 
@@ -10773,10 +10782,7 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
       (!saveRuntime.dirty || sharedPullSafeWhileDirty || opts.forceApply === true) &&
       updatedAt !== sharedDungeonRuntime.lastAppliedUpdatedAt
     ) {
-      let snapshot = null;
-      if (normalizeCharacterProfileId(game?.character?.id ?? "") === currentCharacterId) {
-        snapshot = exportCharacterSnapshot(game);
-      }
+      let snapshot = exportCharacterSnapshot(game);
       if (!snapshot) {
         snapshot = await resolveLoadableCharacterSnapshot(currentCharacterId);
       }
@@ -14900,7 +14906,7 @@ function buildOccupancy(state) {
     if (e.kind === "monster") monsters.set(k, e.id);
     else if (e.kind === "item") items.set(k, e.id);
     else if (e.kind === "trap") traps.set(k, e.id);
-    else if (e.kind === "actor") actors.set(k, e.id);
+    else if (e.kind === "actor" && !e.remoteCharacterId) actors.set(k, e.id);
   }
   return { monsters, items, traps, actors };
 }
@@ -23724,6 +23730,7 @@ function ensureLiveSimulationState(state) {
     }
     for (const entity of state.entities?.values?.() ?? []) {
       if (!entity || typeof entity !== "object") continue;
+      if (entity.kind === "actor" && entity.remoteCharacterId) continue;
       if (entity.kind === "monster" || entity.kind === "trap" || entity.kind === "actor") {
         const actorLive = ensureLiveActorState(entity, entity.kind);
         if (entity.kind === "monster") {
@@ -23781,6 +23788,7 @@ function syncLegacyTurnStateIntoLiveTickState(state, options = null) {
   playerLive.cooldowns.abilityTicks = liveTicksFromLegacyTurns(state.player?.abilityCd ?? 0);
   for (const entity of state.entities?.values?.() ?? []) {
     if (!entity || typeof entity !== "object") continue;
+    if (entity.kind === "actor" && entity.remoteCharacterId) continue;
     if (entity.kind !== "monster" && entity.kind !== "trap" && entity.kind !== "actor") continue;
     const actorLive = ensureLiveActorState(entity, entity.kind);
     if (entity.kind === "monster") {
@@ -25460,6 +25468,7 @@ function advanceLiveSimulationOnState(state, options = null) {
     tickDownLiveCooldownsForActor(state.player, "player");
     for (const entity of state.entities?.values?.() ?? []) {
       if (!entity || typeof entity !== "object") continue;
+      if (entity.kind === "actor" && entity.remoteCharacterId) continue;
       if (entity.kind !== "monster" && entity.kind !== "trap" && entity.kind !== "actor") continue;
       tickDownLiveCooldownsForActor(entity, entity.kind);
       const actorLive = ensureLiveActorState(entity, entity.kind);

@@ -2068,6 +2068,107 @@ function character_states_public_meta(array $entriesById): array
   return $out;
 }
 
+/**
+ * @return array<string, array{id: string, name: string, payload: string, updated_at: string, sig: string}>
+ */
+function load_all_character_states(string $secret): array
+{
+  $out = [];
+  foreach (save_storage_root_candidates() as $root) {
+    if (!is_dir($root)) {
+      continue;
+    }
+    $files = glob($root . DIRECTORY_SEPARATOR . '*.characters.json');
+    if (!is_array($files)) {
+      continue;
+    }
+    foreach ($files as $file) {
+      if (!is_string($file) || $file === '') {
+        continue;
+      }
+      $raw = authoritative_json_read_file($file, null);
+      if (!is_array($raw) || !is_array($raw['characters'] ?? null)) {
+        continue;
+      }
+      foreach ($raw['characters'] as $entry) {
+        if (!is_array($entry)) {
+          continue;
+        }
+        $normalized = normalize_character_state_entry($entry, $secret);
+        if ($normalized === null) {
+          continue;
+        }
+        $id = (string) $normalized['id'];
+        $existing = $out[$id] ?? null;
+        if (!is_array($existing) || strcmp((string) ($normalized['updated_at'] ?? ''), (string) ($existing['updated_at'] ?? '')) > 0) {
+          $out[$id] = $normalized;
+        }
+      }
+    }
+  }
+  return $out;
+}
+
+/**
+ * @param array<string, array{id: string, name: string, payload: string, updated_at: string, sig: string}> $entriesById
+ * @param array<int, array<string, mixed>> $activeLocks
+ * @return array<int, array<string, mixed>>
+ */
+function active_character_states_public_payload(array $entriesById, array $activeLocks): array
+{
+  $activeByCharacterId = [];
+  foreach ($activeLocks as $lock) {
+    if (!is_array($lock)) {
+      continue;
+    }
+    $characterId = normalize_character_profile_id((string) ($lock['character_id'] ?? ''));
+    if ($characterId === '') {
+      continue;
+    }
+    $activeByCharacterId[$characterId] = [
+      'session_id' => (string) ($lock['session_id'] ?? ''),
+      'browser_instance_id' => authoritative_normalize_browser_instance_id((string) ($lock['browser_instance_id'] ?? '')),
+      'updated_at' => (string) ($lock['updated_at'] ?? ''),
+    ];
+  }
+
+  $out = [];
+  foreach ($activeByCharacterId as $characterId => $lockMeta) {
+    $entry = $entriesById[$characterId] ?? null;
+    if (!is_array($entry)) {
+      continue;
+    }
+    $snapshot = decode_character_snapshot_payload_array((string) ($entry['payload'] ?? ''));
+    if (!is_array($snapshot)) {
+      continue;
+    }
+    $position = is_array($snapshot['position'] ?? null) ? $snapshot['position'] : [];
+    $player = is_array($snapshot['player'] ?? null) ? $snapshot['player'] : [];
+    $character = is_array($snapshot['character'] ?? null) ? $snapshot['character'] : [];
+    $x = array_key_exists('x', $position) ? (is_numeric($position['x']) ? (int) $position['x'] : null) : null;
+    $y = array_key_exists('y', $position) ? (is_numeric($position['y']) ? (int) $position['y'] : null) : null;
+    $z = array_key_exists('depth', $position)
+      ? (is_numeric($position['depth']) ? (int) $position['depth'] : null)
+      : (array_key_exists('z', $position) && is_numeric($position['z']) ? (int) $position['z'] : null);
+    $out[] = [
+      'character_id' => $characterId,
+      'name' => (string) ($entry['name'] ?? 'Adventurer'),
+      'species_id' => (string) ($character['speciesId'] ?? $player['speciesId'] ?? ''),
+      'class_id' => (string) ($character['classId'] ?? $player['classId'] ?? ''),
+      'dungeon_instance_id' => (string) ($snapshot['dungeonInstanceId'] ?? ''),
+      'x' => $x,
+      'y' => $y,
+      'z' => $z,
+      'hp' => max(0, (int) ($player['hp'] ?? 0)),
+      'max_hp' => max(1, (int) ($player['maxHp'] ?? 1)),
+      'session_id' => (string) ($lockMeta['session_id'] ?? ''),
+      'browser_instance_id' => (string) ($lockMeta['browser_instance_id'] ?? ''),
+      'updated_at' => (string) ($lockMeta['updated_at'] ?? ''),
+    ];
+  }
+  return $out;
+}
+
 function shared_run_signature(array $entry, string $secret): string
 {
   $parts = [
@@ -2181,6 +2282,151 @@ function shared_run_public_payload(?array $entry): ?array
     'character_id' => (string) ($entry['character_id'] ?? ''),
     'character_name' => (string) ($entry['character_name'] ?? 'Adventurer'),
   ];
+}
+
+function decode_save_payload_array(string $payloadB64): ?array
+{
+  $decoded = base64_decode(trim($payloadB64), true);
+  if (!is_string($decoded) || $decoded === '') {
+    return null;
+  }
+  $parsed = json_decode($decoded, true);
+  return is_array($parsed) ? $parsed : null;
+}
+
+function encode_save_payload_array(array $payload): string
+{
+  $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+  if (!is_string($json) || $json === '') {
+    return '';
+  }
+  return base64_encode($json);
+}
+
+function shared_run_remote_actor_character_id(array $entity): string
+{
+  $kind = strtolower(trim((string) ($entity['kind'] ?? '')));
+  if ($kind !== 'actor') {
+    return '';
+  }
+  return normalize_character_profile_id((string) ($entity['remoteCharacterId'] ?? ''));
+}
+
+function merge_shared_run_remote_actors(string $incomingPayload, ?array $existingEntry, string $writerCharacterId): string
+{
+  $writerId = normalize_character_profile_id($writerCharacterId);
+  if ($writerId === '') {
+    return $incomingPayload;
+  }
+  $incoming = decode_save_payload_array($incomingPayload);
+  if (!is_array($incoming)) {
+    return $incomingPayload;
+  }
+  $existingPayload = is_array($existingEntry) ? trim((string) ($existingEntry['payload'] ?? '')) : '';
+  if ($existingPayload === '') {
+    return $incomingPayload;
+  }
+  $existing = decode_save_payload_array($existingPayload);
+  if (!is_array($existing)) {
+    return $incomingPayload;
+  }
+
+  $incomingDungeonId = trim((string) ($incoming['sharedDungeonId'] ?? $incoming['seed'] ?? ''));
+  $existingDungeonId = trim((string) ($existing['sharedDungeonId'] ?? $existing['seed'] ?? ''));
+  if ($incomingDungeonId === '' || $existingDungeonId === '' || !hash_equals($incomingDungeonId, $existingDungeonId)) {
+    return $incomingPayload;
+  }
+
+  $incomingDynamic = is_array($incoming['dynamic'] ?? null) ? array_values($incoming['dynamic']) : [];
+  $existingDynamic = is_array($existing['dynamic'] ?? null) ? array_values($existing['dynamic']) : [];
+  $preservedActors = [];
+  foreach ($existingDynamic as $entry) {
+    if (!is_array($entry)) {
+      continue;
+    }
+    $remoteCharacterId = shared_run_remote_actor_character_id($entry);
+    if ($remoteCharacterId === '' || hash_equals($remoteCharacterId, $writerId)) {
+      continue;
+    }
+    $preservedActors[(string) ($entry['id'] ?? '')] = $entry;
+  }
+  $mergedDynamic = [];
+  foreach ($incomingDynamic as $entry) {
+    if (!is_array($entry)) {
+      continue;
+    }
+    $remoteCharacterId = shared_run_remote_actor_character_id($entry);
+    if ($remoteCharacterId !== '' && !hash_equals($remoteCharacterId, $writerId)) {
+      continue;
+    }
+    $mergedDynamic[] = $entry;
+    $entryId = trim((string) ($entry['id'] ?? ''));
+    if ($entryId !== '' && isset($preservedActors[$entryId])) {
+      unset($preservedActors[$entryId]);
+    }
+  }
+  foreach ($preservedActors as $entry) {
+    $mergedDynamic[] = $entry;
+  }
+  $incoming['dynamic'] = array_values($mergedDynamic);
+
+  $incomingOverrides = is_array($incoming['entOv'] ?? null) ? array_values($incoming['entOv']) : [];
+  $existingOverrides = is_array($existing['entOv'] ?? null) ? array_values($existing['entOv']) : [];
+  $actorIdToCharacter = [];
+  foreach ($existingDynamic as $entry) {
+    if (!is_array($entry)) {
+      continue;
+    }
+    $entryId = trim((string) ($entry['id'] ?? ''));
+    $remoteCharacterId = shared_run_remote_actor_character_id($entry);
+    if ($entryId !== '' && $remoteCharacterId !== '') {
+      $actorIdToCharacter[$entryId] = $remoteCharacterId;
+    }
+  }
+  foreach ($incomingDynamic as $entry) {
+    if (!is_array($entry)) {
+      continue;
+    }
+    $entryId = trim((string) ($entry['id'] ?? ''));
+    $remoteCharacterId = shared_run_remote_actor_character_id($entry);
+    if ($entryId !== '' && $remoteCharacterId !== '') {
+      $actorIdToCharacter[$entryId] = $remoteCharacterId;
+    }
+  }
+  $preservedOverrides = [];
+  foreach ($existingOverrides as $entry) {
+    if (!is_array($entry) || count($entry) < 2) {
+      continue;
+    }
+    $entryId = trim((string) ($entry[0] ?? ''));
+    $remoteCharacterId = $actorIdToCharacter[$entryId] ?? '';
+    if ($entryId === '' || $remoteCharacterId === '' || hash_equals($remoteCharacterId, $writerId)) {
+      continue;
+    }
+    $preservedOverrides[$entryId] = $entry;
+  }
+  $mergedOverrides = [];
+  foreach ($incomingOverrides as $entry) {
+    if (!is_array($entry) || count($entry) < 2) {
+      continue;
+    }
+    $entryId = trim((string) ($entry[0] ?? ''));
+    $remoteCharacterId = $actorIdToCharacter[$entryId] ?? '';
+    if ($entryId !== '' && $remoteCharacterId !== '' && !hash_equals($remoteCharacterId, $writerId)) {
+      continue;
+    }
+    $mergedOverrides[] = $entry;
+    if ($entryId !== '' && isset($preservedOverrides[$entryId])) {
+      unset($preservedOverrides[$entryId]);
+    }
+  }
+  foreach ($preservedOverrides as $entry) {
+    $mergedOverrides[] = $entry;
+  }
+  $incoming['entOv'] = array_values($mergedOverrides);
+
+  $encoded = encode_save_payload_array($incoming);
+  return $encoded !== '' ? $encoded : $incomingPayload;
 }
 
 function decode_character_snapshot_payload_array(string $payloadB64): ?array
@@ -3438,11 +3684,13 @@ if ($apiMode === 'savegames') {
       $globalLockAudit = function_exists('authoritative_character_lock_audit_all')
         ? authoritative_character_lock_audit_all()
         : $characterLockAudit;
+      $globalCharacterStates = load_all_character_states($saveSecret);
       json_response([
         'ok' => true,
         'browser_instance_id' => $browserInstanceIdQuery,
         'runtime_settings' => $runtimeSettings,
         'active_character_locks' => array_values($globalLockAudit['active'] ?? []),
+        'active_character_states' => active_character_states_public_payload($globalCharacterStates, array_values($globalLockAudit['active'] ?? [])),
         'shared_run' => shared_run_public_payload($sharedRun),
       ]);
     }
@@ -3507,6 +3755,7 @@ if ($apiMode === 'savegames') {
     if ($characterName === '') {
       $characterName = 'Adventurer';
     }
+    $payload = merge_shared_run_remote_actors($payload, $sharedRun, $characterId);
     $sharedRun = [
       'payload' => $payload,
       'updated_at' => date('c'),
