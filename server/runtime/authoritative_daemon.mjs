@@ -26,9 +26,9 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
 let appliedMonsterConfigRaw = "";
 const SESSION_STATE_CACHE_TTL_MS = 300000;
 const SESSION_STATE_CACHE_MAX = 128;
-const AUTHORITATIVE_TICK_MS = 22;
-const AUTHORITATIVE_INPUT_WINDOW_MS = 22;
-const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 8;
+const AUTHORITATIVE_TICK_MS = 16;
+const AUTHORITATIVE_INPUT_WINDOW_MS = 16;
+const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 2;
 const AUTHORITATIVE_POLL_MAX_BATCH_CHANGED_TICKS = 1;
 const sessionStateCache = new Map();
 
@@ -167,12 +167,6 @@ function updateSessionMovementIntent(entry = null, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const seq = Math.max(0, Math.floor(Number(opts.intentSeq ?? 0) || 0));
   if (seq > 0 && seq < normalized.movementIntent.seq) {
-    const staleEnqueueDir = normalizeMoveDir(opts.enqueueDir ?? "");
-    if (staleEnqueueDir && seq > normalized.movementIntent.enqueueSeq) {
-      normalized.pendingMoves.push(staleEnqueueDir);
-      normalized.pendingMoves = normalized.pendingMoves.slice(-8);
-      normalized.movementIntent.enqueueSeq = seq;
-    }
     return normalized.movementIntent;
   }
   if (seq > 0) normalized.movementIntent.seq = seq;
@@ -207,6 +201,24 @@ function movementIntentSummary(entry = null) {
   };
 }
 
+function capturePlayerEffectProbeSignature(player = null) {
+  const effects = Array.isArray(player?.effects) ? player.effects : [];
+  if (!effects.length) return "";
+  const parts = [];
+  for (const raw of effects) {
+    if (!raw || typeof raw !== "object") continue;
+    const type = String(raw.type ?? "").trim().toLowerCase();
+    if (!type) continue;
+    const turnsLeft = Math.max(0, Math.floor(Number(raw.turnsLeft ?? 0) || 0));
+    const dmgPerTurn = Math.max(0, Math.floor(Number(raw.dmgPerTurn ?? 0) || 0));
+    const healPerTurn = Math.max(0, Math.floor(Number(raw.healPerTurn ?? 0) || 0));
+    parts.push(`${type}:${turnsLeft}:${dmgPerTurn}:${healPerTurn}`);
+  }
+  if (!parts.length) return "";
+  parts.sort();
+  return parts.join("|");
+}
+
 function capturePollStateProbe(state = null) {
   const player = (state && typeof state === "object" && state.player && typeof state.player === "object")
     ? state.player
@@ -223,6 +235,8 @@ function capturePollStateProbe(state = null) {
     z: Math.floor(Number(player.z ?? 0)),
     hp: Math.max(0, Math.floor(Number(player.hp ?? 0))),
     energy: Math.max(0, Math.floor(Number(player.energy ?? 0))),
+    abilityCd: Math.max(0, Math.floor(Number(player.abilityCd ?? 0))),
+    effectsSig: capturePlayerEffectProbeSignature(player),
     dead: !!player.dead,
     logLen: log.length,
     eventLen: events.length,
@@ -242,6 +256,8 @@ function pollStateProbeChanged(before = null, after = null) {
     || a.z !== b.z
     || a.hp !== b.hp
     || a.energy !== b.energy
+    || a.abilityCd !== b.abilityCd
+    || a.effectsSig !== b.effectsSig
     || a.dead !== b.dead
     || a.logLen !== b.logLen
     || a.eventLen !== b.eventLen

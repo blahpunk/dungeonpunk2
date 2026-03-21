@@ -221,7 +221,7 @@ const FEATURE_FLAGS = Object.freeze({
   liveTickCombat: true,
 });
 const LIVE_SIM_SCHEMA_VERSION = 1;
-const LIVE_SIM_DEFAULT_TICK_MS = 22;
+const LIVE_SIM_DEFAULT_TICK_MS = 16;
 const LIVE_SIM_TICKS_PER_LEGACY_TURN = 10;
 const LIVE_SIM_MAX_EVENT_HISTORY = 48;
 const LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS = 3;
@@ -1803,17 +1803,17 @@ const authoritativeMirror = createServerMirror();
 const authoritativePendingAction = createPendingActionState();
 let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
-const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
-const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 3;
-const AUTHORITATIVE_MOVE_BATCH_MAX = 3;
+const AUTHORITATIVE_COMMAND_QUEUE_MAX = 10;
+const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 4;
+const AUTHORITATIVE_MOVE_BATCH_MAX = 2;
 const authoritativeCommandQueue = [];
 const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 40;
-const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 22;
+const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 16;
 const AUTHORITATIVE_CLIENT_TICK_MS_MIN = 16;
 const AUTHORITATIVE_CLIENT_TICK_MS_MAX = 100;
 const AUTHORITATIVE_CLIENT_PREDICTION_ENABLED = true;
-const AUTHORITATIVE_ATTACK_PREDICTION_ENABLED = true;
-const AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD = 3;
+const AUTHORITATIVE_ATTACK_PREDICTION_ENABLED = false;
+const AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD = 1;
 const AUTHORITATIVE_PAYLOAD_DIFF_FORMAT = "save_payload_delta_v1";
 const AUTHORITATIVE_PAYLOAD_DIFF_MAX_OPS = 1600;
 const AUTHORITATIVE_PAYLOAD_DIFF_MAX_BYTES = 120000;
@@ -1852,9 +1852,9 @@ const authoritativeSessionRuntime = {
   lastTouchAt: 0,
 };
 const AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS = 25000;
-const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 50;
+const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 35;
 const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MAX_MS = 2000;
-const AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS = 8;
+const AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS = 2;
 const AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED = true;
 const authoritativeMovementChannelRuntime = {
   pollInFlight: false,
@@ -1862,6 +1862,8 @@ const authoritativeMovementChannelRuntime = {
   sessionId: "",
   lastErrorAt: 0,
   intentSeq: 0,
+  lastSentIntentSeq: 0,
+  lastAckedIntentSeq: 0,
   abortController: null,
   disabled: !AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED,
   disableReason: AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED ? "" : "client-disabled",
@@ -1888,6 +1890,7 @@ const authoritativePredictionRuntime = {
 };
 const authoritativeMoveTelemetryRuntime = {
   pendingBySeq: new Map(),
+  pendingStreamMoves: [],
   totals: {
     sent: 0,
     acked: 0,
@@ -1897,6 +1900,20 @@ const authoritativeMoveTelemetryRuntime = {
     totalRttMs: 0,
     totalInputToVisualMs: 0,
     totalInputToAckMs: 0,
+  },
+  samples: {
+    inputToPredictedMs: [],
+    inputToSendMs: [],
+    inputToAckMs: [],
+    inputToVisualCompleteMs: [],
+    correctionDistance: [],
+  },
+  queueDepthHistogram: {},
+  streamMode: {
+    current: AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED ? "stream" : "fallback",
+    changedAt: Date.now(),
+    streamMs: 0,
+    fallbackMs: 0,
   },
   last: null,
 };
@@ -2063,6 +2080,7 @@ function isAuthoritativeMovementStreamAvailable() {
 function noteAuthoritativeMovementStreamCompatibilityFallback() {
   if (authoritativeMovementStreamCompatibilityWarned) return;
   authoritativeMovementStreamCompatibilityWarned = true;
+  noteAuthoritativeMovementStreamMode("fallback");
   if (!game?.log) return;
   if (authoritativeMovementChannelRuntime.disableReason === "client-disabled") return;
   pushLog(game, "Movement stream unavailable in this tab; using compatibility movement mode.");
@@ -2088,9 +2106,18 @@ function shouldDisableAuthoritativeMovementStream(err) {
 function disableAuthoritativeMovementStream(reason = "", err = null) {
   if (authoritativeMovementChannelRuntime.disabled) return;
   authoritativeMovementChannelRuntime.disabled = true;
-  authoritativeMovementChannelRuntime.disableReason = String(reason ?? "").trim();
+  const disableReason = String(reason ?? "").trim();
+  authoritativeMovementChannelRuntime.disableReason = disableReason;
+  noteAuthoritativeMovementStreamMode("fallback");
   stopAuthoritativeMovementPollLoop();
+  const hadPendingPrediction = authoritativeMoveTelemetryRuntime.pendingStreamMoves.length > 0;
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves.length = 0;
+  authoritativePredictionRuntime.inFlightMovePredicted = false;
+  authoritativeTickRuntime.nextMoveAt = 0;
   noteAuthoritativeMovementStreamCompatibilityFallback();
+  if (hadPendingPrediction && disableReason === "poll-error" && isAuthoritativeSessionActive()) {
+    void requestAuthoritativeResync("movement-stream-disabled");
+  }
   if (!game?.log || !err) return;
   const message = authoritativeErrorMessage(err, "Movement stream unavailable.");
   pushLog(game, `${message} Falling back to compatibility movement.`);
@@ -2131,6 +2158,7 @@ function resetAuthoritativePredictionRuntime(sessionId = "") {
   authoritativePredictionRuntime.lastAppliedAcceptedSeq = 0;
   authoritativePredictionRuntime.lastAppliedServerRevision = 0;
   authoritativePredictionRuntime.lastSessionId = String(sessionId ?? "").trim();
+  authoritativeMovementChannelRuntime.lastAckedIntentSeq = 0;
   clearAuthoritativeMoveTelemetry();
 }
 
@@ -2138,6 +2166,7 @@ function clearAuthoritativeCommandQueue() {
   authoritativeCommandQueue.length = 0;
   authoritativePredictionRuntime.inFlightMovePredicted = false;
   clearQueuedAuthoritativeMovePreview();
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves.length = 0;
 }
 
 function pruneAuthoritativeCommandQueue(predicate) {
@@ -2173,6 +2202,30 @@ function isAuthoritativeMoveCommand(command) {
   return String(command?.type ?? "").trim().toUpperCase() === "MOVE";
 }
 
+function authoritativeQueueEvictionIndex(preferredMovementSource = "") {
+  const preferredSource = String(preferredMovementSource ?? "").trim();
+  let index = authoritativeCommandQueue.findIndex((entry) => {
+    if (!entry || typeof entry !== "object" || entry.predicted === true) return false;
+    return !isAuthoritativeMoveCommand(entry.command);
+  });
+  if (index >= 0) return index;
+  if (preferredSource) {
+    index = authoritativeCommandQueue.findIndex((entry) => {
+      if (!entry || typeof entry !== "object" || entry.predicted === true) return false;
+      if (!isAuthoritativeMoveCommand(entry.command)) return false;
+      return String(entry?.options?.movementSource ?? "").trim() !== preferredSource;
+    });
+    if (index >= 0) return index;
+  }
+  for (let i = 0; i < (authoritativeCommandQueue.length - 1); i += 1) {
+    const entry = authoritativeCommandQueue[i];
+    if (!entry || typeof entry !== "object" || entry.predicted === true) continue;
+    if (isAuthoritativeMoveCommand(entry.command)) return i;
+  }
+  index = authoritativeCommandQueue.findIndex((entry) => entry?.predicted !== true);
+  return index >= 0 ? index : 0;
+}
+
 function enqueueAuthoritativeCommand(command, options = null) {
   if (!command || typeof command !== "object") return false;
   const opts = (options && typeof options === "object") ? options : {};
@@ -2205,8 +2258,7 @@ function enqueueAuthoritativeCommand(command, options = null) {
     }
   }
   if (authoritativeCommandQueue.length >= AUTHORITATIVE_COMMAND_QUEUE_MAX) {
-    let dropIndex = authoritativeCommandQueue.findIndex((entry) => entry?.predicted !== true);
-    if (dropIndex < 0) dropIndex = 0;
+    const dropIndex = authoritativeQueueEvictionIndex(movementSource);
     authoritativeCommandQueue.splice(dropIndex, 1);
   }
   const entry = {
@@ -2339,6 +2391,8 @@ function applyPredictedMoveToQueueEntry(entry, command, inputAt = null) {
     endX: Math.floor(Number(trace.endX ?? 0) || 0),
     endY: Math.floor(Number(trace.endY ?? 0) || 0),
     predictedAt: normalizeAuthoritativeMoveInputAt(trace.predictedAt ?? Date.now()),
+    visualMotionStartAt: normalizeAuthoritativeMoveInputAt(trace.visualMotionStartAt ?? trace.predictedAt ?? Date.now()),
+    visualMotionEndAt: normalizeAuthoritativeMoveInputAt(trace.visualMotionEndAt ?? trace.predictedAt ?? Date.now()),
   };
   return true;
 }
@@ -2399,6 +2453,7 @@ function moveDirsForAuthoritativeCommand(command = null) {
 
 function clearAuthoritativeMoveTelemetry() {
   authoritativeMoveTelemetryRuntime.pendingBySeq.clear();
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves.length = 0;
   authoritativeMoveTelemetryRuntime.totals.sent = 0;
   authoritativeMoveTelemetryRuntime.totals.acked = 0;
   authoritativeMoveTelemetryRuntime.totals.predicted = 0;
@@ -2407,7 +2462,125 @@ function clearAuthoritativeMoveTelemetry() {
   authoritativeMoveTelemetryRuntime.totals.totalRttMs = 0;
   authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs = 0;
   authoritativeMoveTelemetryRuntime.totals.totalInputToAckMs = 0;
+  authoritativeMoveTelemetryRuntime.samples.inputToPredictedMs = [];
+  authoritativeMoveTelemetryRuntime.samples.inputToSendMs = [];
+  authoritativeMoveTelemetryRuntime.samples.inputToAckMs = [];
+  authoritativeMoveTelemetryRuntime.samples.inputToVisualCompleteMs = [];
+  authoritativeMoveTelemetryRuntime.samples.correctionDistance = [];
+  authoritativeMoveTelemetryRuntime.queueDepthHistogram = {};
+  authoritativeMoveTelemetryRuntime.streamMode.current = AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED ? "stream" : "fallback";
+  authoritativeMoveTelemetryRuntime.streamMode.changedAt = Date.now();
+  authoritativeMoveTelemetryRuntime.streamMode.streamMs = 0;
+  authoritativeMoveTelemetryRuntime.streamMode.fallbackMs = 0;
   authoritativeMoveTelemetryRuntime.last = null;
+}
+
+function noteAuthoritativeMovementStreamMode(mode = "stream", atMs = Date.now()) {
+  const nextMode = String(mode ?? "").trim().toLowerCase() === "fallback" ? "fallback" : "stream";
+  const runtime = authoritativeMoveTelemetryRuntime.streamMode;
+  const nowMs = Math.max(0, Math.floor(Number(atMs) || Date.now()));
+  const previousMode = runtime.current === "fallback" ? "fallback" : "stream";
+  const deltaMs = Math.max(0, nowMs - Math.max(0, Math.floor(Number(runtime.changedAt ?? nowMs) || nowMs)));
+  if (previousMode === "fallback") runtime.fallbackMs += deltaMs;
+  else runtime.streamMs += deltaMs;
+  runtime.current = nextMode;
+  runtime.changedAt = nowMs;
+}
+
+function noteAuthoritativeMoveSample(sampleKey = "", value = null) {
+  const list = authoritativeMoveTelemetryRuntime.samples?.[sampleKey];
+  const numeric = Number(value);
+  if (!Array.isArray(list) || !Number.isFinite(numeric)) return;
+  list.push(Math.max(0, numeric));
+  if (list.length > 240) list.splice(0, list.length - 240);
+}
+
+function noteAuthoritativeMoveQueueDepth(depth = 0) {
+  const normalized = Math.max(0, Math.floor(Number(depth) || 0));
+  const bucket = normalized >= 6 ? "6+" : String(normalized);
+  authoritativeMoveTelemetryRuntime.queueDepthHistogram[bucket] =
+    Math.max(0, Math.floor(Number(authoritativeMoveTelemetryRuntime.queueDepthHistogram[bucket] ?? 0) || 0)) + 1;
+}
+
+function percentileFromSamples(values = [], fraction = 0.5) {
+  if (!Array.isArray(values) || !values.length) return 0;
+  const ordered = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (!ordered.length) return 0;
+  const clamped = Math.max(0, Math.min(1, Number(fraction) || 0));
+  const index = Math.min(ordered.length - 1, Math.max(0, Math.ceil(ordered.length * clamped) - 1));
+  return ordered[index];
+}
+
+function authoritativeMovementStreamModeSnapshot(atMs = Date.now()) {
+  const runtime = authoritativeMoveTelemetryRuntime.streamMode;
+  const nowMs = Math.max(0, Math.floor(Number(atMs) || Date.now()));
+  const currentMode = runtime.current === "fallback" ? "fallback" : "stream";
+  const deltaMs = Math.max(0, nowMs - Math.max(0, Math.floor(Number(runtime.changedAt ?? nowMs) || nowMs)));
+  const streamMs = runtime.streamMs + (currentMode === "stream" ? deltaMs : 0);
+  const fallbackMs = runtime.fallbackMs + (currentMode === "fallback" ? deltaMs : 0);
+  const totalMs = Math.max(1, streamMs + fallbackMs);
+  return {
+    current: currentMode,
+    streamMs,
+    fallbackMs,
+    streamPct: Math.round((streamMs / totalMs) * 1000) / 10,
+    fallbackPct: Math.round((fallbackMs / totalMs) * 1000) / 10,
+  };
+}
+
+function authoritativeMoveTelemetrySnapshot() {
+  const totals = authoritativeMoveTelemetryRuntime.totals;
+  const samples = authoritativeMoveTelemetryRuntime.samples;
+  const acked = Math.max(0, Math.floor(Number(totals.acked ?? 0) || 0));
+  const predicted = Math.max(0, Math.floor(Number(totals.predicted ?? 0) || 0));
+  const movementMode = authoritativeMovementStreamModeSnapshot();
+  return {
+    totals: {
+      sent: Math.max(0, Math.floor(Number(totals.sent ?? 0) || 0)),
+      acked,
+      predicted,
+      corrected: Math.max(0, Math.floor(Number(totals.corrected ?? 0) || 0)),
+      averageCorrectionDistance: Math.round((Number(totals.totalCorrectionDist ?? 0) / Math.max(1, acked)) * 100) / 100,
+    },
+    latency: {
+      inputToPredictedMedianMs: Math.round(percentileFromSamples(samples.inputToPredictedMs, 0.5) * 10) / 10,
+      inputToPredictedP95Ms: Math.round(percentileFromSamples(samples.inputToPredictedMs, 0.95) * 10) / 10,
+      inputToSendMedianMs: Math.round(percentileFromSamples(samples.inputToSendMs, 0.5) * 10) / 10,
+      inputToSendP95Ms: Math.round(percentileFromSamples(samples.inputToSendMs, 0.95) * 10) / 10,
+      inputToAckMedianMs: Math.round(percentileFromSamples(samples.inputToAckMs, 0.5) * 10) / 10,
+      inputToAckP95Ms: Math.round(percentileFromSamples(samples.inputToAckMs, 0.95) * 10) / 10,
+      inputToVisualCompleteMedianMs: Math.round(percentileFromSamples(samples.inputToVisualCompleteMs, 0.5) * 10) / 10,
+      inputToVisualCompleteP95Ms: Math.round(percentileFromSamples(samples.inputToVisualCompleteMs, 0.95) * 10) / 10,
+    },
+    correction: {
+      medianDistance: Math.round(percentileFromSamples(samples.correctionDistance, 0.5) * 100) / 100,
+      p95Distance: Math.round(percentileFromSamples(samples.correctionDistance, 0.95) * 100) / 100,
+    },
+    queueDepthHistogram: { ...authoritativeMoveTelemetryRuntime.queueDepthHistogram },
+    pending: {
+      commandSeq: authoritativeMoveTelemetryRuntime.pendingBySeq.size,
+      streamMoves: authoritativeMoveTelemetryRuntime.pendingStreamMoves.length,
+      predictedLead: authoritativePredictedMoveLead(),
+    },
+    movementStream: movementMode,
+    last: authoritativeMoveTelemetryRuntime.last ? { ...authoritativeMoveTelemetryRuntime.last } : null,
+  };
+}
+
+function exposeAuthoritativeMoveTelemetryReport() {
+  if (HEADLESS_RUNTIME || typeof window === "undefined") return;
+  window.dumpAuthoritativeMoveTelemetry = () => {
+    const snapshot = authoritativeMoveTelemetrySnapshot();
+    try {
+      console.groupCollapsed("Dungeonpunk movement telemetry");
+      console.log(snapshot);
+      console.groupEnd();
+    } catch {}
+    return snapshot;
+  };
 }
 
 function noteAuthoritativeMoveDispatch(clientCommandSeq = 0, command = null, options = null) {
@@ -2428,6 +2601,7 @@ function noteAuthoritativeMoveDispatch(clientCommandSeq = 0, command = null, opt
       endY: Math.floor(Number(step.endY ?? 0) || 0),
       inputAt: normalizeAuthoritativeMoveInputAt(step.inputAt ?? opts.inputAt ?? sendAt),
       predictedAt: normalizeAuthoritativeMoveInputAt(step.predictedAt ?? sendAt),
+      visualMotionEndAt: normalizeAuthoritativeMoveInputAt(step.visualMotionEndAt ?? step.predictedAt ?? sendAt),
     }));
   const inputAt = predictedSteps.length
     ? Math.min(...predictedSteps.map((step) => normalizeAuthoritativeMoveInputAt(step.inputAt)))
@@ -2445,12 +2619,135 @@ function noteAuthoritativeMoveDispatch(clientCommandSeq = 0, command = null, opt
   };
   authoritativeMoveTelemetryRuntime.pendingBySeq.set(seq, record);
   authoritativeMoveTelemetryRuntime.totals.sent += dirs.length;
+  noteAuthoritativeMoveQueueDepth(record.queueDepthAtSend);
+  noteAuthoritativeMoveSample("inputToSendMs", Math.max(0, sendAt - inputAt));
   if (predictedSteps.length) {
     authoritativeMoveTelemetryRuntime.totals.predicted += predictedSteps.length;
     for (const step of predictedSteps) {
       authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs += Math.max(0, step.predictedAt - step.inputAt);
+      noteAuthoritativeMoveSample("inputToPredictedMs", Math.max(0, step.predictedAt - step.inputAt));
+      noteAuthoritativeMoveSample("inputToVisualCompleteMs", Math.max(0, step.visualMotionEndAt - step.inputAt));
     }
   }
+}
+
+function registerAuthoritativeStreamPredictedMove(intentSeq = 0, trace = null, options = null) {
+  const seq = Math.max(0, Math.floor(Number(intentSeq) || 0));
+  const predictedTrace = (trace && typeof trace === "object") ? trace : null;
+  if (!predictedTrace) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? predictedTrace.predictedAt ?? Date.now());
+  const queuedAt = normalizeAuthoritativeMoveInputAt(opts.queuedAt ?? inputAt);
+  const predictedAt = normalizeAuthoritativeMoveInputAt(predictedTrace.predictedAt ?? Date.now());
+  const sentAt = normalizeAuthoritativeMoveInputAt(opts.sentAt ?? Date.now());
+  const visualMotionStartAt = normalizeAuthoritativeMoveInputAt(predictedTrace.visualMotionStartAt ?? predictedAt);
+  const visualMotionEndAt = normalizeAuthoritativeMoveInputAt(predictedTrace.visualMotionEndAt ?? visualMotionStartAt);
+  const queueDepthAtSend = Math.max(0, Math.floor(Number(opts.queueDepthAtSend ?? 0) || 0));
+  const record = {
+    intentSeq: seq,
+    dir: String(opts.dir ?? "").trim().toUpperCase() || String(predictedTrace.dir ?? "").trim().toUpperCase(),
+    inputAt,
+    queuedAt,
+    predictedAt,
+    sentAt,
+    visualMotionStartAt,
+    visualMotionEndAt,
+    startX: Math.floor(Number(predictedTrace.startX ?? 0) || 0),
+    startY: Math.floor(Number(predictedTrace.startY ?? 0) || 0),
+    expectedX: Math.floor(Number(predictedTrace.endX ?? 0) || 0),
+    expectedY: Math.floor(Number(predictedTrace.endY ?? 0) || 0),
+    queueDepthAtSend,
+  };
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves = authoritativeMoveTelemetryRuntime.pendingStreamMoves
+    .filter((entry) => Math.max(0, Math.floor(Number(entry?.intentSeq ?? 0) || 0)) !== seq);
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves.push(record);
+  if (authoritativeMoveTelemetryRuntime.pendingStreamMoves.length > AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD) {
+    authoritativeMoveTelemetryRuntime.pendingStreamMoves.splice(
+      0,
+      authoritativeMoveTelemetryRuntime.pendingStreamMoves.length - AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD
+    );
+  }
+  authoritativeMoveTelemetryRuntime.totals.sent += 1;
+  authoritativeMoveTelemetryRuntime.totals.predicted += 1;
+  authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs += Math.max(0, predictedAt - inputAt);
+  noteAuthoritativeMoveSample("inputToPredictedMs", Math.max(0, predictedAt - inputAt));
+  noteAuthoritativeMoveSample("inputToSendMs", Math.max(0, sentAt - inputAt));
+  noteAuthoritativeMoveSample("inputToVisualCompleteMs", Math.max(0, visualMotionEndAt - inputAt));
+  noteAuthoritativeMoveQueueDepth(queueDepthAtSend);
+  authoritativeTickRuntime.nextMoveAt = Math.max(
+    authoritativeTickRuntime.nextMoveAt,
+    predictedAt + authoritativeClientTickMs()
+  );
+  authoritativePredictionRuntime.inFlightMovePredicted = true;
+  return record;
+}
+
+function clearAuthoritativeStreamPredictedMove(intentSeq = 0) {
+  const seq = Math.max(0, Math.floor(Number(intentSeq) || 0));
+  const before = authoritativeMoveTelemetryRuntime.pendingStreamMoves.length;
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves =
+    authoritativeMoveTelemetryRuntime.pendingStreamMoves.filter((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      return Math.max(0, Math.floor(Number(entry.intentSeq ?? 0) || 0)) !== seq;
+    });
+  if (!authoritativeMoveTelemetryRuntime.pendingStreamMoves.length && authoritativePredictedQueuedMoveCount() <= 0) {
+    authoritativePredictionRuntime.inFlightMovePredicted = false;
+  }
+  return before - authoritativeMoveTelemetryRuntime.pendingStreamMoves.length;
+}
+
+function shouldSkipAuthoritativeMovementPollSnapshot(response = null) {
+  const pending = authoritativeMoveTelemetryRuntime.pendingStreamMoves;
+  if (!Array.isArray(pending) || !pending.length) return false;
+  const responseIntentSeq = Math.max(0, Math.floor(Number(response?.intent?.seq ?? 0) || 0));
+  const oldestPendingSeq = Math.max(0, Math.floor(Number(pending[0]?.intentSeq ?? 0) || 0));
+  if (!oldestPendingSeq) return false;
+  return responseIntentSeq < oldestPendingSeq;
+}
+
+function acknowledgeAuthoritativeStreamMoveTelemetry(data = null, authoritativePlayer = null) {
+  if (!Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)) return;
+  if (!authoritativeMoveTelemetryRuntime.pendingStreamMoves.length) return;
+  const responseIntentSeq = Math.max(0, Math.floor(Number(data?.intent?.seq ?? 0) || 0));
+  if (responseIntentSeq > 0) {
+    authoritativeMovementChannelRuntime.lastAckedIntentSeq = Math.max(
+      authoritativeMovementChannelRuntime.lastAckedIntentSeq,
+      responseIntentSeq
+    );
+  }
+  const nextRecord = authoritativeMoveTelemetryRuntime.pendingStreamMoves[0];
+  if (!nextRecord || typeof nextRecord !== "object") return;
+  const recordIntentSeq = Math.max(0, Math.floor(Number(nextRecord.intentSeq ?? 0) || 0));
+  if (recordIntentSeq > 0 && responseIntentSeq > 0 && responseIntentSeq < recordIntentSeq) return;
+  if (recordIntentSeq > 0 && responseIntentSeq <= 0) return;
+  authoritativeMoveTelemetryRuntime.pendingStreamMoves.shift();
+  const ackAt = Date.now();
+  const authX = Math.floor(Number(authoritativePlayer?.x ?? 0) || 0);
+  const authY = Math.floor(Number(authoritativePlayer?.y ?? 0) || 0);
+  const correctionDist = Math.abs(authX - Math.floor(Number(nextRecord.expectedX ?? authX))) +
+    Math.abs(authY - Math.floor(Number(nextRecord.expectedY ?? authY)));
+  const inputToAckMs = Math.max(0, ackAt - normalizeAuthoritativeMoveInputAt(nextRecord.inputAt ?? ackAt));
+  const rttMs = Math.max(0, ackAt - normalizeAuthoritativeMoveInputAt(nextRecord.sentAt ?? ackAt));
+  authoritativeMoveTelemetryRuntime.totals.acked += 1;
+  authoritativeMoveTelemetryRuntime.totals.totalRttMs += rttMs;
+  authoritativeMoveTelemetryRuntime.totals.totalInputToAckMs += inputToAckMs;
+  authoritativeMoveTelemetryRuntime.totals.totalCorrectionDist += correctionDist;
+  if (correctionDist > 0) authoritativeMoveTelemetryRuntime.totals.corrected += 1;
+  noteAuthoritativeMoveSample("inputToAckMs", inputToAckMs);
+  noteAuthoritativeMoveSample("correctionDistance", correctionDist);
+  authoritativeMoveTelemetryRuntime.last = {
+    seq: recordIntentSeq,
+    kind: "stream_move",
+    rttMs,
+    inputToAckMs,
+    correctionDist,
+    authX,
+    authY,
+    queueDepthAtSend: Math.max(0, Math.floor(Number(nextRecord.queueDepthAtSend ?? 0) || 0)),
+    tickMs: Math.max(0, Math.floor(Number(data?.tick?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())),
+    pending: authoritativeMoveTelemetryRuntime.pendingBySeq.size + authoritativeMoveTelemetryRuntime.pendingStreamMoves.length,
+    at: ackAt,
+  };
 }
 
 function acknowledgeAuthoritativeMoveTelemetry(data = null, authoritativePlayer = null) {
@@ -2480,6 +2777,8 @@ function acknowledgeAuthoritativeMoveTelemetry(data = null, authoritativePlayer 
     authoritativeMoveTelemetryRuntime.totals.totalInputToAckMs += inputToAckMs;
     authoritativeMoveTelemetryRuntime.totals.totalCorrectionDist += correctionDist;
     if (correctionDist > 0) authoritativeMoveTelemetryRuntime.totals.corrected += 1;
+    noteAuthoritativeMoveSample("inputToAckMs", inputToAckMs);
+    noteAuthoritativeMoveSample("correctionDistance", correctionDist);
     authoritativeMoveTelemetryRuntime.last = {
       seq,
       rttMs,
@@ -2489,26 +2788,32 @@ function acknowledgeAuthoritativeMoveTelemetry(data = null, authoritativePlayer 
       authY,
       queueDepthAtSend: Math.max(0, Math.floor(Number(record.queueDepthAtSend ?? 0) || 0)),
       tickMs: Math.max(0, Math.floor(Number(data?.tick?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())),
-      pending: authoritativeMoveTelemetryRuntime.pendingBySeq.size,
+      pending: authoritativeMoveTelemetryRuntime.pendingBySeq.size + authoritativeMoveTelemetryRuntime.pendingStreamMoves.length,
       at: ackAt,
     };
   }
 }
 
 function authoritativeMoveDiagnosticsLabel() {
-  const totals = authoritativeMoveTelemetryRuntime.totals;
-  const acked = Math.max(0, Math.floor(Number(totals.acked ?? 0) || 0));
-  if (acked <= 0) return "MOVE diag: collecting...";
-  const avgRtt = Math.round((Number(totals.totalRttMs ?? 0) / Math.max(1, acked)) * 10) / 10;
-  const avgInputVisual = Math.round((Number(totals.totalInputToVisualMs ?? 0) / Math.max(1, Number(totals.predicted ?? 0) || 1)) * 10) / 10;
-  const avgInputAck = Math.round((Number(totals.totalInputToAckMs ?? 0) / Math.max(1, acked)) * 10) / 10;
-  const correctionRate = Math.round((Number(totals.corrected ?? 0) / Math.max(1, acked)) * 1000) / 10;
-  const avgCorrection = Math.round((Number(totals.totalCorrectionDist ?? 0) / Math.max(1, acked)) * 100) / 100;
-  const last = authoritativeMoveTelemetryRuntime.last;
-  const tickMs = Math.max(0, Math.floor(Number(last?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs()));
-  const pending = authoritativeMoveTelemetryRuntime.pendingBySeq.size;
-  const lead = authoritativePredictedMoveLead();
-  return `MOVE diag: tick ${tickMs}ms | RTT ${avgRtt}ms | input->visual ${avgInputVisual}ms | input->ack ${avgInputAck}ms | corr ${correctionRate}% avg ${avgCorrection} | lead ${lead} | pending ${pending}`;
+  const snapshot = authoritativeMoveTelemetrySnapshot();
+  const acked = Math.max(0, Math.floor(Number(snapshot?.totals?.acked ?? 0) || 0));
+  const tickMs = Math.max(
+    0,
+    Math.floor(Number(snapshot?.last?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())
+  );
+  if (acked <= 0) {
+    return `MOVE diag: collecting... | ${snapshot?.movementStream?.current === "fallback" ? "fallback" : "stream"} ${Math.round(Number(snapshot?.movementStream?.streamPct ?? 0))}%`;
+  }
+  const correctionRate = Math.round(
+    (Math.max(0, Math.floor(Number(snapshot?.totals?.corrected ?? 0) || 0)) / Math.max(1, acked)) * 1000
+  ) / 10;
+  const pending = Math.max(
+    0,
+    Math.floor(Number(snapshot?.pending?.commandSeq ?? 0) || 0) +
+      Math.floor(Number(snapshot?.pending?.streamMoves ?? 0) || 0)
+  );
+  const lead = Math.max(0, Math.floor(Number(snapshot?.pending?.predictedLead ?? 0) || 0));
+  return `MOVE diag: ${snapshot?.movementStream?.current === "fallback" ? "fallback" : "stream"} ${Math.round(Number(snapshot?.movementStream?.streamPct ?? 0))}% | tick ${tickMs}ms | input->pred ${snapshot?.latency?.inputToPredictedMedianMs ?? 0}/${snapshot?.latency?.inputToPredictedP95Ms ?? 0}ms | input->ack ${snapshot?.latency?.inputToAckMedianMs ?? 0}/${snapshot?.latency?.inputToAckP95Ms ?? 0}ms | corr ${correctionRate}% med ${snapshot?.correction?.medianDistance ?? 0} | lead ${lead} | pending ${pending}`;
 }
 
 function scheduleAuthoritativeQueueDrain(delayMs = 0) {
@@ -2561,6 +2866,12 @@ function tryApplyImmediateAuthoritativeMovePrediction(command, trace = null) {
   if (!delta) return false;
   const p = game.player;
   if (p.dead) return false;
+  if (liveTickCombatEnabled(game)) {
+    const playerLive = ensureLiveActorState(p, "player");
+    const currentTick = Math.max(0, Math.floor(Number(currentLiveSimulationTick(game)) || 0));
+    if (playerLive.action.actionState === "windup" || playerLive.action.actionState === "executing") return false;
+    if (currentTick < Math.max(0, Math.floor(Number(playerLive.action.moveLockUntilTick ?? 0) || 0))) return false;
+  }
   const startX = Number(p.x ?? 0);
   const startY = Number(p.y ?? 0);
   const nx = p.x + delta.dx;
@@ -2583,8 +2894,17 @@ function tryApplyImmediateAuthoritativeMovePrediction(command, trace = null) {
     trace.endX = Math.floor(nx);
     trace.endY = Math.floor(ny);
     trace.predictedAt = Date.now();
+    trace.dir = String(command?.dir ?? "").trim().toUpperCase();
   }
   noteAuthoritativeVisualPlayerTarget(nx, ny, startX, startY);
+  if (trace && typeof trace === "object") {
+    trace.visualMotionStartAt = normalizeAuthoritativeMoveInputAt(
+      authoritativeVisualMotionRuntime.startAtMs ?? trace.predictedAt ?? Date.now()
+    );
+    trace.visualMotionEndAt = normalizeAuthoritativeMoveInputAt(
+      trace.visualMotionStartAt + Math.max(0, Math.floor(Number(authoritativeVisualMotionRuntime.durationMs ?? 0) || 0))
+    );
+  }
   computeVisibility(game);
   hydrateNearby(game);
   updateContextActionButton(game);
@@ -2630,6 +2950,7 @@ function drainAuthoritativeCommandQueue() {
     if (nextType === "MOVE") {
       const dirs = [];
       const firstDir = String(next.command.dir ?? "").trim().toUpperCase();
+      const firstSource = String(next?.options?.movementSource ?? "").trim();
       if (firstDir === "N" || firstDir === "S" || firstDir === "E" || firstDir === "W") {
         dirs.push(firstDir);
       }
@@ -2638,6 +2959,8 @@ function drainAuthoritativeCommandQueue() {
         if (!peek?.command || typeof peek.command !== "object") break;
         const peekType = String(peek.command.type ?? "").trim().toUpperCase();
         if (peekType !== "MOVE") break;
+        const peekSource = String(peek?.options?.movementSource ?? "").trim();
+        if (peekSource !== firstSource) break;
         const shifted = authoritativeCommandQueue.shift();
         if (shifted && typeof shifted === "object") consumedEntries.push(shifted);
         const peekDir = String(peek.command.dir ?? "").trim().toUpperCase();
@@ -2667,6 +2990,7 @@ function drainAuthoritativeCommandQueue() {
         endX: Math.floor(Number(consumed.predictedTrace.endX ?? 0) || 0),
         endY: Math.floor(Number(consumed.predictedTrace.endY ?? 0) || 0),
         predictedAt: normalizeAuthoritativeMoveInputAt(consumed.predictedTrace.predictedAt ?? Date.now()),
+        visualMotionEndAt: normalizeAuthoritativeMoveInputAt(consumed.predictedTrace.visualMotionEndAt ?? consumed.predictedTrace.predictedAt ?? Date.now()),
         inputAt: normalizeAuthoritativeMoveInputAt(consumed.predictedInputAt ?? consumed.options?.inputAt ?? Date.now()),
       });
     }
@@ -2688,6 +3012,7 @@ function drainAuthoritativeCommandQueue() {
             endX: Math.floor(Number(trace.endX ?? 0) || 0),
             endY: Math.floor(Number(trace.endY ?? 0) || 0),
             predictedAt: normalizeAuthoritativeMoveInputAt(trace.predictedAt ?? Date.now()),
+            visualMotionEndAt: normalizeAuthoritativeMoveInputAt(trace.visualMotionEndAt ?? trace.predictedAt ?? Date.now()),
             inputAt: normalizeAuthoritativeMoveInputAt(next?.options?.inputAt ?? Date.now()),
           });
         }
@@ -2830,6 +3155,7 @@ function applyAuthoritativeSnapshotToGame(response, options = null) {
   noteAuthoritativeTickFromResponse(data);
   if (!activateLoadedGameState(nextState, reason)) return false;
   acknowledgeAuthoritativeMoveTelemetry(data, game?.player ?? null);
+  acknowledgeAuthoritativeStreamMoveTelemetry(data, game?.player ?? null);
   replayQueuedAuthoritativeMovePredictions();
   updateDebugQuickSwitchStatus(game);
   if (Array.isArray(data?.saves)) saveMenuUi.saves = data.saves;
@@ -2924,6 +3250,7 @@ async function performAuthoritativeCommand(command, options = null) {
           endX: Math.floor(Number(trace.endX ?? 0) || 0),
           endY: Math.floor(Number(trace.endY ?? 0) || 0),
           predictedAt: normalizeAuthoritativeMoveInputAt(trace.predictedAt ?? Date.now()),
+          visualMotionEndAt: normalizeAuthoritativeMoveInputAt(trace.visualMotionEndAt ?? trace.predictedAt ?? Date.now()),
           inputAt: normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now()),
         };
         dispatchPredictedSteps.push(directPredictedStep);
@@ -2940,7 +3267,7 @@ async function performAuthoritativeCommand(command, options = null) {
   }
   if (commandType === "ATTACK" || commandType === "ACTIVATE_ABILITY") {
     const target = findMonsterForAuthoritativeCommand(game, command);
-    if (target) markCombatEvent(game, target);
+    markCombatEvent(game, target ?? null);
   }
   setAuthoritativeInputLock(true, {
     type: commandType,
@@ -2995,6 +3322,7 @@ async function performAuthoritativeCommand(command, options = null) {
               endX: directPredictedStep.endX,
               endY: directPredictedStep.endY,
               predictedAt: directPredictedStep.predictedAt,
+              visualMotionEndAt: directPredictedStep.visualMotionEndAt,
             };
           } else if (canPredictAuthoritativeMoveNow()) {
             applyPredictedMoveToQueueEntry(queuedEntry, command, opts.inputAt ?? Date.now());
@@ -3027,6 +3355,7 @@ async function performAuthoritativeCommand(command, options = null) {
                 endX: Math.floor(Number(carriedTrace.endX ?? 0) || 0),
                 endY: Math.floor(Number(carriedTrace.endY ?? 0) || 0),
                 predictedAt: normalizeAuthoritativeMoveInputAt(carriedTrace.predictedAt ?? Date.now()),
+                visualMotionEndAt: normalizeAuthoritativeMoveInputAt(carriedTrace.visualMotionEndAt ?? carriedTrace.predictedAt ?? Date.now()),
               };
             }
             carriedPrediction = false;
@@ -3101,6 +3430,7 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
         minResponseMs: AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS,
         signal: controller?.signal,
       });
+      noteAuthoritativeMovementStreamMode("stream");
       if (
         authoritativeMovementChannelRuntime.stopRequested ||
         !isAuthoritativeSessionActive() ||
@@ -3109,6 +3439,11 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
         break;
       }
       if (response?.changed && response?.snapshot) {
+        if (shouldSkipAuthoritativeMovementPollSnapshot(response)) {
+          noteAuthoritativeTickFromResponse(response);
+          retryCount = 0;
+          continue;
+        }
         applyAuthoritativeSnapshotToGame(response, {
           markDirty: !!response?.ok,
           dirtyReason: "move-stream",
@@ -14705,7 +15040,8 @@ function drawMinimap(state) {
 }
 
 // ---------- Effects tick ----------
-function applyEffectsTick(state) {
+function applyEffectsTick(state, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
   const p = state.player;
   p.effects = ensureArray(p?.effects);
   if (p.poisonImmune) {
@@ -14735,6 +15071,7 @@ function applyEffectsTick(state) {
   if (p.hp <= 0 && !p.dead) killPlayer(state, { cause: "poison", killerType: "poison" });
 
   recalcDerivedStats(state);
+  if (opts.skipUi === true) return;
   renderEquipment(state);
   renderEffects(state);
 }
@@ -15780,14 +16117,45 @@ function submitAuthoritativeMovementInput(dx = 0, dy = 0, options = null) {
     noteAuthoritativeMovementStreamCompatibilityFallback();
     return performAuthoritativeCommand(moveCommand(dx, dy), opts);
   }
+  const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now());
+  const intentSeq = nextAuthoritativeMovementIntentSeq();
+  const predictedStep = tryPredictAuthoritativeMovementStreamStep(enqueueDir, {
+    intentSeq,
+    inputAt,
+    queuedAt: inputAt,
+    sentAt: Date.now(),
+    queueDepthAtSend: 0,
+  });
   return Promise.resolve(syncAuthoritativeMovementControl({
     enqueueDir,
+    intentSeq,
     movementSource: String(opts.movementSource ?? "").trim(),
-    inputAt: normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now()),
+    inputAt,
   })).then((ok) => {
     if (ok) return true;
     if (!isAuthoritativeMovementStreamAvailable()) {
-      return performAuthoritativeCommand(moveCommand(dx, dy), opts);
+      if (predictedStep?.intentSeq) clearAuthoritativeStreamPredictedMove(predictedStep.intentSeq);
+      return performAuthoritativeCommand(moveCommand(dx, dy), {
+        ...opts,
+        inputAt,
+        predictionAlreadyApplied: predictedStep?.predicted === true,
+        predictedSteps: predictedStep?.trace
+          ? [{
+              dir: enqueueDir,
+              startX: Math.floor(Number(predictedStep.trace.startX ?? 0) || 0),
+              startY: Math.floor(Number(predictedStep.trace.startY ?? 0) || 0),
+              endX: Math.floor(Number(predictedStep.trace.endX ?? 0) || 0),
+              endY: Math.floor(Number(predictedStep.trace.endY ?? 0) || 0),
+              predictedAt: normalizeAuthoritativeMoveInputAt(predictedStep.trace.predictedAt ?? inputAt),
+              visualMotionEndAt: normalizeAuthoritativeMoveInputAt(predictedStep.trace.visualMotionEndAt ?? predictedStep.trace.predictedAt ?? inputAt),
+              inputAt,
+            }]
+          : [],
+      });
+    }
+    if (predictedStep?.predicted === true) {
+      if (predictedStep?.intentSeq) clearAuthoritativeStreamPredictedMove(predictedStep.intentSeq);
+      void requestAuthoritativeResync("movement-intent-sync-failed");
     }
     return false;
   });
@@ -20833,11 +21201,7 @@ function draw(state) {
         if (mk) {
           const ent = state.entities.get(mk);
           const visualEntity = (isAuthoritativeSessionActive() && ent?.id)
-            ? (() => {
-                const tickMs = authoritativeClientTickMs();
-                noteEntityVisualTarget(ent.id, ent.x, ent.y, nowMs, tickMs);
-                return resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs);
-              })()
+            ? resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs)
             : { x: ent?.x ?? wx, y: ent?.y ?? wy };
           const monsterDrawSx = Number(visualEntity.x ?? wx) - player.x + viewRadiusX;
           const monsterDrawSy = Number(visualEntity.y ?? wy) - player.y + viewRadiusY;
@@ -20876,11 +21240,7 @@ function draw(state) {
         if (ak) {
           const ent = state.entities.get(ak);
           const visualEntity = (isAuthoritativeSessionActive() && ent?.id)
-            ? (() => {
-                const tickMs = authoritativeClientTickMs();
-                noteEntityVisualTarget(ent.id, ent.x, ent.y, nowMs, tickMs);
-                return resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs);
-              })()
+            ? resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs)
             : { x: ent?.x ?? wx, y: ent?.y ?? wy };
           const actorDrawSx = Number(visualEntity.x ?? wx) - player.x + viewRadiusX;
           const actorDrawSy = Number(visualEntity.y ?? wy) - player.y + viewRadiusY;
@@ -21360,6 +21720,7 @@ function releaseKeyboardMovementHold(source = "", code = "") {
 function clearHeldKeyboardMovement() {
   keyboardMovementHolds.clear();
   authoritativeMovementIntentBySource.clear();
+  authoritativeTickRuntime.nextMoveAt = 0;
   if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
     void syncAuthoritativeMovementControl();
   }
@@ -21408,6 +21769,35 @@ function resolvePreferredAuthoritativeMovementIntent() {
   };
 }
 
+function tryPredictAuthoritativeMovementStreamStep(dir = "", options = null) {
+  if (!AUTHORITATIVE_CLIENT_PREDICTION_ENABLED) return null;
+  if (!isAuthoritativeSessionActive()) return null;
+  if (!isAuthoritativeMovementStreamAvailable()) return null;
+  if (!canPredictAuthoritativeMoveNow()) return null;
+  const normalizedDir = String(dir ?? "").trim().toUpperCase();
+  if (normalizedDir !== "N" && normalizedDir !== "S" && normalizedDir !== "E" && normalizedDir !== "W") return null;
+  const moveCommandPayload = { type: "MOVE", dir: normalizedDir };
+  if (shouldDropAuthoritativeCommand(moveCommandPayload, { suppressWallLog: true })) return null;
+  const trace = { dir: normalizedDir };
+  const predicted = tryApplyImmediateAuthoritativeMovePrediction(moveCommandPayload, trace);
+  if (!predicted) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const intentSeq = Math.max(0, Math.floor(Number(opts.intentSeq ?? authoritativeMovementChannelRuntime.lastSentIntentSeq ?? 0) || 0));
+  const record = registerAuthoritativeStreamPredictedMove(intentSeq, trace, {
+    dir: normalizedDir,
+    inputAt: opts.inputAt ?? Date.now(),
+    queuedAt: opts.queuedAt ?? opts.inputAt ?? Date.now(),
+    sentAt: opts.sentAt ?? Date.now(),
+    queueDepthAtSend: opts.queueDepthAtSend ?? 0,
+  });
+  return {
+    predicted: true,
+    record,
+    trace,
+    intentSeq,
+  };
+}
+
 async function syncAuthoritativeMovementControl(options = null) {
   if (!isAuthoritativeSessionActive()) return false;
   if (!isAuthoritativeMovementStreamAvailable()) {
@@ -21421,14 +21811,28 @@ async function syncAuthoritativeMovementControl(options = null) {
   const enqueueDir = String(opts.enqueueDir ?? "").trim().toUpperCase();
   const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
   if (!sessionId) return false;
+  const intentSeq = Math.max(0, Math.floor(Number(opts.intentSeq ?? 0) || 0)) || nextAuthoritativeMovementIntentSeq();
+  authoritativeMovementChannelRuntime.lastSentIntentSeq = Math.max(
+    authoritativeMovementChannelRuntime.lastSentIntentSeq,
+    intentSeq
+  );
+  noteAuthoritativeMovementStreamMode("stream");
   try {
-    await authoritativeApi.setMovementIntent({
+    const response = await authoritativeApi.setMovementIntent({
       sessionId,
       holdDir,
       active,
       enqueueDir,
-      intentSeq: nextAuthoritativeMovementIntentSeq(),
+      intentSeq,
     });
+    const responseIntentSeq = Math.max(0, Math.floor(Number(response?.intent?.seq ?? 0) || 0));
+    if (responseIntentSeq > 0) {
+      authoritativeMovementChannelRuntime.lastAckedIntentSeq = Math.max(
+        authoritativeMovementChannelRuntime.lastAckedIntentSeq,
+        responseIntentSeq
+      );
+    }
+    noteAuthoritativeMovementStreamMode("stream");
     return true;
   } catch (err) {
     if (shouldDisableAuthoritativeMovementStream(err)) {
@@ -21446,7 +21850,24 @@ async function syncAuthoritativeMovementControl(options = null) {
 }
 
 function pumpAuthoritativeMovementIntent() {
-  return false;
+  if (!AUTHORITATIVE_CLIENT_PREDICTION_ENABLED) return false;
+  if (!isAuthoritativeSessionActive()) return false;
+  if (!isAuthoritativeMovementStreamAvailable()) return false;
+  if (!game?.player || game.player.dead) return false;
+  if (Date.now() < Math.max(0, Math.floor(Number(authoritativeTickRuntime.nextMoveAt ?? 0) || 0))) return false;
+  const selected = resolvePreferredAuthoritativeMovementIntent();
+  if (!selected) return false;
+  const holdDir = authoritativeMoveDirFromDelta(selected.dx, selected.dy);
+  if (!holdDir) return false;
+  const intentSeq = Math.max(0, Math.floor(Number(authoritativeMovementChannelRuntime.lastSentIntentSeq ?? 0) || 0));
+  if (!intentSeq) return false;
+  return !!tryPredictAuthoritativeMovementStreamStep(holdDir, {
+    intentSeq,
+    inputAt: Date.now(),
+    queuedAt: Date.now(),
+    sentAt: Date.now(),
+    queueDepthAtSend: 0,
+  });
 }
 
 function onKey(state, e) {
@@ -21984,10 +22405,17 @@ function normalizeLiveSimulationState(raw = null) {
     mode: enabled
       ? (String(src.mode ?? "live_tick").trim().toLowerCase() || "live_tick")
       : "legacy_turn_bridge",
-    tickMs: Math.max(10, Math.floor(Number(src.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS)),
+    tickMs: Math.max(
+      10,
+      Math.min(
+        LIVE_SIM_DEFAULT_TICK_MS,
+        Math.floor(Number(src.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS)
+      )
+    ),
     tick: Math.max(0, Math.floor(Number(src.tick ?? 0) || 0)),
     lastStepAtMs: Math.max(0, Math.floor(Number(src.lastStepAtMs ?? 0) || 0)),
     lastServerTick: Math.max(0, Math.floor(Number(src.lastServerTick ?? 0) || 0)),
+    legacyCooldownSeeded: src.legacyCooldownSeeded === true,
     stepSeq: Math.max(0, Math.floor(Number(src.stepSeq ?? 0) || 0)),
     telegraphs: normalizeLiveTelegraphEntries(src.telegraphs ?? null),
     events: normalizeLiveEventEntries(src.events ?? null),
@@ -22019,24 +22447,27 @@ function ensureLiveSimulationState(state) {
   if (live.mode === "legacy_turn_bridge") {
     live.tick = Math.max(live.tick, liveTicksFromLegacyTurns(state.turn ?? 0));
   }
-  if (state.player && typeof state.player === "object") {
-    const playerLive = ensureLiveActorState(state.player, "player");
-    playerLive.cooldowns.abilityTicks = Math.max(
-      playerLive.cooldowns.abilityTicks,
-      liveTicksFromLegacyTurns(state.player.abilityCd ?? 0)
-    );
-  }
-  for (const entity of state.entities?.values?.() ?? []) {
-    if (!entity || typeof entity !== "object") continue;
-    if (entity.kind === "monster" || entity.kind === "trap" || entity.kind === "actor") {
-      const actorLive = ensureLiveActorState(entity, entity.kind);
-      if (entity.kind === "monster") {
-        actorLive.cooldowns.abilityTicks = Math.max(
-          actorLive.cooldowns.abilityTicks,
-          liveTicksFromLegacyTurns(entity.abilityCd ?? 0)
-        );
+  if (live.legacyCooldownSeeded !== true) {
+    if (state.player && typeof state.player === "object") {
+      const playerLive = ensureLiveActorState(state.player, "player");
+      playerLive.cooldowns.abilityTicks = Math.max(
+        playerLive.cooldowns.abilityTicks,
+        liveTicksFromLegacyTurns(state.player.abilityCd ?? 0)
+      );
+    }
+    for (const entity of state.entities?.values?.() ?? []) {
+      if (!entity || typeof entity !== "object") continue;
+      if (entity.kind === "monster" || entity.kind === "trap" || entity.kind === "actor") {
+        const actorLive = ensureLiveActorState(entity, entity.kind);
+        if (entity.kind === "monster") {
+          actorLive.cooldowns.abilityTicks = Math.max(
+            actorLive.cooldowns.abilityTicks,
+            liveTicksFromLegacyTurns(entity.abilityCd ?? 0)
+          );
+        }
       }
     }
+    live.legacyCooldownSeeded = true;
   }
   return live;
 }
@@ -23233,8 +23664,8 @@ function advanceLivePlayerCombatOnTick(state, options = null) {
 function liveMonsterMoveCadenceTicks(monster = null, spec = null, ai = "") {
   const speed = Math.max(0.5, Number(monster?.spd ?? spec?.spd ?? 1) || 1);
   const rangedAi = String(ai ?? "").includes("ranged");
-  const baseTicks = rangedAi ? 5 : 4;
-  return Math.max(1, Math.min(10, Math.round(baseTicks / speed)));
+  const baseTicks = rangedAi ? 3 : 2;
+  return Math.max(1, Math.min(8, Math.round(baseTicks / speed)));
 }
 
 function initializeLiveMonsterAiState(monster = null, currentTick = 0) {
@@ -23311,10 +23742,32 @@ function tryCommitLiveMonsterMove(state, monster = null, nextPos = null, options
   const recoveryTicks = liveMonsterMoveCadenceTicks(monster, opts.spec ?? null, opts.ai ?? "");
   const actionSeq = Math.max(0, Math.floor(Number(live.stepSeq ?? 0) || 0)) + 1;
   live.stepSeq = actionSeq;
+  const prevX = Number(monster.x ?? nx);
+  const prevY = Number(monster.y ?? ny);
 
   monster.x = nx;
   monster.y = ny;
   monster.z = nz;
+  if (monster.id) {
+    const nowMs = Date.now();
+    const tickMs = (typeof authoritativeClientTickMs === "function")
+      ? authoritativeClientTickMs()
+      : LIVE_SIM_DEFAULT_TICK_MS;
+    const existingRuntime = entityVisualMotionRuntimes.get(monster.id);
+    if (!existingRuntime || existingRuntime.initialized !== true) {
+      entityVisualMotionRuntimes.set(monster.id, {
+        initialized: true,
+        fromX: Number(prevX),
+        fromY: Number(prevY),
+        toX: Number(nx),
+        toY: Number(ny),
+        startAtMs: nowMs,
+        durationMs: Math.max(18, Math.round(tickMs * 0.82)),
+      });
+    } else {
+      noteEntityVisualTarget(monster.id, nx, ny, nowMs, tickMs);
+    }
+  }
   monster.awake = true;
   clearMonsterIntent(monster);
   monsterLive.action.currentActionType = actionType;
@@ -23663,7 +24116,10 @@ function tryStepLivePlayerMovement(state, dir = "", options = null) {
   playerLive.action.actionStartTick = currentTick;
   playerLive.action.actionResolveTick = currentTick;
   playerLive.action.actionRecoveryEndTick = currentTick + recoveryTicks;
-  playerLive.action.gcdEndTick = currentTick + recoveryTicks;
+  playerLive.action.gcdEndTick = Math.max(
+    Math.max(0, Math.floor(Number(playerLive.action.gcdEndTick ?? 0) || 0)),
+    currentTick
+  );
   playerLive.action.moveLockUntilTick = currentTick + recoveryTicks;
   playerLive.action.sequence = actionSeq;
 
@@ -23680,6 +24136,21 @@ function tryStepLivePlayerMovement(state, dir = "", options = null) {
     },
   });
   return { moved: true, reason: "", recoveryTicks };
+}
+
+function isLiveLegacyTurnCadenceTick(tick = 0) {
+  const normalizedTick = Math.max(0, Math.floor(Number(tick ?? 0) || 0));
+  if (normalizedTick <= 0) return false;
+  return (normalizedTick % LIVE_SIM_TICKS_PER_LEGACY_TURN) === 0;
+}
+
+function applyLiveLegacyTurnCadenceTick(state, currentTick = 0) {
+  if (!state || typeof state !== "object") return;
+  if (!isLiveLegacyTurnCadenceTick(currentTick)) return;
+  state.turn = Math.max(0, Math.floor(Number(state.turn ?? 0) || 0)) + 1;
+  applyEffectsTick(state, { skipUi: true });
+  tickPoisonClouds(state);
+  tickMonsterEffects(state);
 }
 
 function advanceLiveSimulationOnState(state, options = null) {
@@ -23748,6 +24219,7 @@ function advanceLiveSimulationOnState(state, options = null) {
     advanceLiveMonstersMovementOnTick(state, { currentTick: live.tick });
     if (state.player.dead) break;
     advanceLivePlayerCombatOnTick(state, { currentTick: live.tick });
+    applyLiveLegacyTurnCadenceTick(state, live.tick);
     if (state.player.dead) break;
     if (oneShotMoveDir && clearMoveIntent) {
       ensureLiveActorState(state.player, "player").intent.moveDir = "";
@@ -25198,10 +25670,34 @@ function applyAuthoritativeHotDeltaToState(state, rawDelta = null) {
   for (const rawEntry of upserts) {
     const entry = cloneAuthoritativeHotEntity(rawEntry);
     if (!entry?.id) continue;
+    const prev = state.entities.get(entry.id);
     state.entities.set(entry.id, { ...entry });
     if (entry.origin === "dynamic") state.dynamic.set(entry.id, { ...entry });
     else state.dynamic.delete(entry.id);
     state.removedIds.delete(entry.id);
+    if (
+      entry.kind === "monster"
+      && entry.id
+      && prev
+      && (
+        Math.floor(Number(prev.x ?? entry.x)) !== Math.floor(Number(entry.x))
+        || Math.floor(Number(prev.y ?? entry.y)) !== Math.floor(Number(entry.y))
+      )
+    ) {
+      const nowMs = Date.now();
+      const tickMs = (typeof authoritativeClientTickMs === "function")
+        ? authoritativeClientTickMs()
+        : LIVE_SIM_DEFAULT_TICK_MS;
+      entityVisualMotionRuntimes.set(entry.id, {
+        initialized: true,
+        fromX: Number(prev.x ?? entry.x),
+        fromY: Number(prev.y ?? entry.y),
+        toX: Number(entry.x),
+        toY: Number(entry.y),
+        startAtMs: nowMs,
+        durationMs: Math.max(18, Math.round(tickMs * 0.82)),
+      });
+    }
   }
 
   const tileUpsert = Array.isArray(delta.tileUpsert) ? delta.tileUpsert : [];
@@ -26266,8 +26762,8 @@ if (!HEADLESS_RUNTIME) {
 
         // Pointer-based input handling with tap-vs-hold semantics for reliable touch
         const activePointers = new Map();
-        const initialDelay = 140; // ms before repeating starts
-        const repeatInterval = 75; // ms between repeats
+        const initialDelay = 120; // ms before repeating starts
+        const repeatInterval = 28; // ms between repeats
 
         tc.addEventListener('pointerdown', (ev) => {
           try {
@@ -26348,36 +26844,33 @@ if (!HEADLESS_RUNTIME) {
     }
 
     window.addEventListener('load', initTouchControls);
+    exposeAuthoritativeMoveTelemetryReport();
 
     let lastFrameTs = 0;
-    const targetFrameMs = 1000 / 30;
-    const targetAuthoritativeFrameMs = 1000 / 60;
     function loop(ts) {
       const now = Number.isFinite(ts)
         ? ts
         : ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
-      const frameBudgetMs = isAuthoritativeSessionActive() ? targetAuthoritativeFrameMs : targetFrameMs;
-      if (now - lastFrameTs >= frameBudgetMs) {
+      try {
+        pumpAuthoritativeMovementIntent();
+        draw(game);
+      } catch (err) {
+        showFatal(err);
         try {
-          draw(game);
-        } catch (err) {
-          showFatal(err);
-          try {
-            game = makeNewGame();
-            updateDebugMenuUi(game);
-            updateContextActionButton(game);
-            updateDeathOverlay(game);
-            renderInfoOverlay(game);
-            renderInventory(game);
-            renderEquipment(game);
-            renderEffects(game);
-            renderLog(game);
-          } catch (fallbackErr) {
-            showFatal(fallbackErr);
-          }
+          game = makeNewGame();
+          updateDebugMenuUi(game);
+          updateContextActionButton(game);
+          updateDeathOverlay(game);
+          renderInfoOverlay(game);
+          renderInventory(game);
+          renderEquipment(game);
+          renderEffects(game);
+          renderLog(game);
+        } catch (fallbackErr) {
+          showFatal(fallbackErr);
         }
-        lastFrameTs = now;
       }
+      lastFrameTs = now;
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
