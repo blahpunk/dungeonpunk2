@@ -6817,7 +6817,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
   <body
     data-can-admin-controls="<?php echo $isAdminUser ? '1' : '0'; ?>"
     data-is-authenticated="<?php echo $user !== null ? '1' : '0'; ?>"
-    data-authoritative-enabled="<?php echo $user !== null ? '1' : '0'; ?>"
+    data-authoritative-enabled="0"
     data-save-csrf="<?php echo h($saveGamesCsrf); ?>"
     data-save-max-slots="<?php echo MAX_SERVER_SAVES; ?>"
     data-character-max-slots="<?php echo MAX_SERVER_CHARACTERS; ?>"
@@ -6874,6 +6874,13 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
               <div class="debugTeleportRow">
                 <input id="debugLevelInput" type="number" min="1" step="1" inputmode="numeric" placeholder="Level" />
                 <button id="debugLevelGo" type="button">Go</button>
+              </div>
+            </div>
+            <div class="debugTeleport">
+              <label class="debugTeleportLabel" for="debugDungeonSpeedInput">Dungeon speed (ms/tick)</label>
+              <div class="debugTeleportRow">
+                <input id="debugDungeonSpeedInput" type="number" min="10" max="1000" step="1" inputmode="numeric" placeholder="28" />
+                <button id="debugDungeonSpeedGo" type="button">Set</button>
               </div>
             </div>
             <div class="debugTeleport">

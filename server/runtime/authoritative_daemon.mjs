@@ -10,6 +10,7 @@ createHeadlessBrowserEnv();
 
 const engine = await import("../../game.js");
 const socketPath = String(process.argv[2] ?? "").trim();
+const workerLogPath = path.join(path.dirname(socketPath || "."), "worker.log");
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const MONSTER_EDITOR_CONFIG_PATHS = [
   (() => {
@@ -31,9 +32,20 @@ const AUTHORITATIVE_INPUT_WINDOW_MS = 12;
 const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 2;
 const AUTHORITATIVE_POLL_MAX_BATCH_CHANGED_TICKS = 1;
 const sessionStateCache = new Map();
+const SESSION_CACHE_DIR = path.join(PROJECT_ROOT, ".runtime", "authoritative_runtime", "session_cache");
+const heartbeatTimer = setInterval(() => {
+  pruneSessionStateCache(Date.now());
+}, 15000);
 
 if (!socketPath) {
   throw new Error("Missing authoritative daemon socket path.");
+}
+
+function appendRuntimeLog(message = "") {
+  const line = `[${new Date().toISOString()}] ${String(message ?? "").trim()}\n`;
+  try {
+    fs.appendFileSync(workerLogPath, line, "utf8");
+  } catch {}
 }
 
 function normalizeSessionId(value = "") {
@@ -53,6 +65,18 @@ function normalizeOperation(value = "") {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .replace(/_+/g, "_");
+}
+
+function ensureRuntimeDirs() {
+  try {
+    fs.mkdirSync(SESSION_CACHE_DIR, { recursive: true });
+  } catch {}
+}
+
+function sessionCachePath(sessionId = "") {
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return "";
+  return path.join(SESSION_CACHE_DIR, `${sid}.json`);
 }
 
 function pruneSessionStateCache(nowMs = Date.now()) {
@@ -76,7 +100,36 @@ function getCachedSessionState(sessionId = "", worldPayload = "") {
   const key = normalizeSessionId(sessionId);
   if (!key) return null;
   pruneSessionStateCache(Date.now());
-  const entry = sessionStateCache.get(key);
+  let entry = sessionStateCache.get(key);
+  if ((!entry || typeof entry !== "object") && key) {
+    const cachePath = sessionCachePath(key);
+    if (cachePath && fs.existsSync(cachePath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+        const payload = String(parsed?.worldPayload ?? "");
+        const state = payload ? engine.headlessStateFromPayload(payload) : null;
+        if (state) {
+          entry = {
+            worldPayload: payload,
+            state,
+            lastTick: Math.max(0, Math.floor(Number(parsed?.lastTick ?? 0) || 0)),
+            updatedAt: Math.max(0, Math.floor(Number(parsed?.updatedAt ?? Date.now()) || Date.now())),
+            movementIntent: {
+              active: parsed?.movementIntent?.active === true,
+              dir: normalizeMoveDir(parsed?.movementIntent?.dir ?? ""),
+              updatedAt: Math.max(0, Math.floor(Number(parsed?.movementIntent?.updatedAt ?? 0) || 0)),
+              seq: Math.max(0, Math.floor(Number(parsed?.movementIntent?.seq ?? 0) || 0)),
+              enqueueSeq: Math.max(0, Math.floor(Number(parsed?.movementIntent?.enqueueSeq ?? 0) || 0)),
+            },
+            pendingMoves: Array.isArray(parsed?.pendingMoves)
+              ? parsed.pendingMoves.map((dir) => normalizeMoveDir(dir)).filter(Boolean).slice(-8)
+              : [],
+          };
+          sessionStateCache.set(key, entry);
+        }
+      } catch {}
+    }
+  }
   if (!entry || typeof entry !== "object") return null;
   const requestedPayload = String(worldPayload ?? "");
   if (requestedPayload.trim() !== "" && String(entry.worldPayload ?? "") !== requestedPayload) return null;
@@ -89,7 +142,7 @@ function setCachedSessionState(sessionId = "", worldPayload = "", state = null) 
   if (!key || !state) return;
   pruneSessionStateCache(Date.now());
   const prev = sessionStateCache.get(key);
-  sessionStateCache.set(key, {
+  const nextEntry = {
     worldPayload: String(worldPayload ?? ""),
     state,
     lastTick: Number.isFinite(prev?.lastTick) ? Math.max(0, Math.floor(prev.lastTick)) : 0,
@@ -110,13 +163,31 @@ function setCachedSessionState(sessionId = "", worldPayload = "", state = null) 
     pendingMoves: Array.isArray(prev?.pendingMoves)
       ? prev.pendingMoves.map((dir) => normalizeMoveDir(dir)).filter(Boolean).slice(-8)
       : [],
-  });
+  };
+  sessionStateCache.set(key, nextEntry);
+  ensureRuntimeDirs();
+  const cachePath = sessionCachePath(key);
+  if (!cachePath) return;
+  try {
+    fs.writeFileSync(cachePath, JSON.stringify({
+      worldPayload: nextEntry.worldPayload,
+      lastTick: nextEntry.lastTick,
+      updatedAt: nextEntry.updatedAt,
+      movementIntent: nextEntry.movementIntent,
+      pendingMoves: nextEntry.pendingMoves,
+    }), "utf8");
+  } catch {}
 }
 
 function clearCachedSessionState(sessionId = "") {
   const key = normalizeSessionId(sessionId);
   if (!key) return;
   sessionStateCache.delete(key);
+  const cachePath = sessionCachePath(key);
+  if (!cachePath) return;
+  try {
+    fs.unlinkSync(cachePath);
+  } catch {}
 }
 
 function sleep(ms = 0) {
@@ -664,6 +735,7 @@ async function handleOperation(raw = "") {
 }
 
 function cleanupAndExit(exitCode = 0) {
+  appendRuntimeLog(`cleanupAndExit code=${exitCode}`);
   try {
     fs.unlinkSync(socketPath);
   } catch {}
@@ -673,6 +745,7 @@ function cleanupAndExit(exitCode = 0) {
 try {
   fs.mkdirSync(path.dirname(socketPath), { recursive: true });
 } catch {}
+ensureRuntimeDirs();
 
 try {
   fs.unlinkSync(socketPath);
@@ -680,13 +753,12 @@ try {
 
 const server = net.createServer({ allowHalfOpen: true }, (socket) => {
   let raw = "";
+  let handled = false;
   socket.setEncoding("utf8");
 
-  socket.on("data", (chunk) => {
-    raw += chunk;
-  });
-
-  socket.on("end", async () => {
+  const finalize = async () => {
+    if (handled) return;
+    handled = true;
     let result;
     try {
       result = await handleOperation(raw);
@@ -694,6 +766,17 @@ const server = net.createServer({ allowHalfOpen: true }, (socket) => {
       result = fail(err?.message ?? "Unhandled authoritative daemon error.");
     }
     socket.end(JSON.stringify(result));
+  };
+
+  socket.on("data", (chunk) => {
+    raw += chunk;
+    if (!handled && raw.includes("\n")) {
+      void finalize();
+    }
+  });
+
+  socket.on("end", async () => {
+    await finalize();
   });
 
   socket.on("error", () => {
@@ -702,15 +785,31 @@ const server = net.createServer({ allowHalfOpen: true }, (socket) => {
 });
 
 server.on("error", (err) => {
+  appendRuntimeLog(`server error: ${err?.stack ?? err?.message ?? "unknown"}`);
   process.stderr.write(`${err?.message ?? "Authoritative daemon server error."}\n`);
   cleanupAndExit(1);
 });
 
 server.listen(socketPath, () => {
+  appendRuntimeLog(`listening socket=${socketPath}`);
   try {
     fs.chmodSync(socketPath, 0o660);
   } catch {}
 });
 
+process.on("beforeExit", (code) => {
+  appendRuntimeLog(`beforeExit code=${code}`);
+});
+process.on("exit", (code) => {
+  appendRuntimeLog(`exit code=${code}`);
+});
+process.on("uncaughtException", (err) => {
+  appendRuntimeLog(`uncaughtException: ${err?.stack ?? err?.message ?? "unknown"}`);
+  cleanupAndExit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  appendRuntimeLog(`unhandledRejection: ${reason?.stack ?? reason?.message ?? String(reason ?? "unknown")}`);
+  cleanupAndExit(1);
+});
 process.on("SIGINT", () => cleanupAndExit(0));
 process.on("SIGTERM", () => cleanupAndExit(0));

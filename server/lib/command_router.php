@@ -696,6 +696,26 @@ function authoritative_poll_movement(
   $sendHotDelta = is_array($resultHotDelta);
   $sendDiff = !$sendHotDelta && is_array($resultDiff);
 
+  if ($sendHotDelta) {
+    $response = [
+      'ok' => $moved,
+      'changed' => true,
+      'sessionId' => $sessionIdNorm,
+      'serverRevision' => max(0, (int) ($session['server_revision'] ?? 0)),
+      'acceptedCommandSeq' => max(0, (int) ($session['last_command_seq'] ?? 0)),
+      'tick' => $resultTick,
+      'perf' => $resultPerf,
+      'hotDelta' => $moved ? $resultHotDelta : null,
+    ];
+    if ($resultIntent !== null) {
+      $response['intent'] = $resultIntent;
+    }
+    if (!$moved) {
+      $response['error'] = trim((string) ($result['error'] ?? 'Movement blocked.'));
+    }
+    return $response;
+  }
+
   $response = authoritative_build_snapshot_response($session, $snapshot, [
     'ok' => $moved,
     'accepted_command_seq' => max(0, (int) ($session['last_command_seq'] ?? 0)),

@@ -220,8 +220,12 @@ const FEATURE_FLAGS = Object.freeze({
   classActives: true,
   liveTickCombat: true,
 });
+const FORCE_UNIFIED_LOCAL_LIVE_MODE = true;
 const LIVE_SIM_SCHEMA_VERSION = 1;
 const LIVE_SIM_DEFAULT_TICK_MS = 16;
+const LIVE_SIM_LOCAL_GUEST_TICK_MS = 28;
+const LIVE_SIM_LOCAL_TICK_MS_MIN = 10;
+const LIVE_SIM_LOCAL_TICK_MS_MAX = 1000;
 const LIVE_SIM_TICKS_PER_LEGACY_TURN = 10;
 const LIVE_SIM_MAX_EVENT_HISTORY = 48;
 const LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS = 3;
@@ -285,6 +289,7 @@ function resolveBrowserLiveTickCombatRequestMode() {
 const BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE = resolveBrowserLiveTickCombatRequestMode();
 
 function resolveLiveTickCombatRequestMode() {
+  if (FORCE_UNIFIED_LOCAL_LIVE_MODE) return true;
   const runtimeValue = parseLiveTickCombatFlagValue(globalThis.__DUNGEONPUNK_LIVE_TICK_COMBAT__);
   if (runtimeValue !== null) return runtimeValue;
   if (BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE !== null) return BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE;
@@ -294,6 +299,25 @@ function resolveLiveTickCombatRequestMode() {
 function liveTickCombatRequestedByClient() {
   return resolveLiveTickCombatRequestMode() === true;
 }
+
+function normalizeLocalDungeonTickMs(value, fallback = LIVE_SIM_LOCAL_GUEST_TICK_MS) {
+  const raw = Number(value);
+  const fallbackRaw = Number(fallback);
+  const resolved = Number.isFinite(raw) && raw > 0
+    ? raw
+    : (Number.isFinite(fallbackRaw) && fallbackRaw > 0 ? fallbackRaw : LIVE_SIM_LOCAL_GUEST_TICK_MS);
+  return Math.max(
+    LIVE_SIM_LOCAL_TICK_MS_MIN,
+    Math.min(LIVE_SIM_LOCAL_TICK_MS_MAX, Math.floor(resolved))
+  );
+}
+
+function optionalLocalDungeonTickMs(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return normalizeLocalDungeonTickMs(raw, LIVE_SIM_LOCAL_GUEST_TICK_MS);
+}
+
 const ENV_STYLE_VARIANTS = Object.freeze([
   {
     id: "carved_stone",
@@ -1787,6 +1811,8 @@ const debugDepthInputEl = document.getElementById("debugDepthInput");
 const debugDepthGoEl = document.getElementById("debugDepthGo");
 const debugLevelInputEl = document.getElementById("debugLevelInput");
 const debugLevelGoEl = document.getElementById("debugLevelGo");
+const debugDungeonSpeedInputEl = document.getElementById("debugDungeonSpeedInput");
+const debugDungeonSpeedGoEl = document.getElementById("debugDungeonSpeedGo");
 const debugClearRadiusInputEl = document.getElementById("debugClearRadiusInput");
 const debugClearGoEl = document.getElementById("debugClearGo");
 const debugRosterGoEl = document.getElementById("debugRosterGo");
@@ -1861,12 +1887,14 @@ const AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED = true;
 const AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED = false;
 const authoritativeMovementChannelRuntime = {
   pollInFlight: false,
+  intentInFlight: false,
   stopRequested: false,
   sessionId: "",
   lastErrorAt: 0,
   intentSeq: 0,
   lastSentIntentSeq: 0,
   lastAckedIntentSeq: 0,
+  queuedIntent: null,
   abortController: null,
   disabled: !AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED,
   disableReason: AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED ? "" : "client-disabled",
@@ -2220,6 +2248,7 @@ function disableAuthoritativeMovementStream(reason = "", err = null) {
 }
 
 function isAuthoritativeModeEnabled() {
+  if (FORCE_UNIFIED_LOCAL_LIVE_MODE) return false;
   return authoritativeEnabled && isAuthenticatedUser;
 }
 
@@ -3461,6 +3490,7 @@ function activateLoadedGameState(nextGame, reason = "load", options = null) {
     ?? (game?.player ? { x: Number(game.player.x ?? 0), y: Number(game.player.y ?? 0) } : null);
   const reasonKey = String(reason ?? "").trim().toLowerCase();
   const fastUiUpdate = isAuthoritativeSessionActive() && isFastAuthoritativeUiReason(reasonKey);
+  normalizeLoadedLiveTickState(nextGame);
   normalizeLoadedStateCollections(nextGame);
   game = nextGame;
   if (isAuthoritativeSessionActive()) {
@@ -3922,7 +3952,9 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
       if (authoritativeMovementChannelRuntime.abortController === controller) {
         authoritativeMovementChannelRuntime.abortController = null;
       }
-      authoritativeMovementChannelRuntime.pollInFlight = false;
+  authoritativeMovementChannelRuntime.pollInFlight = false;
+  authoritativeMovementChannelRuntime.intentInFlight = false;
+  authoritativeMovementChannelRuntime.queuedIntent = null;
     }
   }
   if (String(authoritativeMovementChannelRuntime.sessionId ?? "").trim() === sid) {
@@ -4515,6 +4547,13 @@ function updateDebugMenuUi(state) {
   if (toggleLockpickEl) toggleLockpickEl.checked = d.lockpick;
   if (debugDepthInputEl) debugDepthInputEl.value = `${state?.player?.z ?? 0}`;
   if (debugLevelInputEl) debugLevelInputEl.value = `${Math.max(1, Math.floor(state?.player?.level ?? 1))}`;
+  if (debugDungeonSpeedInputEl && document.activeElement !== debugDungeonSpeedInputEl) {
+    const tickMs = normalizeLocalDungeonTickMs(
+      state?.live?.customTickMs ?? state?.live?.tickMs ?? LIVE_SIM_LOCAL_GUEST_TICK_MS,
+      LIVE_SIM_LOCAL_GUEST_TICK_MS
+    );
+    debugDungeonSpeedInputEl.value = `${tickMs}`;
+  }
   if (debugClearRadiusInputEl) {
     const raw = Number(debugClearRadiusInputEl.value ?? "");
     if (!Number.isFinite(raw) || raw <= 0) debugClearRadiusInputEl.value = "10";
@@ -4841,6 +4880,28 @@ function setPlayerLevelDebug(state, targetLevel) {
     `Debug: level set ${prevLevel} -> ${newLevel} (XP ${p.xp}/${xpToNext(newLevel)}, HP ${p.hp}/${p.maxHp}).`
   );
   saveNow(state);
+  return true;
+}
+
+function setDungeonSpeedDebug(state, targetTickMs) {
+  if (!canUseAdminControls()) return false;
+  if (!state || !liveTickCombatEnabled(state)) return false;
+  const live = ensureLiveSimulationState(state);
+  const nextTickMs = normalizeLocalDungeonTickMs(targetTickMs, LIVE_SIM_LOCAL_GUEST_TICK_MS);
+  const prevTickMs = normalizeLocalDungeonTickMs(
+    live.customTickMs ?? live.tickMs ?? LIVE_SIM_LOCAL_GUEST_TICK_MS,
+    LIVE_SIM_LOCAL_GUEST_TICK_MS
+  );
+  live.customTickMs = nextTickMs;
+  live.tickMs = nextTickMs;
+  live.lastStepAtMs = Date.now();
+  updateDebugMenuUi(state);
+  pushLog(
+    state,
+    `Debug: dungeon speed set ${prevTickMs}ms -> ${nextTickMs}ms per tick. Lower is faster.`
+  );
+  saveResumeSnapshot(state);
+  markSaveDirty(state, "admin-dungeon-speed");
   return true;
 }
 
@@ -9382,6 +9443,7 @@ async function requestNewDungeonReset(state) {
       return true;
     }
     game = makeNewGame(randomSeedString(), { carryover });
+    normalizeLoadedLiveTickState(game);
     game.debug = priorDebug;
     enforceAdminControlPolicy(game);
     updateDebugMenuUi(game);
@@ -10070,6 +10132,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
       const profile = normalizeCharacterProfile(snapshot.character ?? { id: characterOnlyId });
       const seededRun = game ? createCharacterRunFromCurrentDungeon(game, snapshot) : null;
       if (seededRun) {
+        normalizeLoadedLiveTickState(seededRun);
         game = seededRun;
       } else {
         const carryover = {
@@ -10089,6 +10152,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
           maxHp: Math.max(1, Math.floor(snapshot?.player?.maxHp ?? maxHpForLevel(1, profile))),
         };
         game = makeNewGame(randomSeedString(), { carryover });
+        normalizeLoadedLiveTickState(game);
       }
       if (forceEntrance) {
         respawnAtStart(game);
@@ -10122,6 +10186,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   if (!payload) return false;
   const loaded = importSave(payload);
   if (!loaded) return false;
+  normalizeLoadedLiveTickState(loaded);
   game = loaded;
   const loadedCharacterId = String(loaded?.character?.id ?? "").trim();
   if (loadedCharacterId) {
@@ -10608,6 +10673,7 @@ async function loadSaveFromServer(saveId, options = null) {
     if (requireAlive && (loaded?.player?.dead || Number(loaded?.player?.hp ?? 0) <= 0)) {
       throw new Error("Autosave is from a dead state.");
     }
+    normalizeLoadedLiveTickState(loaded);
     game = loaded;
     const targetCharacterId = normalizeCharacterProfileId(loaded?.character?.id ?? "") || activeCharacterId;
     if (targetCharacterId) {
@@ -11907,6 +11973,7 @@ async function loadLatestAccountRunAfterGuestDecline() {
 }
 function activateLoadedRunStateForRespawn(loaded, reason = "respawn-autosave") {
   if (!loaded?.player || !loaded?.world) return false;
+  normalizeLoadedLiveTickState(loaded);
   game = loaded;
   applyRespawnRecoveryState(game);
   enforceAdminControlPolicy(game);
@@ -14058,7 +14125,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
   renderInventory(state);
   renderEquipment(state);
   renderEffects(state);
-  return state;
+  return normalizeLoadedLiveTickState(state);
 }
 
 // ---------- Hydration ----------
@@ -22149,6 +22216,7 @@ function shouldIgnoreGameHotkeys(e) {
 }
 
 const keyboardMovementHolds = new Map();
+const localMovementIntentBySource = new Map();
 const authoritativeMovementIntentBySource = new Map();
 const AUTHORITATIVE_MOVE_INTENT_INITIAL_DELAY_MS = 120;
 const AUTHORITATIVE_MOVE_INTENT_REPEAT_MS_MIN = 22;
@@ -22214,11 +22282,50 @@ function releaseKeyboardMovementHold(source = "", code = "") {
 
 function clearHeldKeyboardMovement() {
   keyboardMovementHolds.clear();
+  localMovementIntentBySource.clear();
   authoritativeMovementIntentBySource.clear();
   authoritativeTickRuntime.nextMoveAt = 0;
+  if (game?.player && liveTickCombatEnabled(game) && !isAuthoritativeSessionActive()) {
+    ensureLiveActorState(game.player, "player").intent.moveDir = "";
+  }
   if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
     void syncAuthoritativeMovementControl();
   }
+}
+
+function setLocalMovementIntent(source = "", dx = 0, dy = 0) {
+  const key = String(source ?? "").trim();
+  if (!key) return;
+  localMovementIntentBySource.set(key, {
+    dx: Math.trunc(Number(dx) || 0),
+    dy: Math.trunc(Number(dy) || 0),
+    updatedAt: Date.now(),
+  });
+}
+
+function clearLocalMovementIntent(source = "") {
+  const key = String(source ?? "").trim();
+  if (!key) return;
+  localMovementIntentBySource.delete(key);
+}
+
+function resolvePreferredLocalMovementIntent() {
+  let selected = null;
+  for (const entry of localMovementIntentBySource.values()) {
+    if (!entry || typeof entry !== "object") continue;
+    if (!selected || Number(entry.updatedAt ?? 0) >= Number(selected.updatedAt ?? 0)) {
+      selected = entry;
+    }
+  }
+  if (!selected) return "";
+  return normalizeCardinalDirection(deltaToCardinalDir(selected.dx, selected.dy));
+}
+
+function syncLocalLiveMovementControl(state) {
+  if (!state?.player || isAuthoritativeSessionActive() || !liveTickCombatEnabled(state)) return "";
+  const dir = resolvePreferredLocalMovementIntent();
+  ensureLiveActorState(state.player, "player").intent.moveDir = dir;
+  return dir;
 }
 
 function setAuthoritativeMovementIntent(source = "", dx = 0, dy = 0, options = null) {
@@ -22243,6 +22350,10 @@ function clearAuthoritativeMovementIntent(source = "") {
   const key = String(source ?? "").trim();
   if (!key) return;
   authoritativeMovementIntentBySource.delete(key);
+}
+
+function authoritativeMovementIntentSignature(holdDir = "", active = false, enqueueDir = "") {
+  return `${active ? "1" : "0"}|${String(holdDir ?? "").trim().toUpperCase()}|${String(enqueueDir ?? "").trim().toUpperCase()}`;
 }
 
 function resolvePreferredAuthoritativeMovementIntent() {
@@ -22278,6 +22389,22 @@ async function syncAuthoritativeMovementControl(options = null) {
   const sessionId = String(authoritativeMirror.sessionId ?? "").trim();
   if (!sessionId) return false;
   const intentSeq = Math.max(0, Math.floor(Number(opts.intentSeq ?? 0) || 0)) || nextAuthoritativeMovementIntentSeq();
+  const signature = authoritativeMovementIntentSignature(holdDir, active, enqueueDir);
+  const queuedIntent = {
+    holdDir,
+    active,
+    enqueueDir,
+    sessionId,
+    intentSeq,
+    inputAt: opts.inputAt ?? selected?.updatedAt ?? Date.now(),
+    movementSource: String(opts.movementSource ?? "").trim(),
+    signature,
+  };
+  if (authoritativeMovementChannelRuntime.intentInFlight) {
+    authoritativeMovementChannelRuntime.queuedIntent = queuedIntent;
+    return true;
+  }
+  authoritativeMovementChannelRuntime.intentInFlight = true;
   authoritativeMovementChannelRuntime.lastSentIntentSeq = Math.max(
     authoritativeMovementChannelRuntime.lastSentIntentSeq,
     intentSeq
@@ -22303,7 +22430,7 @@ async function syncAuthoritativeMovementControl(options = null) {
     if (enqueueDir) {
       noteAuthoritativeMovementIntentAckTelemetry(response, {
         intentSeq,
-        inputAt: opts.inputAt ?? selected?.updatedAt ?? Date.now(),
+        inputAt: queuedIntent.inputAt,
         responseReadyAt,
         transportMs: Math.max(0, responseReadyAt - requestStartedAt),
         responseBytes: authoritativeObservedResponseBytes(response),
@@ -22323,6 +22450,17 @@ async function syncAuthoritativeMovementControl(options = null) {
       authoritativeMovementChannelRuntime.lastErrorAt = now;
     }
     return false;
+  } finally {
+    authoritativeMovementChannelRuntime.intentInFlight = false;
+    const pending = authoritativeMovementChannelRuntime.queuedIntent;
+    authoritativeMovementChannelRuntime.queuedIntent = null;
+    if (
+      pending
+      && pending.sessionId === String(authoritativeMirror.sessionId ?? "").trim()
+      && pending.signature !== signature
+    ) {
+      void syncAuthoritativeMovementControl(pending);
+    }
   }
 }
 
@@ -22420,10 +22558,13 @@ function onKey(state, e) {
       if (e.repeat) return;
       setAuthoritativeMovementIntent(movementInput.source, movementInput.dx, movementInput.dy);
     } else if (liveTickCombatEnabled(state)) {
+      setLocalMovementIntent(movementInput.source, movementInput.dx, movementInput.dy);
+      syncLocalLiveMovementControl(state);
       if (e.repeat) return;
-      const dir = deltaToCardinalDir(movementInput.dx, movementInput.dy);
-      if (dir) {
-        runLocalLiveTickCommand(state, { type: "MOVE", dir });
+      const moveDir = deltaToCardinalDir(movementInput.dx, movementInput.dy);
+      if (moveDir) {
+        runLocalLiveTickCommand(state, { type: "MOVE", dir: moveDir });
+        syncLocalLiveMovementControl(state);
       }
       return;
     }
@@ -22912,19 +23053,15 @@ function normalizeLiveSimulationState(raw = null) {
   const enabled = requestedMode === false
     ? false
     : (src.enabled === true || requestedMode === true || FEATURE_FLAGS.liveTickCombat === true);
+  const customTickMs = optionalLocalDungeonTickMs(src.customTickMs);
   return {
     version: LIVE_SIM_SCHEMA_VERSION,
     enabled,
     mode: enabled
       ? (String(src.mode ?? "live_tick").trim().toLowerCase() || "live_tick")
       : "legacy_turn_bridge",
-    tickMs: Math.max(
-      10,
-      Math.min(
-        LIVE_SIM_DEFAULT_TICK_MS,
-        Math.floor(Number(src.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS)
-      )
-    ),
+    tickMs: normalizeLocalDungeonTickMs(src.tickMs, LIVE_SIM_DEFAULT_TICK_MS),
+    customTickMs,
     tick: Math.max(0, Math.floor(Number(src.tick ?? 0) || 0)),
     lastStepAtMs: Math.max(0, Math.floor(Number(src.lastStepAtMs ?? 0) || 0)),
     lastServerTick: Math.max(0, Math.floor(Number(src.lastServerTick ?? 0) || 0)),
@@ -23061,6 +23198,13 @@ function normalizeLoadedLiveTickState(state) {
   const live = ensureLiveSimulationState(state);
   live.enabled = true;
   live.mode = "live_tick";
+  if (!isAuthoritativeModeEnabled()) {
+    const customTickMs = optionalLocalDungeonTickMs(live.customTickMs);
+    live.customTickMs = customTickMs;
+    live.tickMs = customTickMs > 0
+      ? customTickMs
+      : normalizeLocalDungeonTickMs(LIVE_SIM_LOCAL_GUEST_TICK_MS, LIVE_SIM_LOCAL_GUEST_TICK_MS);
+  }
   if (!Number.isFinite(Number(live.lastStepAtMs ?? 0)) || Number(live.lastStepAtMs ?? 0) <= 0) {
     live.lastStepAtMs = Date.now();
   }
@@ -25839,6 +25983,10 @@ function onKeyUp(e) {
   if (!movementInput) return;
   const released = releaseKeyboardMovementHold(movementInput.source, String(e.code ?? ""));
   if (!released) return;
+  clearLocalMovementIntent(movementInput.source);
+  if (game && liveTickCombatEnabled(game) && !isAuthoritativeSessionActive()) {
+    syncLocalLiveMovementControl(game);
+  }
   clearAuthoritativeMovementIntent(movementInput.source);
   if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
     void syncAuthoritativeMovementControl();
@@ -26005,11 +26153,6 @@ function cloneAuthoritativeHotEntity(entity = null) {
       hp: Math.max(0, Math.floor(Number(entity.hp ?? 0))),
       maxHp: Math.max(1, Math.floor(Number(entity.maxHp ?? entity.hp ?? 1))),
       awake: !!entity.awake,
-      cd: Math.max(0, Math.floor(Number(entity.cd ?? 0))),
-      abilityCd: Math.max(0, Math.floor(Number(entity.abilityCd ?? 0))),
-      alertedTurn: Math.max(0, Math.floor(Number(entity.alertedTurn ?? 0))),
-      effects: normalizeMonsterEffects(entity.effects ?? []),
-      live: normalizeLiveCombatActorState(entity.live ?? null, "monster"),
     };
   }
   if (kind === "item") {
@@ -26017,14 +26160,9 @@ function cloneAuthoritativeHotEntity(entity = null) {
       ...base,
       type: normalizeItemType(entity.type),
       amount: Math.max(1, Math.floor(Number(entity.amount ?? 1))),
-      templateId: itemTemplateIdForType(entity.templateId ?? entity.type) ?? itemTemplateIdForType(entity.type) ?? entity.type,
-      instanceId: String(entity.instanceId ?? "").trim(),
-      ownerType: String(entity.ownerType ?? "world").trim() || "world",
-      ownerId: entity.ownerId === null || entity.ownerId === undefined ? null : String(entity.ownerId),
       locked: !!entity.locked,
       keyType: String(entity.keyType ?? entity.lockKeyType ?? "").trim(),
       rewardChest: !!entity.rewardChest,
-      lootDepth: Number.isFinite(Number(entity.lootDepth)) ? Math.max(0, Math.floor(Number(entity.lootDepth))) : undefined,
       lockKeyType: String(entity.lockKeyType ?? entity.keyType ?? "").trim(),
     };
   }
@@ -26039,12 +26177,6 @@ function cloneAuthoritativeHotEntity(entity = null) {
       detected: !!entity.detected,
       triggered: !!entity.triggered,
       disarmed: !!entity.disarmed,
-      charges: Math.max(1, Math.floor(Number(entity.charges ?? 1))),
-      factionId: String(entity.factionId ?? "").trim().toLowerCase(),
-      payload: (entity.payload && typeof entity.payload === "object") ? { ...entity.payload } : {},
-      friendlyTo: String(entity.friendlyTo ?? "").trim().toLowerCase(),
-      ownerId: entity.ownerId === null || entity.ownerId === undefined ? "" : String(entity.ownerId),
-      live: normalizeLiveCombatActorState(entity.live ?? null, "trap"),
     };
   }
   if (kind === "actor") {
@@ -26052,15 +26184,13 @@ function cloneAuthoritativeHotEntity(entity = null) {
       ...base,
       type: String(entity.type ?? "hero_actor").trim() || "hero_actor",
       spriteId: String(entity.spriteId ?? "hero").trim() || "hero",
-      ai: String(entity.ai ?? "none").trim() || "none",
-      live: normalizeLiveCombatActorState(entity.live ?? null, "actor"),
     };
   }
   return null;
 }
 
 function authoritativeHotDeltaRadiusTiles() {
-  return Math.max(viewRadiusX, viewRadiusY) + 6;
+  return Math.max(viewRadiusX, viewRadiusY) + 3;
 }
 
 function captureAuthoritativeHotEntities(state, z = 0, centerX = 0, centerY = 0, radiusTiles = authoritativeHotDeltaRadiusTiles()) {
@@ -26155,8 +26285,6 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
     live: {
       tick: Math.max(0, Math.floor(Number(state.live?.tick ?? 0) || 0)),
       lastServerTick: Math.max(0, Math.floor(Number(state.live?.lastServerTick ?? state.live?.tick ?? 0) || 0)),
-      telegraphs: normalizeLiveTelegraphEntries(state.live?.telegraphs ?? null),
-      events: normalizeLiveEventEntries(state.live?.events ?? null),
     },
     player: {
       x: Math.floor(Number(state.player.x ?? 0)),
@@ -26177,8 +26305,7 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
     entitiesRemove,
     tileUpsert,
     tileRemove,
-    events: Array.isArray(state.log) ? state.log.slice(Math.max(0, Math.floor(logStart ?? 0))) : [],
-    logTail: Array.isArray(state.log) ? state.log.slice(-16) : [],
+    logTail: Array.isArray(state.log) ? state.log.slice(-8) : [],
     hudTargets: normalizeCombatHudTargets(combat?.hudTargets ?? {}),
   };
 }
@@ -27031,6 +27158,31 @@ debugLevelInputEl?.addEventListener("keydown", (e) => {
   e.preventDefault();
   e.stopPropagation();
   runDebugSetLevel();
+});
+const runDebugSetDungeonSpeed = () => {
+  if (!canUseAdminControls()) return;
+  if (!game || !debugDungeonSpeedInputEl) return;
+  const raw = debugDungeonSpeedInputEl.value.trim();
+  if (!raw.length) {
+    pushLog(game, "Enter a dungeon speed value in ms per tick.");
+    return;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    pushLog(game, "Invalid dungeon speed value.");
+    return;
+  }
+  setDungeonSpeedDebug(game, parsed);
+};
+debugDungeonSpeedGoEl?.addEventListener("click", (e) => {
+  e.preventDefault();
+  runDebugSetDungeonSpeed();
+});
+debugDungeonSpeedInputEl?.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  e.stopPropagation();
+  runDebugSetDungeonSpeed();
 });
 const runDebugClearRadius = () => {
   if (!canUseAdminControls()) return;

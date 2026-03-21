@@ -120,17 +120,22 @@ function authoritative_worker_direct_command(): array
 
 function authoritative_worker_daemon_command(): string
 {
+  $node = escapeshellarg(authoritative_worker_node_binary());
+  $script = escapeshellarg(authoritative_worker_daemon_script_path());
+  $socket = escapeshellarg(authoritative_worker_socket_path());
+  $log = escapeshellarg(authoritative_worker_log_path());
   return
-    'nohup ' .
-    escapeshellarg(authoritative_worker_node_binary()) .
-    ' --experimental-default-type=module ' .
-    escapeshellarg(authoritative_worker_daemon_script_path()) .
-    ' ' .
-    escapeshellarg(authoritative_worker_socket_path()) .
-    ' < /dev/null ' .
-    ' >> ' .
-    escapeshellarg(authoritative_worker_log_path()) .
-    ' 2>&1 &';
+    'if command -v setsid >/dev/null 2>&1; then ' .
+      'setsid -f ' . $node .
+      ' --experimental-default-type=module ' . $script .
+      ' ' . $socket .
+      ' >/dev/null 2>>' . $log . '; ' .
+    'else ' .
+      'nohup ' . $node .
+      ' --experimental-default-type=module ' . $script .
+      ' ' . $socket .
+      ' < /dev/null >>' . $log . ' 2>&1 & ' .
+    'fi';
 }
 
 /**
@@ -222,81 +227,12 @@ function authoritative_worker_daemon_start(): bool
   if (!authoritative_worker_runtime_dir_ready()) {
     return false;
   }
-
-  $lockHandle = @fopen(authoritative_worker_start_lock_path(), 'c+');
-  if (!is_resource($lockHandle)) {
-    return false;
+  $probe = authoritative_worker_socket_connect(0.05);
+  if (is_resource($probe)) {
+    fclose($probe);
+    return true;
   }
-  if (!@flock($lockHandle, LOCK_EX)) {
-    @fclose($lockHandle);
-    return false;
-  }
-
-  try {
-    $currentVersion = authoritative_worker_code_version();
-    $storedVersion = authoritative_worker_stored_version();
-    $socketPath = authoritative_worker_socket_path();
-    $existingPids = authoritative_worker_daemon_pids();
-    if (count($existingPids) > 1) {
-      authoritative_worker_kill_daemons();
-      $existingPids = authoritative_worker_daemon_pids();
-    }
-    if ($currentVersion !== '' && $storedVersion !== '' && !hash_equals($storedVersion, $currentVersion)) {
-      authoritative_worker_kill_daemons();
-      @unlink($socketPath);
-      $existingPids = [];
-    }
-    $existing = authoritative_worker_socket_connect(0.1);
-    if (is_resource($existing)) {
-      fclose($existing);
-      if ($currentVersion !== '' && ($storedVersion === '' || !hash_equals($storedVersion, $currentVersion))) {
-        // Socket reachable but code changed; force daemon recycle.
-        authoritative_worker_kill_daemons();
-        @unlink($socketPath);
-        $existingPids = [];
-      } else {
-        return true;
-      }
-    }
-    if ($existingPids) {
-      $waitDeadline = microtime(true) + 1.0;
-      while (microtime(true) < $waitDeadline) {
-        usleep(100000);
-        $probe = authoritative_worker_socket_connect(0.1);
-        if (is_resource($probe)) {
-          fclose($probe);
-          authoritative_worker_store_version($currentVersion);
-          return true;
-        }
-        if (!authoritative_worker_daemon_pids()) {
-          break;
-        }
-      }
-    }
-    if (is_file($socketPath) || file_exists($socketPath)) {
-      if (!authoritative_worker_socket_connect(0.05)) {
-        authoritative_worker_kill_daemons();
-      }
-      @unlink($socketPath);
-    }
-
-    @pclose(@popen(authoritative_worker_daemon_command(), 'r'));
-
-    $deadline = microtime(true) + 3.0;
-    while (microtime(true) < $deadline) {
-      usleep(100000);
-      $probe = authoritative_worker_socket_connect(0.15);
-      if (is_resource($probe)) {
-        fclose($probe);
-        authoritative_worker_store_version($currentVersion);
-        return true;
-      }
-    }
-    return false;
-  } finally {
-    @flock($lockHandle, LOCK_UN);
-    @fclose($lockHandle);
-  }
+  return false;
 }
 
 /**
@@ -378,6 +314,10 @@ function authoritative_worker_call_direct(array $input): array
  */
 function authoritative_worker_call(array $input): array
 {
+  $viaDaemon = authoritative_worker_call_via_daemon($input);
+  if (is_array($viaDaemon)) {
+    return $viaDaemon;
+  }
   return authoritative_worker_call_direct($input);
 }
 
