@@ -46,6 +46,15 @@ function normalizeMoveDir(value = "") {
   return (dir === "N" || dir === "S" || dir === "E" || dir === "W") ? dir : "";
 }
 
+function normalizeOperation(value = "") {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+}
+
 function pruneSessionStateCache(nowMs = Date.now()) {
   for (const [key, entry] of sessionStateCache.entries()) {
     const updatedAt = Number(entry?.updatedAt ?? 0);
@@ -321,7 +330,7 @@ function refreshMonsterRuntimeConfig() {
 async function handleOperation(raw = "") {
   refreshMonsterRuntimeConfig();
   const input = raw.trim() ? JSON.parse(raw) : {};
-  const operation = String(input.operation ?? "").trim();
+  const operation = normalizeOperation(input.operation ?? "");
   const sessionId = normalizeSessionId(input.sessionId ?? input.session_id ?? "");
 
   if (operation === "bootstrap") {

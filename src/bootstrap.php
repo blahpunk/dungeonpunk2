@@ -33,9 +33,9 @@ function app_resolve_storage_root(): string
     $candidates[] = $envRoot;
   }
 
+  $candidates[] = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '.runtime';
   $candidates[] = '/var/www/blahpunk_runtime/dungeon25';
   $candidates[] = dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'blahpunk_runtime' . DIRECTORY_SEPARATOR . 'dungeon25';
-  $candidates[] = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '.runtime';
   $candidates[] = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'data'; // legacy fallback
 
   foreach ($candidates as $candidate) {

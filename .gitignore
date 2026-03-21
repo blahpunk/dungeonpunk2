@@ -118,3 +118,7 @@ secrets.*
 logs/
 clone.bat
 client/assets/sprites.txt
+
+# Project-local runtime and content data
+.runtime/
+data/

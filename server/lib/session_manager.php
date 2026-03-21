@@ -316,6 +316,32 @@ function authoritative_close_matching_browser_character_sessions(
 }
 
 /**
+ * @return array<string, mixed>|null
+ */
+function authoritative_find_browser_character_session(
+  string $userEmail,
+  string $characterId,
+  string $browserInstanceId
+): ?array {
+  $targetCharacterId = trim($characterId);
+  $targetBrowserId = authoritative_normalize_browser_instance_id($browserInstanceId);
+  if ($targetCharacterId === '' || $targetBrowserId === '') {
+    return null;
+  }
+  $now = time();
+  foreach (authoritative_list_user_sessions($userEmail, true) as $session) {
+    $sessionId = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
+    if ($sessionId === '') continue;
+    if (trim((string) ($session['character_id'] ?? '')) !== $targetCharacterId) continue;
+    if (!authoritative_session_is_recent_for_character_lock($session, $now)) continue;
+    $sessionBrowserId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
+    if ($sessionBrowserId === '' || !hash_equals($sessionBrowserId, $targetBrowserId)) continue;
+    return $session;
+  }
+  return null;
+}
+
+/**
  * @return array{ok: bool, sessionId: string, updatedAt: string}
  */
 function authoritative_touch_session(

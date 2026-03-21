@@ -281,6 +281,17 @@ function authoritative_bootstrap_context(
   $characterPayload = '';
   if ($characterId !== '' && isset($characterStates[$characterId])) {
     $characterPayload = trim((string) ($characterStates[$characterId]['payload'] ?? ''));
+    if (
+      $characterPayload !== ''
+      && $source === 'run_record'
+      && $characterId !== ''
+      && $characterId === normalize_character_profile_id((string) ($runRecord['active_character_id'] ?? ''))
+    ) {
+      // The canonical run payload already contains the latest authoritative
+      // state and position for the active character. Do not layer a potentially
+      // stale per-character snapshot on top of it during refresh/reopen.
+      $characterPayload = '';
+    }
   }
   if ($characterPayload === '' && $characterId !== '') {
     $latestForCharacter = authoritative_find_latest_save_entry($entries, $characterId);

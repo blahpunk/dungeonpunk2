@@ -24,6 +24,15 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
 let appliedMonsterConfigRaw = "";
 const AUTHORITATIVE_TICK_MS = 12;
 
+function normalizeOperation(value = "") {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+}
+
 function sleep(ms = 0) {
   const delay = Math.max(0, Math.floor(Number(ms) || 0));
   if (delay <= 0) return Promise.resolve();
@@ -89,7 +98,7 @@ async function main() {
   refreshMonsterRuntimeConfig();
   const raw = await readStdin();
   const input = raw.trim() ? JSON.parse(raw) : {};
-  const operation = String(input.operation ?? "").trim();
+  const operation = normalizeOperation(input.operation ?? "");
 
   if (operation === "bootstrap") {
     const snapshot = engine.headlessBootstrapState(input.options ?? {});

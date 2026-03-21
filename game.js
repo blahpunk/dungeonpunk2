@@ -27151,12 +27151,12 @@ if (!HEADLESS_RUNTIME) {
       }
       void autosaveIfDirty("lifecycle");
     };
-    window.addEventListener("pagehide", () => flushAutosaveLifecycle({ closeRun: true }));
+    window.addEventListener("pagehide", () => flushAutosaveLifecycle({ closeRun: false }));
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "hidden") return;
       flushAutosaveLifecycle({ closeRun: false });
     });
-    window.addEventListener("beforeunload", () => flushAutosaveLifecycle({ closeRun: true }));
+    window.addEventListener("beforeunload", () => flushAutosaveLifecycle({ closeRun: false }));
     document.addEventListener("keydown", (e) => onKey(game, e));
     document.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", () => clearHeldKeyboardMovement());

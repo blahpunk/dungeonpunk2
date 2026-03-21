@@ -63,6 +63,52 @@ function authoritative_persist_canonical_snapshot(
 }
 
 /**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $snapshot
+ */
+function authoritative_should_persist_character_snapshot_checkpoint(array $session, array $snapshot): bool
+{
+  $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
+  $x = array_key_exists('x', $summary) ? (int) $summary['x'] : null;
+  $y = array_key_exists('y', $summary) ? (int) $summary['y'] : null;
+  $z = array_key_exists('depth', $summary) ? (int) $summary['depth'] : null;
+  if (!is_int($x) || !is_int($y) || !is_int($z)) {
+    return true;
+  }
+
+  $lastX = array_key_exists('last_character_checkpoint_x', $session) ? (int) $session['last_character_checkpoint_x'] : null;
+  $lastY = array_key_exists('last_character_checkpoint_y', $session) ? (int) $session['last_character_checkpoint_y'] : null;
+  $lastZ = array_key_exists('last_character_checkpoint_z', $session) ? (int) $session['last_character_checkpoint_z'] : null;
+  $lastAtMs = max(0, (int) ($session['last_character_checkpoint_at_ms'] ?? 0));
+  $nowMs = (int) floor(microtime(true) * 1000);
+
+  if (!is_int($lastX) || !is_int($lastY) || !is_int($lastZ) || $lastAtMs <= 0) {
+    return true;
+  }
+  if ($lastZ !== $z) {
+    return true;
+  }
+  $dist = abs($x - $lastX) + abs($y - $lastY);
+  if ($dist >= 3) {
+    return true;
+  }
+  return ($nowMs - $lastAtMs) >= 750;
+}
+
+/**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $snapshot
+ */
+function authoritative_update_character_snapshot_checkpoint(array &$session, array $snapshot): void
+{
+  $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
+  $session['last_character_checkpoint_x'] = (int) ($summary['x'] ?? 0);
+  $session['last_character_checkpoint_y'] = (int) ($summary['y'] ?? 0);
+  $session['last_character_checkpoint_z'] = (int) ($summary['depth'] ?? 0);
+  $session['last_character_checkpoint_at_ms'] = (int) floor(microtime(true) * 1000);
+}
+
+/**
  * @param array<string, mixed> $options
  * @return array<string, mixed>
  */
@@ -73,6 +119,25 @@ function authoritative_open_session_for_character(
   array $options = []
 ): array {
   authoritative_release_php_session_lock();
+  $requestedCharacterId = normalize_character_profile_id($characterId);
+  $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($options['browser_instance_id'] ?? ''));
+  if ($requestedCharacterId !== '' && $browserInstanceId !== '') {
+    $existingSession = authoritative_find_browser_character_session($userEmail, $requestedCharacterId, $browserInstanceId);
+    if (is_array($existingSession)) {
+      $existingSessionId = authoritative_normalize_session_id((string) ($existingSession['session_id'] ?? ''));
+      if ($existingSessionId !== '') {
+        $loaded = authoritative_load_session_snapshot($userEmail, $existingSessionId);
+        $session = $loaded['session'];
+        $snapshot = $loaded['snapshot'];
+        if (!authoritative_persist_session($session)) {
+          throw new RuntimeException('Could not refresh authoritative session.');
+        }
+        return authoritative_build_snapshot_response($session, $snapshot, [
+          'message' => 'Authoritative session resumed.',
+        ]);
+      }
+    }
+  }
   $context = authoritative_bootstrap_context($userEmail, $saveSecret, $characterId, $options);
   $snapshotResponse = authoritative_worker_bootstrap(
     (string) ($context['world_payload'] ?? ''),
@@ -88,7 +153,6 @@ function authoritative_open_session_for_character(
   }
 
   $resolvedCharacterId = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($context['character_id'] ?? '')));
-  $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($options['browser_instance_id'] ?? ''));
   if ($resolvedCharacterId !== '') {
     authoritative_close_matching_browser_character_sessions($userEmail, $resolvedCharacterId, $browserInstanceId);
     $conflict = authoritative_find_character_session_conflict($userEmail, $resolvedCharacterId, $browserInstanceId);
@@ -103,6 +167,12 @@ function authoritative_open_session_for_character(
     $browserInstanceId
   );
   authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, (array) ($context['run_record'] ?? []));
+  try {
+    authoritative_worker_snapshot((string) ($snapshot['payload'] ?? ''), (string) ($session['session_id'] ?? ''));
+  } catch (RuntimeException $err) {
+    // Non-fatal: the canonical snapshot is already persisted, but caching the
+    // live session state here makes same-browser refresh resume exact position.
+  }
   if (!authoritative_persist_session($session)) {
     throw new RuntimeException('Could not persist authoritative session.');
   }
@@ -165,11 +235,19 @@ function authoritative_load_session_snapshot(
   $context = authoritative_load_session_run_context($userEmail, $sessionId);
   $session = $context['session'];
   $runRecord = $context['run_record'];
-  $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
-  if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
-    $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
+  $snapshotResponse = null;
+  try {
+    $snapshotResponse = authoritative_worker_snapshot('', $sessionId);
+  } catch (RuntimeException $err) {
+    $snapshotResponse = null;
   }
-  $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionId);
+  if (!is_array($snapshotResponse)) {
+    $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
+    if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
+      $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
+    }
+    $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionId);
+  }
   $snapshot = is_array($snapshotResponse['snapshot'] ?? null) ? $snapshotResponse['snapshot'] : null;
   if (!is_array($snapshot)) {
     throw new RuntimeException('Could not build authoritative snapshot.');
@@ -542,9 +620,13 @@ function authoritative_poll_movement(
   if ($moved) {
     $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
     $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
+    $persistCharacterState = authoritative_should_persist_character_snapshot_checkpoint($session, $snapshot);
     authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
-      'persist_character_state' => false,
+      'persist_character_state' => $persistCharacterState,
     ]);
+    if ($persistCharacterState) {
+      authoritative_update_character_snapshot_checkpoint($session, $snapshot);
+    }
     if (!authoritative_persist_session($session)) {
       throw new RuntimeException('Could not persist authoritative movement session.');
     }
