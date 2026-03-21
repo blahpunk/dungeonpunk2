@@ -85,9 +85,9 @@ function authoritative_character_lock_ttl_seconds(): int
   $seconds = is_string($raw) ? (int) floor((float) $raw) : 0;
   if ($seconds <= 0) {
     // Short lock window keeps stale browser crashes from blocking character switching.
-    $seconds = 120;
+    $seconds = 20;
   }
-  return max(30, min(900, $seconds));
+  return max(8, min(300, $seconds));
 }
 
 function authoritative_close_grace_seconds(): int
@@ -181,6 +181,17 @@ function authoritative_session_is_recent_for_character_lock(array $session, ?int
   }
   $now = $nowTs ?? time();
   return ($now - $lastTouchTs) <= authoritative_character_lock_ttl_seconds();
+}
+
+/**
+ * @param array<string, mixed> $session
+ */
+function authoritative_session_blocks_character_lock(array $session, ?int $nowTs = null): bool
+{
+  if (authoritative_session_is_pending_close($session)) {
+    return false;
+  }
+  return authoritative_session_is_recent_for_character_lock($session, $nowTs);
 }
 
 function authoritative_create_session(
@@ -309,6 +320,58 @@ function authoritative_list_user_sessions(string $userEmail, bool $pruneStale = 
 }
 
 /**
+ * @return array<int, array<string, mixed>>
+ */
+function authoritative_list_all_sessions(bool $pruneStale = true): array
+{
+  $dir = authoritative_session_storage_dir();
+  if (!is_dir($dir)) {
+    return [];
+  }
+  $pattern = $dir . DIRECTORY_SEPARATOR . '*.json';
+  $files = glob($pattern);
+  if (!is_array($files) || !$files) {
+    return [];
+  }
+
+  $now = time();
+  $out = [];
+  foreach ($files as $path) {
+    if (!is_string($path) || $path === '') {
+      continue;
+    }
+    $raw = authoritative_json_read_file($path, null);
+    if (!is_array($raw)) {
+      continue;
+    }
+    $sessionId = authoritative_normalize_session_id((string) ($raw['session_id'] ?? pathinfo($path, PATHINFO_FILENAME)));
+    if ($sessionId === '') {
+      continue;
+    }
+    $session = $raw;
+    $session['session_id'] = $sessionId;
+    $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0));
+    $session['last_command_seq'] = max(0, (int) ($session['last_command_seq'] ?? 0));
+    $session['character_id'] = trim((string) ($session['character_id'] ?? ''));
+    $session['browser_instance_id'] = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
+    if (!authoritative_session_is_fresh($session, $now)) {
+      if ($pruneStale) {
+        @unlink($path);
+      }
+      continue;
+    }
+    if (authoritative_session_pending_close_expired($session, $now)) {
+      if ($pruneStale) {
+        @unlink($path);
+      }
+      continue;
+    }
+    $out[] = $session;
+  }
+  return $out;
+}
+
+/**
  * @return array<string, mixed>|null
  */
 function authoritative_find_character_session_conflict(
@@ -333,7 +396,7 @@ function authoritative_find_character_session_conflict(
     if (trim((string) ($session['character_id'] ?? '')) !== $targetCharacterId) {
       continue;
     }
-    if (!authoritative_session_is_recent_for_character_lock($session, $now)) {
+    if (!authoritative_session_blocks_character_lock($session, $now)) {
       @unlink(authoritative_session_file_path($sessionId));
       continue;
     }
@@ -368,7 +431,7 @@ function authoritative_close_matching_browser_character_sessions(
     if (trim((string) ($session['character_id'] ?? '')) !== $targetCharacterId) {
       continue;
     }
-    if (!authoritative_session_is_recent_for_character_lock($session, $now)) {
+    if (!authoritative_session_blocks_character_lock($session, $now)) {
       @unlink(authoritative_session_file_path($sessionId));
       continue;
     }
@@ -398,12 +461,40 @@ function authoritative_find_browser_character_session(
     $sessionId = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
     if ($sessionId === '') continue;
     if (trim((string) ($session['character_id'] ?? '')) !== $targetCharacterId) continue;
-    if (!authoritative_session_is_recent_for_character_lock($session, $now)) continue;
+    if (!authoritative_session_blocks_character_lock($session, $now)) continue;
     $sessionBrowserId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
     if ($sessionBrowserId === '' || !hash_equals($sessionBrowserId, $targetBrowserId)) continue;
     return $session;
   }
   return null;
+}
+
+function authoritative_close_browser_sessions(
+  string $userEmail,
+  string $browserInstanceId,
+  string $excludeSessionId = ''
+): void {
+  $targetBrowserId = authoritative_normalize_browser_instance_id($browserInstanceId);
+  if ($targetBrowserId === '') {
+    return;
+  }
+  $exclude = authoritative_normalize_session_id($excludeSessionId);
+  $now = time();
+  foreach (authoritative_list_user_sessions($userEmail, true) as $session) {
+    $sessionId = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
+    if ($sessionId === '' || ($exclude !== '' && hash_equals($sessionId, $exclude))) {
+      continue;
+    }
+    if (!authoritative_session_blocks_character_lock($session, $now)) {
+      @unlink(authoritative_session_file_path($sessionId));
+      continue;
+    }
+    $sessionBrowserId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
+    if ($sessionBrowserId === '' || !hash_equals($sessionBrowserId, $targetBrowserId)) {
+      continue;
+    }
+    @unlink(authoritative_session_file_path($sessionId));
+  }
 }
 
 /**
@@ -465,7 +556,57 @@ function authoritative_character_lock_audit(string $userEmail): array
   foreach (authoritative_list_user_sessions($userEmail, true) as $session) {
     $sessionId = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
     if ($sessionId === '') continue;
-    if (!authoritative_session_is_recent_for_character_lock($session, $now)) continue;
+    if (!authoritative_session_blocks_character_lock($session, $now)) continue;
+    $characterId = trim((string) ($session['character_id'] ?? ''));
+    if ($characterId === '') continue;
+    $entry = [
+      'session_id' => $sessionId,
+      'character_id' => $characterId,
+      'browser_instance_id' => authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? '')),
+      'updated_at' => (string) ($session['updated_at'] ?? ''),
+    ];
+    $active[] = $entry;
+    if (!isset($byCharacter[$characterId]) || !is_array($byCharacter[$characterId])) {
+      $byCharacter[$characterId] = [];
+    }
+    $byCharacter[$characterId][] = $entry;
+  }
+
+  $duplicates = [];
+  foreach ($byCharacter as $characterId => $rows) {
+    if (!is_array($rows) || count($rows) <= 1) continue;
+    $browserIds = [];
+    foreach ($rows as $row) {
+      $browserIds[(string) ($row['browser_instance_id'] ?? '')] = true;
+    }
+    $duplicates[] = [
+      'character_id' => (string) $characterId,
+      'count' => count($rows),
+      'browser_count' => count($browserIds),
+      'sessions' => array_values($rows),
+    ];
+  }
+  return [
+    'active' => array_values($active),
+    'duplicates' => array_values($duplicates),
+  ];
+}
+
+/**
+ * @return array{
+ *   active: array<int, array<string, mixed>>,
+ *   duplicates: array<int, array<string, mixed>>
+ * }
+ */
+function authoritative_character_lock_audit_all(): array
+{
+  $now = time();
+  $active = [];
+  $byCharacter = [];
+  foreach (authoritative_list_all_sessions(true) as $session) {
+    $sessionId = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
+    if ($sessionId === '') continue;
+    if (!authoritative_session_blocks_character_lock($session, $now)) continue;
     $characterId = trim((string) ($session['character_id'] ?? ''));
     if ($characterId === '') continue;
     $entry = [

@@ -1330,6 +1330,42 @@ function save_signing_secret(): string
   ));
 }
 
+function shared_runtime_settings_defaults(): array
+{
+  return [
+    'dungeon_speed_ms' => 28,
+  ];
+}
+
+function shared_runtime_settings_path(): string
+{
+  return app_storage_path('runtime_settings/shared.json');
+}
+
+function shared_runtime_settings_normalize(array $raw): array
+{
+  $defaults = shared_runtime_settings_defaults();
+  $speed = max(10, min(1000, (int) floor((float) ($raw['dungeon_speed_ms'] ?? $defaults['dungeon_speed_ms']))));
+  return [
+    'dungeon_speed_ms' => $speed,
+  ];
+}
+
+function shared_runtime_settings_load(): array
+{
+  $defaults = shared_runtime_settings_defaults();
+  $raw = authoritative_json_read_file(shared_runtime_settings_path(), $defaults);
+  return shared_runtime_settings_normalize(is_array($raw) ? $raw : $defaults);
+}
+
+function shared_runtime_settings_persist(array $settings): bool
+{
+  return authoritative_json_write_file(
+    shared_runtime_settings_path(),
+    shared_runtime_settings_normalize($settings)
+  );
+}
+
 function safe_file_token(string $value): string
 {
   return hash('sha256', strtolower(trim($value)));
@@ -1348,6 +1384,11 @@ function user_character_state_file_path(string $email): string
 function user_item_authority_file_path(string $email): string
 {
   return save_storage_root() . DIRECTORY_SEPARATOR . safe_file_token($email) . '.items.json';
+}
+
+function global_shared_run_file_path(): string
+{
+  return save_storage_root() . DIRECTORY_SEPARATOR . 'global.shared-run.json';
 }
 
 /**
@@ -1388,6 +1429,22 @@ function user_character_state_file_path_candidates(string $email): array
 function user_item_authority_file_path_candidates(string $email): array
 {
   $token = safe_file_token($email) . '.items.json';
+  $paths = [];
+  foreach (save_storage_root_candidates() as $root) {
+    $candidate = $root . DIRECTORY_SEPARATOR . $token;
+    if (!in_array($candidate, $paths, true)) {
+      $paths[] = $candidate;
+    }
+  }
+  return $paths;
+}
+
+/**
+ * @return array<int, string>
+ */
+function global_shared_run_file_path_candidates(): array
+{
+  $token = 'global.shared-run.json';
   $paths = [];
   foreach (save_storage_root_candidates() as $root) {
     $candidate = $root . DIRECTORY_SEPARATOR . $token;
@@ -2011,6 +2068,224 @@ function character_states_public_meta(array $entriesById): array
   return $out;
 }
 
+function shared_run_signature(array $entry, string $secret): string
+{
+  $parts = [
+    (string) ($entry['payload'] ?? ''),
+    (string) ($entry['updated_at'] ?? ''),
+    (string) ($entry['character_id'] ?? ''),
+    (string) ($entry['character_name'] ?? ''),
+  ];
+  return hash_hmac('sha256', implode('|', $parts), $secret);
+}
+
+/**
+ * @return array{payload: string, updated_at: string, character_id: string, character_name: string, sig: string}|null
+ */
+function normalize_shared_run_entry(array $entry, string $secret): ?array
+{
+  $payload = trim((string) ($entry['payload'] ?? ''));
+  if ($payload === '' || strlen($payload) > SAVE_PAYLOAD_MAX_LEN) {
+    return null;
+  }
+  $updatedAt = trim((string) ($entry['updated_at'] ?? ''));
+  if ($updatedAt === '') {
+    $updatedAt = date('c');
+  }
+  $characterId = normalize_character_profile_id((string) ($entry['character_id'] ?? ''));
+  $characterName = trim_save_name((string) ($entry['character_name'] ?? ''));
+  if ($characterName === '') {
+    $characterName = 'Adventurer';
+  }
+  $normalized = [
+    'payload' => $payload,
+    'updated_at' => $updatedAt,
+    'character_id' => $characterId,
+    'character_name' => $characterName,
+    'sig' => '',
+  ];
+  $providedSig = trim((string) ($entry['sig'] ?? ''));
+  if ($secret !== '') {
+    $expected = shared_run_signature($normalized, $secret);
+    if ($providedSig === '' || !hash_equals($expected, $providedSig)) {
+      return null;
+    }
+    $normalized['sig'] = $expected;
+  } else {
+    $normalized['sig'] = hash('sha256', implode('|', [$payload, $updatedAt, $characterId, $characterName]));
+  }
+  return $normalized;
+}
+
+/**
+ * @return array{payload: string, updated_at: string, character_id: string, character_name: string, sig: string}|null
+ */
+function load_user_shared_run(string $email, string $secret): ?array
+{
+  $file = null;
+  $bestMtime = -1;
+  foreach (global_shared_run_file_path_candidates() as $candidate) {
+    if (!is_file($candidate)) {
+      continue;
+    }
+    $mtime = (int) (@filemtime($candidate) ?: 0);
+    if ($file === null || $mtime > $bestMtime) {
+      $file = $candidate;
+      $bestMtime = $mtime;
+    }
+  }
+  if ($file === null) {
+    return null;
+  }
+  $raw = authoritative_json_read_file($file, null);
+  if (!is_array($raw)) {
+    return null;
+  }
+  return normalize_shared_run_entry($raw, $secret);
+}
+
+/**
+ * @param array{payload: string, updated_at: string, character_id: string, character_name: string, sig?: string}|null $entry
+ */
+function persist_user_shared_run(string $email, ?array $entry, string $secret): bool
+{
+  if (!ensure_save_storage_root()) {
+    return false;
+  }
+  $file = global_shared_run_file_path();
+  if ($entry === null) {
+    return !is_file($file) || @unlink($file);
+  }
+  $normalized = normalize_shared_run_entry($entry, '');
+  if ($normalized === null) {
+    return false;
+  }
+  if ($secret !== '') {
+    $normalized['sig'] = shared_run_signature($normalized, $secret);
+  }
+  return authoritative_json_write_file($file, $normalized);
+}
+
+/**
+ * @param array{payload: string, updated_at: string, character_id: string, character_name: string, sig: string}|null $entry
+ * @return array<string, mixed>|null
+ */
+function shared_run_public_payload(?array $entry): ?array
+{
+  if (!is_array($entry)) {
+    return null;
+  }
+  return [
+    'payload' => (string) ($entry['payload'] ?? ''),
+    'updated_at' => (string) ($entry['updated_at'] ?? ''),
+    'character_id' => (string) ($entry['character_id'] ?? ''),
+    'character_name' => (string) ($entry['character_name'] ?? 'Adventurer'),
+  ];
+}
+
+function decode_character_snapshot_payload_array(string $payloadB64): ?array
+{
+  $decoded = base64_decode(trim($payloadB64), true);
+  if (!is_string($decoded) || $decoded === '') {
+    return null;
+  }
+  $parsed = json_decode($decoded, true);
+  return is_array($parsed) ? $parsed : null;
+}
+
+function encode_character_snapshot_payload_array(array $payload): string
+{
+  $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+  if (!is_string($json) || $json === '') {
+    return '';
+  }
+  return base64_encode($json);
+}
+
+function shared_run_payload_dungeon_instance_id(string $payloadB64): string
+{
+  $decoded = base64_decode(trim($payloadB64), true);
+  if (!is_string($decoded) || $decoded === '') {
+    return '';
+  }
+  $parsed = json_decode($decoded, true);
+  if (!is_array($parsed)) {
+    return '';
+  }
+  $id = trim((string) ($parsed['sharedDungeonId'] ?? $parsed['seed'] ?? ''));
+  return $id;
+}
+
+function reset_all_character_positions_for_new_dungeon(string $dungeonInstanceId, string $secret): bool
+{
+  if ($dungeonInstanceId === '') {
+    return false;
+  }
+  $ok = true;
+  foreach (save_storage_root_candidates() as $root) {
+    if (!is_dir($root)) {
+      continue;
+    }
+    $files = glob($root . DIRECTORY_SEPARATOR . '*.characters.json');
+    if (!is_array($files)) {
+      continue;
+    }
+    foreach ($files as $file) {
+      if (!is_string($file) || $file === '') {
+        continue;
+      }
+      $raw = authoritative_json_read_file($file, null);
+      if (!is_array($raw) || !is_array($raw['characters'] ?? null)) {
+        continue;
+      }
+      $nextEntries = [];
+      foreach ($raw['characters'] as $entry) {
+        if (!is_array($entry)) {
+          continue;
+        }
+        $normalized = normalize_character_state_entry($entry, $secret);
+        if ($normalized === null) {
+          continue;
+        }
+        $snapshot = decode_character_snapshot_payload_array((string) ($normalized['payload'] ?? ''));
+        if (!is_array($snapshot)) {
+          $nextEntries[] = $normalized;
+          continue;
+        }
+        $snapshot['dungeonInstanceId'] = $dungeonInstanceId;
+        $snapshot['position'] = [
+          'x' => null,
+          'y' => null,
+          'depth' => null,
+        ];
+        $payload = encode_character_snapshot_payload_array($snapshot);
+        if ($payload === '') {
+          $nextEntries[] = $normalized;
+          continue;
+        }
+        $normalized['payload'] = $payload;
+        $normalized['updated_at'] = date('c');
+        $nextEntries[] = $normalized;
+      }
+      $payload = [
+        'version' => 1,
+        'characters' => [],
+      ];
+      foreach ($nextEntries as $entry) {
+        if ($secret !== '') {
+          $entry['sig'] = character_state_signature($entry, $secret);
+        }
+        $payload['characters'][] = $entry;
+      }
+      $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+      if (!is_string($json) || file_put_contents($file, $json . PHP_EOL, LOCK_EX) === false) {
+        $ok = false;
+      }
+    }
+  }
+  return $ok;
+}
+
 function normalize_item_authority_instance_id(string $value): string
 {
   $id = trim($value);
@@ -2502,6 +2777,7 @@ if (empty($_SESSION['savegames_csrf'])) {
   $_SESSION['savegames_csrf'] = bin2hex(random_bytes(32));
 }
 $saveGamesCsrf = (string) $_SESSION['savegames_csrf'];
+$sharedRuntimeSettings = shared_runtime_settings_load();
 
 // All later request paths only need session-derived values read above.
 // Release the PHP session lock now so long-poll and intent requests can run concurrently.
@@ -3109,8 +3385,13 @@ if ($apiMode === 'savegames') {
   $entries = load_user_saves($userEmail, $saveSecret);
   $characterStates = load_user_character_states($userEmail, $saveSecret);
   $itemAuthorityStates = load_user_item_authority_states($userEmail, $saveSecret);
+  $sharedRun = load_user_shared_run($userEmail, $saveSecret);
+  $runtimeSettings = shared_runtime_settings_load();
 
   if ($method === 'GET') {
+    $browserInstanceIdQuery = authoritative_normalize_browser_instance_id((string) ($_GET['browser_instance_id'] ?? ''));
+    $characterLockAudit = authoritative_character_lock_audit($userEmail);
+    $sharedRunRequested = !empty($_GET['shared_run']);
     $itemCharacterIdQuery = normalize_character_profile_id((string) ($_GET['item_character'] ?? ''));
     if ($itemCharacterIdQuery !== '') {
       $itemState = $itemAuthorityStates[$itemCharacterIdQuery] ?? null;
@@ -3153,11 +3434,27 @@ if ($apiMode === 'savegames') {
       ], 410);
     }
 
+    if ($sharedRunRequested) {
+      $globalLockAudit = function_exists('authoritative_character_lock_audit_all')
+        ? authoritative_character_lock_audit_all()
+        : $characterLockAudit;
+      json_response([
+        'ok' => true,
+        'browser_instance_id' => $browserInstanceIdQuery,
+        'runtime_settings' => $runtimeSettings,
+        'active_character_locks' => array_values($globalLockAudit['active'] ?? []),
+        'shared_run' => shared_run_public_payload($sharedRun),
+      ]);
+    }
+
     json_response([
       'ok' => true,
       'max_saves' => MAX_SERVER_SAVES,
       'max_characters' => MAX_SERVER_CHARACTERS,
       'name_max_len' => SAVE_NAME_MAX_LEN,
+      'browser_instance_id' => $browserInstanceIdQuery,
+      'runtime_settings' => $runtimeSettings,
+      'active_character_locks' => array_values($characterLockAudit['active'] ?? []),
       'characters' => character_entries_public_meta($entries),
       'character_states' => character_states_public_meta($characterStates),
       'item_states' => item_authority_states_public_meta($itemAuthorityStates),
@@ -3181,6 +3478,161 @@ if ($apiMode === 'savegames') {
   }
 
   $action = trim((string) ($body['action'] ?? ''));
+  if ($action === 'admin_runtime_settings') {
+    if (!$isAdminUser) {
+      json_response(['ok' => false, 'error' => 'Admin access required.'], 403);
+    }
+    $incoming = is_array($body['runtime_settings'] ?? null) ? $body['runtime_settings'] : [];
+    $nextRuntimeSettings = shared_runtime_settings_normalize([
+      'dungeon_speed_ms' => $incoming['dungeon_speed_ms'] ?? $runtimeSettings['dungeon_speed_ms'],
+    ]);
+    if (!shared_runtime_settings_persist($nextRuntimeSettings)) {
+      json_response(['ok' => false, 'error' => 'Could not persist runtime settings.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'runtime_settings' => $nextRuntimeSettings,
+    ]);
+  }
+  if ($action === 'shared_run_sync') {
+    $payload = trim((string) ($body['payload'] ?? ''));
+    if ($payload === '') {
+      json_response(['ok' => false, 'error' => 'Missing shared run payload.'], 400);
+    }
+    if (strlen($payload) > SAVE_PAYLOAD_MAX_LEN) {
+      json_response(['ok' => false, 'error' => 'Shared run payload is too large.'], 413);
+    }
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    $characterName = trim_save_name((string) ($body['character_name'] ?? ''));
+    if ($characterName === '') {
+      $characterName = 'Adventurer';
+    }
+    $sharedRun = [
+      'payload' => $payload,
+      'updated_at' => date('c'),
+      'character_id' => $characterId,
+      'character_name' => $characterName,
+      'sig' => '',
+    ];
+    if (!persist_user_shared_run($userEmail, $sharedRun, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist shared dungeon state.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'shared_run' => shared_run_public_payload($sharedRun),
+      'runtime_settings' => $runtimeSettings,
+    ]);
+  }
+  if ($action === 'admin_universal_new_dungeon') {
+    if (!$isAdminUser) {
+      json_response(['ok' => false, 'error' => 'Admin access required.'], 403);
+    }
+    $payload = trim((string) ($body['payload'] ?? ''));
+    if ($payload === '') {
+      json_response(['ok' => false, 'error' => 'Missing shared run payload.'], 400);
+    }
+    if (strlen($payload) > SAVE_PAYLOAD_MAX_LEN) {
+      json_response(['ok' => false, 'error' => 'Shared run payload is too large.'], 413);
+    }
+    $dungeonInstanceId = shared_run_payload_dungeon_instance_id($payload);
+    if ($dungeonInstanceId === '') {
+      json_response(['ok' => false, 'error' => 'Could not determine dungeon instance id.'], 400);
+    }
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    $characterName = trim_save_name((string) ($body['character_name'] ?? ''));
+    if ($characterName === '') {
+      $characterName = 'Adventurer';
+    }
+    $sharedRun = [
+      'payload' => $payload,
+      'updated_at' => date('c'),
+      'character_id' => $characterId,
+      'character_name' => $characterName,
+      'sig' => '',
+    ];
+    if (!persist_user_shared_run($userEmail, $sharedRun, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not persist shared dungeon state.'], 500);
+    }
+    if (!reset_all_character_positions_for_new_dungeon($dungeonInstanceId, $saveSecret)) {
+      json_response(['ok' => false, 'error' => 'Could not reset stored character positions for the new dungeon.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'shared_run' => shared_run_public_payload($sharedRun),
+      'runtime_settings' => $runtimeSettings,
+      'dungeon_instance_id' => $dungeonInstanceId,
+    ]);
+  }
+  if ($action === 'character_session_open') {
+    $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
+    $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
+    if ($characterId === '' || $browserInstanceId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character session metadata.'], 400);
+    }
+    $existing = authoritative_find_browser_character_session($userEmail, $characterId, $browserInstanceId);
+    if (is_array($existing)) {
+      $touched = authoritative_touch_session((string) ($existing['session_id'] ?? ''), $userEmail, $browserInstanceId);
+      json_response([
+        'ok' => true,
+        'session' => [
+          'session_id' => (string) ($touched['sessionId'] ?? ''),
+          'character_id' => $characterId,
+          'browser_instance_id' => $browserInstanceId,
+          'updated_at' => (string) ($touched['updatedAt'] ?? date('c')),
+        ],
+      ]);
+    }
+    authoritative_close_browser_sessions($userEmail, $browserInstanceId);
+    $conflict = authoritative_find_character_session_conflict($userEmail, $characterId, $browserInstanceId);
+    if (is_array($conflict)) {
+      json_response([
+        'ok' => false,
+        'error' => 'This character is already active in another browser instance. Choose a different character.',
+        'code' => 'CHARACTER_ACTIVE_ELSEWHERE',
+        'conflict' => [
+          'character_id' => (string) ($conflict['character_id'] ?? $characterId),
+          'browser_instance_id' => (string) ($conflict['browser_instance_id'] ?? ''),
+          'updated_at' => (string) ($conflict['updated_at'] ?? ''),
+        ],
+      ], 409);
+    }
+    $session = authoritative_create_session($userEmail, $characterId, 0, $browserInstanceId);
+    if (!authoritative_persist_session($session)) {
+      json_response(['ok' => false, 'error' => 'Could not persist character session.'], 500);
+    }
+    json_response([
+      'ok' => true,
+      'session' => [
+        'session_id' => (string) ($session['session_id'] ?? ''),
+        'character_id' => $characterId,
+        'browser_instance_id' => $browserInstanceId,
+        'updated_at' => (string) ($session['updated_at'] ?? date('c')),
+      ],
+    ]);
+  }
+  if ($action === 'character_session_touch') {
+    $sessionId = authoritative_normalize_session_id((string) ($body['session_id'] ?? ''));
+    $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
+    if ($sessionId === '' || $browserInstanceId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character session metadata.'], 400);
+    }
+    $touched = authoritative_touch_session($sessionId, $userEmail, $browserInstanceId);
+    json_response([
+      'ok' => true,
+      'session' => [
+        'session_id' => (string) ($touched['sessionId'] ?? ''),
+        'updated_at' => (string) ($touched['updatedAt'] ?? date('c')),
+      ],
+    ]);
+  }
+  if ($action === 'character_session_close') {
+    $sessionId = authoritative_normalize_session_id((string) ($body['session_id'] ?? ''));
+    if ($sessionId === '') {
+      json_response(['ok' => false, 'error' => 'Missing character session id.'], 400);
+    }
+    authoritative_close_session($sessionId, $userEmail, true, 'character-session-close');
+    json_response(['ok' => true]);
+  }
   if ($action === 'character_sync') {
     $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
     if ($characterId === '') {
@@ -6822,6 +7274,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
     data-save-max-slots="<?php echo MAX_SERVER_SAVES; ?>"
     data-character-max-slots="<?php echo MAX_SERVER_CHARACTERS; ?>"
     data-save-name-max-len="<?php echo SAVE_NAME_MAX_LEN; ?>"
+    data-dungeon-speed-ms="<?php echo (int) ($sharedRuntimeSettings['dungeon_speed_ms'] ?? 28); ?>"
     data-app-version="<?php echo h($appBuildVersion); ?>"
   >
     <header>
@@ -6970,10 +7423,12 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
           <div id="deathOverlay" aria-hidden="true">
             <div id="deathCard">
               <h2 id="deathTitle">You Died</h2>
-              <p id="deathText">Respawn to continue this run, or start a new dungeon.</p>
+              <p id="deathText">Respawn to continue this run.</p>
               <div id="deathButtons">
                 <button id="btnRespawn" type="button">Respawn</button>
+                <?php if ($isAdminUser): ?>
                 <button id="btnNewDungeon" type="button">New Dungeon</button>
+                <?php endif; ?>
               </div>
             </div>
           </div>
@@ -7321,7 +7776,7 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
     <div id="newDungeonConfirmOverlay" aria-hidden="true">
       <div id="newDungeonConfirmCard" role="dialog" aria-modal="true" aria-labelledby="newDungeonConfirmTitle">
         <h2 id="newDungeonConfirmTitle">Start New Dungeon?</h2>
-        <p id="newDungeonConfirmText"><strong>WARNING:</strong> Starting a new dungeon permanently discards the current dungeon instance for this account. All character dungeon positions are wiped and every character will start at the new dungeon entrance.</p>
+        <p id="newDungeonConfirmText"><strong>WARNING:</strong> Starting a new dungeon permanently replaces the universal dungeon for all players. All character dungeon positions are wiped and every character will start at the new dungeon entrance.</p>
         <p id="newDungeonConfirmPreserve">Character progression is preserved: level/XP, gold, inventory, and equipment.</p>
         <div id="newDungeonConfirmButtons">
           <button id="newDungeonConfirmCancel" type="button">Cancel</button>

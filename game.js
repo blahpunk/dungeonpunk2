@@ -165,9 +165,14 @@ const DOOR_MUTATION_LOCK_COLOR_IDS = Object.freeze([
 const SAVE_KEY = "infinite_dungeon_roguelike_save_v8";
 const SAVE_LOGIN_HANDOFF_KEY = "dungeon25_save_after_login_handoff_v1";
 const SAVE_AUTH_STATE_KEY = "infinite_dungeon_save_auth_state_v1";
+const BROWSER_INSTANCE_ID_CLAIM_PREFIX = "d25_browser_instance_claim:";
+const BROWSER_INSTANCE_ID_CLAIM_STALE_MS = 45000;
+const BROWSER_INSTANCE_ID_CLAIM_REFRESH_MS = 10000;
 const CHARACTER_STATE_SLOT_PREFIX = "charstate:";
 const LOCAL_CHARACTER_STATE_PREFIX = "infinite_dungeon_character_state_v1:";
 const CHARACTER_SYNC_DEBOUNCE_MS = 1200;
+const SHARED_DUNGEON_SYNC_INTERVAL_MS = 120;
+const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 35;
 const XP_SCALE = 100;
 const COMBAT_SCALE = 100;
 const POTION_HEAL_PCT = 0.35;
@@ -229,6 +234,11 @@ const LIVE_SIM_LOCAL_TICK_MS_MAX = 1000;
 const LIVE_SIM_TICKS_PER_LEGACY_TURN = 10;
 const LIVE_SIM_MAX_EVENT_HISTORY = 48;
 const LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS = 3;
+const browserInstanceClaimRuntime = {
+  token: `claim_${Math.random().toString(36).slice(2, 14)}_${Date.now().toString(36)}`,
+  id: "",
+  timer: 0,
+};
 const LIVE_TIMING_ACTION_POLICY = Object.freeze({
   MOVE: "live_action_timeline",
   MOVE_BATCH: "live_action_timeline",
@@ -253,6 +263,7 @@ const LIVE_TIMING_ACTION_POLICY = Object.freeze({
   SAVE_AND_EXIT: "meta",
 });
 const LIVE_TICK_COMBAT_STORAGE_KEY = "d25_live_tick_combat";
+const SERVER_GLOBAL_DUNGEON_SPEED_MS = Number(document.body?.dataset?.dungeonSpeedMs ?? LIVE_SIM_LOCAL_GUEST_TICK_MS);
 
 function parseLiveTickCombatFlagValue(value) {
   if (typeof value === "boolean") return value;
@@ -316,6 +327,28 @@ function optionalLocalDungeonTickMs(value) {
   const raw = Number(value);
   if (!Number.isFinite(raw) || raw <= 0) return 0;
   return normalizeLocalDungeonTickMs(raw, LIVE_SIM_LOCAL_GUEST_TICK_MS);
+}
+
+let globalDungeonSpeedMsRuntime = normalizeLocalDungeonTickMs(
+  SERVER_GLOBAL_DUNGEON_SPEED_MS,
+  LIVE_SIM_LOCAL_GUEST_TICK_MS
+);
+
+function currentGlobalDungeonSpeedMs() {
+  return normalizeLocalDungeonTickMs(globalDungeonSpeedMsRuntime, LIVE_SIM_LOCAL_GUEST_TICK_MS);
+}
+
+function applyRuntimeSettingsPayload(runtimeSettings = null) {
+  const settings = (runtimeSettings && typeof runtimeSettings === "object") ? runtimeSettings : {};
+  globalDungeonSpeedMsRuntime = normalizeLocalDungeonTickMs(
+    settings.dungeon_speed_ms ?? globalDungeonSpeedMsRuntime,
+    LIVE_SIM_LOCAL_GUEST_TICK_MS
+  );
+  if (game?.live && liveTickCombatEnabled(game) && !isAuthoritativeSessionActive()) {
+    game.live.tickMs = currentGlobalDungeonSpeedMs();
+    game.live.lastStepAtMs = Date.now();
+  }
+  if (game) updateDebugMenuUi(game);
 }
 
 const ENV_STYLE_VARIANTS = Object.freeze([
@@ -2091,21 +2124,121 @@ function noteAuthoritativeVisualPlayerTarget(nextX = 0, nextY = 0, previousX = n
   authoritativeVisualMotionRuntime.durationMs = Math.max(20, Math.min(96, Math.round(targetTickMs * (dist > 1 ? 0.95 : 0.86))));
 }
 
+function browserInstanceClaimKey(id = "") {
+  return `${BROWSER_INSTANCE_ID_CLAIM_PREFIX}${String(id ?? "").trim().toLowerCase()}`;
+}
+
+function readBrowserInstanceClaim(id = "") {
+  const key = browserInstanceClaimKey(id);
+  if (!key || key === BROWSER_INSTANCE_ID_CLAIM_PREFIX) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === "object") ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeBrowserInstanceClaim(id = "") {
+  const normalizedId = String(id ?? "").trim().toLowerCase();
+  if (!normalizedId) return false;
+  try {
+    localStorage.setItem(
+      browserInstanceClaimKey(normalizedId),
+      JSON.stringify({
+        token: browserInstanceClaimRuntime.token,
+        updatedAt: Date.now(),
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function browserInstanceClaimIsFresh(entry = null) {
+  const updatedAt = Number(entry?.updatedAt ?? NaN);
+  if (!Number.isFinite(updatedAt) || updatedAt <= 0) return false;
+  const ageMs = Date.now() - updatedAt;
+  return ageMs >= 0 && ageMs <= BROWSER_INSTANCE_ID_CLAIM_STALE_MS;
+}
+
+function claimBrowserInstanceId(id = "") {
+  const normalizedId = String(id ?? "").trim().toLowerCase();
+  if (!normalizedId) return false;
+  const existing = readBrowserInstanceClaim(normalizedId);
+  if (
+    existing?.token &&
+    existing.token !== browserInstanceClaimRuntime.token &&
+    browserInstanceClaimIsFresh(existing)
+  ) {
+    return false;
+  }
+  if (!writeBrowserInstanceClaim(normalizedId)) return true;
+  const confirmed = readBrowserInstanceClaim(normalizedId);
+  return !confirmed?.token || confirmed.token === browserInstanceClaimRuntime.token;
+}
+
+function ensureBrowserInstanceClaim(id = "") {
+  const normalizedId = String(id ?? "").trim().toLowerCase();
+  if (!normalizedId) return;
+  browserInstanceClaimRuntime.id = normalizedId;
+  writeBrowserInstanceClaim(normalizedId);
+  if (browserInstanceClaimRuntime.timer || typeof window === "undefined") return;
+  browserInstanceClaimRuntime.timer = window.setInterval(() => {
+    const activeId = String(browserInstanceClaimRuntime.id ?? "").trim().toLowerCase();
+    if (!activeId) return;
+    writeBrowserInstanceClaim(activeId);
+  }, BROWSER_INSTANCE_ID_CLAIM_REFRESH_MS);
+}
+
+function releaseBrowserInstanceClaim() {
+  if (browserInstanceClaimRuntime.timer) {
+    clearInterval(browserInstanceClaimRuntime.timer);
+    browserInstanceClaimRuntime.timer = 0;
+  }
+  const activeId = String(browserInstanceClaimRuntime.id ?? "").trim().toLowerCase();
+  browserInstanceClaimRuntime.id = "";
+  if (!activeId) return;
+  const claim = readBrowserInstanceClaim(activeId);
+  if (claim?.token !== browserInstanceClaimRuntime.token) return;
+  try {
+    localStorage.removeItem(browserInstanceClaimKey(activeId));
+  } catch {}
+}
+
 function resolveBrowserInstanceId() {
   const fallback = () => `browser_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
   let id = "";
   try {
     id = String(sessionStorage.getItem(BROWSER_INSTANCE_ID_STORAGE_KEY) ?? "").trim().toLowerCase();
   } catch {}
-  if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
-    id = fallback().replace(/[^a-z0-9_\-]/g, "");
+  for (let attempt = 0; attempt < 6; attempt += 1) {
     if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
-      id = `browser_${Math.random().toString(36).slice(2, 14)}`.replace(/[^a-z0-9_\-]/g, "");
+      id = fallback().replace(/[^a-z0-9_\-]/g, "");
+      if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
+        id = `browser_${Math.random().toString(36).slice(2, 14)}`.replace(/[^a-z0-9_\-]/g, "");
+      }
+    }
+    if (!claimBrowserInstanceId(id)) {
+      id = "";
+      continue;
     }
     try {
       sessionStorage.setItem(BROWSER_INSTANCE_ID_STORAGE_KEY, id);
     } catch {}
+    ensureBrowserInstanceClaim(id);
+    return id;
   }
+  if (!/^[a-z0-9_\-]{12,120}$/.test(id)) {
+    id = `browser_${Math.random().toString(36).slice(2, 14)}`.replace(/[^a-z0-9_\-]/g, "");
+  }
+  try {
+    sessionStorage.setItem(BROWSER_INSTANCE_ID_STORAGE_KEY, id);
+  } catch {}
+  ensureBrowserInstanceClaim(id);
   return id;
 }
 
@@ -4288,12 +4421,29 @@ const saveRuntime = {
   activeRunSaveId: "",
   activeAutosaveSaveId: "",
 };
+const characterSessionRuntime = {
+  sessionId: "",
+  characterId: "",
+  touchTimer: 0,
+  touchInFlight: false,
+  lastTouchAt: 0,
+};
 const characterSyncRuntime = {
   dirty: false,
   reason: "",
   timer: 0,
   syncing: false,
   lastSyncAt: 0,
+};
+const sharedDungeonRuntime = {
+  timer: 0,
+  syncing: false,
+  lastPushAt: 0,
+  lastPullAt: 0,
+  lastSeenUpdatedAt: "",
+  lastAppliedUpdatedAt: "",
+  lastAppliedCharacterId: "",
+  lastError: "",
 };
 const itemAuthorityRuntime = {
   ready: false,
@@ -4548,10 +4698,7 @@ function updateDebugMenuUi(state) {
   if (debugDepthInputEl) debugDepthInputEl.value = `${state?.player?.z ?? 0}`;
   if (debugLevelInputEl) debugLevelInputEl.value = `${Math.max(1, Math.floor(state?.player?.level ?? 1))}`;
   if (debugDungeonSpeedInputEl && document.activeElement !== debugDungeonSpeedInputEl) {
-    const tickMs = normalizeLocalDungeonTickMs(
-      state?.live?.customTickMs ?? state?.live?.tickMs ?? LIVE_SIM_LOCAL_GUEST_TICK_MS,
-      LIVE_SIM_LOCAL_GUEST_TICK_MS
-    );
+    const tickMs = currentGlobalDungeonSpeedMs();
     debugDungeonSpeedInputEl.value = `${tickMs}`;
   }
   if (debugClearRadiusInputEl) {
@@ -4883,19 +5030,22 @@ function setPlayerLevelDebug(state, targetLevel) {
   return true;
 }
 
-function setDungeonSpeedDebug(state, targetTickMs) {
+async function setDungeonSpeedDebug(state, targetTickMs) {
   if (!canUseAdminControls()) return false;
   if (!state || !liveTickCombatEnabled(state)) return false;
-  const live = ensureLiveSimulationState(state);
   const nextTickMs = normalizeLocalDungeonTickMs(targetTickMs, LIVE_SIM_LOCAL_GUEST_TICK_MS);
-  const prevTickMs = normalizeLocalDungeonTickMs(
-    live.customTickMs ?? live.tickMs ?? LIVE_SIM_LOCAL_GUEST_TICK_MS,
-    LIVE_SIM_LOCAL_GUEST_TICK_MS
-  );
-  live.customTickMs = nextTickMs;
-  live.tickMs = nextTickMs;
-  live.lastStepAtMs = Date.now();
-  updateDebugMenuUi(state);
+  const prevTickMs = currentGlobalDungeonSpeedMs();
+  if (isAuthenticatedUser) {
+    const data = await saveApiRequest("POST", {
+      action: "admin_runtime_settings",
+      runtime_settings: {
+        dungeon_speed_ms: nextTickMs,
+      },
+    });
+    applyRuntimeSettingsPayload(data?.runtime_settings ?? null);
+  } else {
+    applyRuntimeSettingsPayload({ dungeon_speed_ms: nextTickMs });
+  }
   pushLog(
     state,
     `Debug: dungeon speed set ${prevTickMs}ms -> ${nextTickMs}ms per tick. Lower is faster.`
@@ -9219,7 +9369,7 @@ function openNewDungeonConfirm(state) {
   if (!newDungeonConfirmOverlayEl) {
     return Promise.resolve(confirm(
       "Start a NEW DUNGEON?\n\n" +
-      "WARNING: Starting a new dungeon permanently discards the current dungeon instance for this account. " +
+      "WARNING: Starting a new dungeon permanently replaces the universal dungeon for all players. " +
       "All character dungeon positions are wiped and every character will start at the new dungeon entrance.\n\n" +
       "Character progression is preserved: level/XP, gold, inventory, and equipment."
     ));
@@ -9400,6 +9550,13 @@ function openGuestLoginImportOverlay(state = null) {
 async function requestNewDungeonReset(state) {
   const run = state ?? game;
   if (!run || newDungeonResetPending) return false;
+  if (!canUseAdminControls()) {
+    if (run?.log) {
+      pushLog(run, "Only the admin can start a new universal dungeon.");
+      renderLog(run);
+    }
+    return false;
+  }
   newDungeonResetPending = true;
   try {
     const confirmed = await openNewDungeonConfirm(run);
@@ -9454,6 +9611,9 @@ async function requestNewDungeonReset(state) {
     saveNow(game);
     markCharacterStateDirty(game, "new-dungeon");
     void syncCharacterStateIfDirty("new-dungeon");
+    if (canUseSharedDungeonSync()) {
+      await persistSharedDungeonStateToServer(game, "new-dungeon", { adminReset: true });
+    }
     return true;
   } finally {
     newDungeonResetPending = false;
@@ -9694,6 +9854,7 @@ function markSaveDirty(state, reason = "") {
   saveRuntime.dirty = true;
   saveRuntime.dirtyReason = String(reason || "state-change");
   saveRuntime.lastDirtyAt = Date.now();
+  if (canUseSharedDungeonSync()) scheduleSharedDungeonPush(saveRuntime.dirtyReason);
   syncItemAuthorityFromStateIfChanged(state, reason || "state-change");
   markCharacterStateDirty(state, reason || "state-change");
   if (saveRuntime.pendingAutosaveReason) {
@@ -9741,13 +9902,11 @@ async function autosaveIfDirty(reason = "") {
       return true;
     }
     if (isAuthenticatedUser) {
-      const overwriteId = String(saveRuntime.activeRunSaveId ?? "").trim();
-      const ok = await saveCurrentGameToServer(overwriteId, { autosave: true });
-      if (ok) {
-        saveResumeSnapshot(game);
-        clearSaveDirty();
-      }
-      return !!ok;
+      saveResumeSnapshot(game);
+      const worldOk = await syncSharedDungeonState(reason || "autosave", { forcePush: true });
+      const charOk = await syncCharacterStateIfDirty(reason || "autosave");
+      if (worldOk && charOk) clearSaveDirty();
+      return !!(worldOk && charOk);
     }
     saveNow(game);
     return true;
@@ -9766,11 +9925,9 @@ async function autosaveBeforeCharacterSwitch() {
     return true;
   }
   if (!isAuthenticatedUser) return autosaveIfDirty("switch-character");
-  const hasServerRunSave = !!String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim();
-  if (saveRuntime.dirty || !hasServerRunSave) {
-    return saveCurrentGameToServer(String(saveRuntime.activeAutosaveSaveId ?? saveRuntime.activeRunSaveId ?? "").trim(), {
-      autosave: true,
-    });
+  saveResumeSnapshot(game);
+  if (saveRuntime.dirty) {
+    return syncCharacterStateIfDirty("switch-character");
   }
   return true;
 }
@@ -9781,6 +9938,7 @@ function exportCharacterSnapshot(state) {
   const profile = normalizeCharacterProfile(src.character ?? null);
   return {
     character: profile,
+    dungeonInstanceId: String(src.sharedDungeonId ?? src.world?.seedStr ?? "").trim(),
     position: {
       x: Number.isFinite(Number(p.x)) ? Math.floor(Number(p.x)) : null,
       y: Number.isFinite(Number(p.y)) ? Math.floor(Number(p.y)) : null,
@@ -9840,6 +9998,7 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
     const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
     return {
       character: profile,
+      dungeonInstanceId: String(decoded?.dungeonInstanceId ?? "").trim(),
       position: normalizeCharacterSnapshotPosition(decoded?.position ?? decoded?.character?.position ?? null),
       player: {
         level: Math.max(1, Math.floor(decoded?.player?.level ?? 1)),
@@ -9865,6 +10024,36 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
   }
 }
 
+async function resolveLoadableCharacterSnapshot(characterId = "", slotMeta = null) {
+  const id = normalizeCharacterProfileId(characterId);
+  if (!id) return null;
+  const activeGameCharacterId = normalizeCharacterProfileId(game?.character?.id ?? "");
+  if (game && activeGameCharacterId === id) {
+    const activeSnapshot = exportCharacterSnapshot(game);
+    if (activeSnapshot) return activeSnapshot;
+  }
+
+  const serverSnapshot = await resolveCharacterSnapshotFromServerState(id);
+  if (serverSnapshot) return serverSnapshot;
+
+  const localSnapshot = resolveCharacterSnapshotFromLocalState(id);
+  if (localSnapshot) return localSnapshot;
+
+  const latestSnapshot = await resolveLatestCharacterSnapshot(id);
+  if (latestSnapshot) return latestSnapshot;
+
+  const slotProfile = normalizeCharacterProfile(slotMeta?.profile ?? { id, name: slotMeta?.name ?? DEFAULT_CHARACTER_NAME });
+  return buildCharacterSnapshotFromCarryover(slotProfile, {
+    character: slotProfile,
+    level: 1,
+    xp: 0,
+    gold: 0,
+    inv: [],
+    equip: { weapon: null, head: null, chest: null, legs: null },
+    maxHp: maxHpForLevel(1, slotProfile),
+  });
+}
+
 function resolveCharacterSnapshotFromLocalState(characterId = "") {
   const id = String(characterId ?? "").trim();
   if (!id) return null;
@@ -9882,6 +10071,7 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
   const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
   return {
     character: profile,
+    dungeonInstanceId: String(decoded?.dungeonInstanceId ?? "").trim(),
     position: normalizeCharacterSnapshotPosition(decoded?.position ?? decoded?.character?.position ?? null),
     player: {
       level: Math.max(1, Math.floor(decoded?.player?.level ?? 1)),
@@ -9910,6 +10100,7 @@ function buildCharacterSnapshotFromCarryover(profile, carryover = null) {
   const maxHp = Math.max(1, Math.floor(carryover?.maxHp ?? maxHpForLevel(level, normalizedProfile)));
   return {
     character: normalizedProfile,
+    dungeonInstanceId: String(carryover?.dungeonInstanceId ?? "").trim(),
     position: { x: null, y: null, depth: null },
     player: {
       level,
@@ -10018,6 +10209,7 @@ function markCharacterStateDirty(state, reason = "") {
   }
   characterSyncRuntime.timer = setTimeout(() => {
     characterSyncRuntime.timer = 0;
+    if (canUseSharedDungeonSync()) void syncSharedDungeonState(characterSyncRuntime.reason || "debounced", { forcePush: true });
     void syncCharacterStateIfDirty(characterSyncRuntime.reason || "debounced");
   }, CHARACTER_SYNC_DEBOUNCE_MS);
 }
@@ -10077,8 +10269,8 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   const forceEntrance = opts.forceEntrance === true;
   const silent = opts.silent === true;
   const providedCharacterId = normalizeCharacterProfileId(opts.characterId ?? "");
-  const providedLatestSaveId = String(opts.latestSaveId ?? "").trim();
   const currentId = String(getActiveCharacterSlotId() ?? "");
+  const slotMeta = opts.slotMeta && typeof opts.slotMeta === "object" ? opts.slotMeta : null;
   // In Quick Switch mode we must still reload even if slot id matches,
   // otherwise the temporary test class cannot be reverted.
   if (
@@ -10117,69 +10309,63 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
 
   if (isAuthenticatedUser) {
     const characterOnlyId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
-    if (characterOnlyId) {
-      const latestSaveId = providedLatestSaveId || await resolveLatestSaveIdForCharacter(characterOnlyId);
-      if (latestSaveId) {
-        const loaded = await loadSaveFromServer(latestSaveId, { showStatus: false, closeOverlay: false, forceEntrance });
-        if (!loaded) return false;
-        clearSaveDirty();
-        markCharacterStateDirty(game, "load-run");
-        void syncCharacterStateIfDirty("load-run");
-        return true;
+    if (!characterOnlyId) return false;
+    const opened = await openCharacterSession(characterOnlyId);
+    if (!opened) {
+      if (!silent) {
+        const msg = "Could not open character session.";
+        if (isCharacterOverlayOpen()) setCharacterOverlayStatus(msg, true);
+        else if (game?.log) {
+          pushLog(game, msg);
+          renderLog(game);
+        }
       }
-      const snapshot = await resolveCharacterSnapshotFromServerState(characterOnlyId);
-      if (!snapshot) return false;
-      const profile = normalizeCharacterProfile(snapshot.character ?? { id: characterOnlyId });
-      const seededRun = game ? createCharacterRunFromCurrentDungeon(game, snapshot) : null;
-      if (seededRun) {
-        normalizeLoadedLiveTickState(seededRun);
-        game = seededRun;
-      } else {
-        const carryover = {
-          character: profile,
-          level: Math.max(1, Math.floor(snapshot?.player?.level ?? 1)),
-          xp: Math.max(0, Math.floor(snapshot?.player?.xp ?? 0)),
-          gold: Math.max(0, Math.floor(snapshot?.player?.gold ?? 0)),
-          inv: normalizeInventoryEntries(snapshot?.player?.inv ?? [], {
-            speciesId: profile.speciesId,
-            classId: profile.classId,
-            ownerId: profile.id,
-          }),
-          equip: normalizeEquip(snapshot?.player?.equip ?? {}, {
-            speciesId: profile.speciesId,
-            classId: profile.classId,
-          }),
-          maxHp: Math.max(1, Math.floor(snapshot?.player?.maxHp ?? maxHpForLevel(1, profile))),
-        };
-        game = makeNewGame(randomSeedString(), { carryover });
-        normalizeLoadedLiveTickState(game);
+      return false;
+    }
+    try {
+      const snapshot = await resolveLoadableCharacterSnapshot(characterOnlyId, slotMeta);
+      if (!snapshot) throw new Error("Could not load character slot.");
+      let basePayload = String(opts.basePayload ?? "").trim();
+      if (!basePayload && canUseSharedDungeonSync()) {
+        const sharedData = await fetchSharedDungeonStateFromServer();
+        basePayload = String(sharedData?.shared_run?.payload ?? "").trim();
       }
-      if (forceEntrance) {
-        respawnAtStart(game);
-      }
-      const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
-      const savedRun = await saveStateToServerSlot(game, "", slotName);
+      const loadedRun = buildRunForCharacterSnapshot(snapshot, {
+        basePayload,
+        baseState: game,
+        forceEntrance,
+      });
+      if (!loadedRun) throw new Error("Could not build the character run.");
+      game = loadedRun;
       enforceAdminControlPolicy(game);
       updateDebugMenuUi(game);
       setDebugMenuOpen(false);
       updateContextActionButton(game);
       updateDeathOverlay(game);
       setActiveCharacterSlotId(id);
-      saveRuntime.activeRunSaveId = String(savedRun?.save?.id ?? "").trim();
+      saveRuntime.activeRunSaveId = "";
       saveRuntime.activeAutosaveSaveId = "";
       refreshSaveNameFromLive(true);
       saveNow(game);
       clearSaveDirty();
       markCharacterStateDirty(game, "load-run");
       void syncCharacterStateIfDirty("load-run");
+      void syncSharedDungeonState("load-run", { forcePull: true });
       return true;
+    } catch (err) {
+      if (String(characterSessionRuntime.characterId ?? "") === characterOnlyId) {
+        void closeCharacterSession("load-failed");
+      }
+      const message = String(err?.message ?? "").trim() || "Could not load character slot.";
+      if (!silent) {
+        if (isCharacterOverlayOpen()) setCharacterOverlayStatus(message, true);
+        else if (game?.log) {
+          pushLog(game, message);
+          renderLog(game);
+        }
+      }
+      return false;
     }
-    const loaded = await loadSaveFromServer(id, { showStatus: false, closeOverlay: false, forceEntrance });
-    if (!loaded) return false;
-    clearSaveDirty();
-    markCharacterStateDirty(game, "load-run");
-    void syncCharacterStateIfDirty("load-run");
-    return true;
   }
 
   const payload = readLocalSlotPayload(id);
@@ -10331,13 +10517,8 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId, options = null) {
   } else {
     setActiveCharacterSlotId(id);
   }
-  if (isAuthenticatedUser) {
-    saveRuntime.activeRunSaveId = "";
-    saveRuntime.activeAutosaveSaveId = await resolveAutosaveOverwriteIdFromServer(game);
-  } else {
-    saveRuntime.activeRunSaveId = "";
-    saveRuntime.activeAutosaveSaveId = "";
-  }
+  saveRuntime.activeRunSaveId = "";
+  saveRuntime.activeAutosaveSaveId = "";
   resetItemAuthorityRuntime(itemAuthorityCharacterIdForState(game));
   refreshSaveNameFromLive(true);
   saveNow(game);
@@ -10374,7 +10555,360 @@ async function saveApiRequest(method = "GET", body = null, query = "") {
     err.response = { ...(data && typeof data === "object" ? data : {}), status_code: resp.status };
     throw err;
   }
+  if (data && typeof data === "object" && data.runtime_settings) {
+    applyRuntimeSettingsPayload(data.runtime_settings);
+  }
   return data;
+}
+
+function canUseSharedDungeonSync() {
+  return !!(isAuthenticatedUser && !isAuthoritativeModeEnabled());
+}
+
+function activeSharedDungeonCharacterId() {
+  return normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId()) || normalizeCharacterProfileId(game?.character?.id ?? "");
+}
+
+function sharedDungeonActorEntityId(characterId = "") {
+  return `remote_character:${normalizeCharacterProfileId(characterId)}`;
+}
+
+function sharedDungeonInstanceIdForState(state = null) {
+  return String(state?.sharedDungeonId ?? state?.world?.seedStr ?? "").trim();
+}
+
+function removeSharedDungeonActorForCharacter(state, characterId = "") {
+  const cid = normalizeCharacterProfileId(characterId);
+  if (!state?.entities || !cid) return;
+  const actorId = sharedDungeonActorEntityId(cid);
+  state.entities.delete(actorId);
+  if (state.dynamic instanceof Map) state.dynamic.delete(actorId);
+  if (state.entityOverrides instanceof Map) state.entityOverrides.delete(actorId);
+}
+
+function clearRemoteCharacterActors(state) {
+  if (!state?.entities) return;
+  for (const [id, ent] of Array.from(state.entities.entries())) {
+    if (ent?.kind === "actor" && ent?.remoteCharacterId) {
+      state.entities.delete(id);
+    }
+  }
+  if (state.dynamic instanceof Map) {
+    for (const [id, ent] of Array.from(state.dynamic.entries())) {
+      if (ent?.kind === "actor" && ent?.remoteCharacterId) {
+        state.dynamic.delete(id);
+      }
+    }
+  }
+  if (state.entityOverrides instanceof Map) {
+    for (const id of Array.from(state.entityOverrides.keys())) {
+      if (String(id ?? "").startsWith("remote_character:")) {
+        state.entityOverrides.delete(id);
+      }
+    }
+  }
+}
+
+function syncRemoteCharacterActors(state, sharedData = null) {
+  if (!state?.entities || !canUseSharedDungeonSync()) return;
+  const activeLocks = Array.isArray(sharedData?.active_character_locks) ? sharedData.active_character_locks : [];
+  const currentCharacterId = activeSharedDungeonCharacterId();
+  const activeCharacterIds = new Set(
+    activeLocks
+      .map((entry) => normalizeCharacterProfileId(entry?.character_id ?? ""))
+      .filter(Boolean)
+  );
+  for (const [id, ent] of Array.from(state.entities.entries())) {
+    if (ent?.kind !== "actor" || !ent?.remoteCharacterId) continue;
+    const remoteId = normalizeCharacterProfileId(ent.remoteCharacterId);
+    if (!remoteId || remoteId === currentCharacterId || !activeCharacterIds.has(remoteId)) {
+      state.entities.delete(id);
+      if (state.dynamic instanceof Map) state.dynamic.delete(id);
+      if (state.entityOverrides instanceof Map) state.entityOverrides.delete(id);
+    }
+  }
+  removeSharedDungeonActorForCharacter(state, currentCharacterId);
+}
+
+function buildRunForCharacterSnapshot(snapshot, options = null) {
+  if (!snapshot) return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const basePayload = String(opts.basePayload ?? "").trim();
+  let nextState = basePayload ? importSave(basePayload) : null;
+  if (!nextState && opts.baseState) {
+    try { nextState = importSave(exportSave(opts.baseState)); } catch { nextState = null; }
+  }
+  if (!nextState) {
+    nextState = makeNewGame(randomSeedString(), { carryover: buildCarryoverFromCharacterSnapshot(snapshot) });
+  }
+  if (!nextState) return null;
+  const snapshotDungeonId = String(snapshot?.dungeonInstanceId ?? "").trim();
+  const stateDungeonId = sharedDungeonInstanceIdForState(nextState);
+  const shouldForceEntrance = opts.forceEntrance === true || (!!stateDungeonId && !!snapshotDungeonId && snapshotDungeonId !== stateDungeonId);
+  if (!applyCharacterSnapshot(nextState, snapshot)) return null;
+  nextState.sharedDungeonId = stateDungeonId || snapshotDungeonId || sharedDungeonInstanceIdForState(nextState);
+  removeSharedDungeonActorForCharacter(nextState, normalizeCharacterProfileId(snapshot?.character?.id ?? ""));
+  nextState.log = [];
+  if (shouldForceEntrance) {
+    placePlayerAtDungeonEntrance(nextState, {
+      message: "You enter the dungeon...",
+      resetVision: true,
+    });
+  } else {
+    placePlayerFromCharacterSnapshot(nextState, snapshot, {
+      entranceMessage: "You enter the dungeon...",
+      resetVision: true,
+    });
+  }
+  normalizeLoadedLiveTickState(nextState);
+  return nextState;
+}
+
+function exportSharedDungeonPayload(state) {
+  if (!state) return "";
+  let cloned = null;
+  try {
+    cloned = importSave(exportSave(state));
+  } catch {
+    cloned = null;
+  }
+  if (!cloned) return "";
+  const profile = normalizeCharacterProfile(state?.character ?? null);
+  const cid = normalizeCharacterProfileId(profile?.id ?? "");
+  removeSharedDungeonActorForCharacter(cloned, cid);
+  if (cid && cloned?.entities && cloned?.dynamic instanceof Map) {
+    const display = resolveCharacterSpriteDisplay(profile.speciesId, profile.classId);
+    const actor = {
+      id: sharedDungeonActorEntityId(cid),
+      kind: "actor",
+      type: "hero_actor",
+      spriteId: display.spriteId || "hero",
+      x: Math.floor(Number(state?.player?.x ?? 0)),
+      y: Math.floor(Number(state?.player?.y ?? 0)),
+      z: Math.floor(Number(state?.player?.z ?? 0)),
+      ai: "none",
+      remoteCharacterId: cid,
+      remoteCharacterName: profile.name,
+      hp: Math.max(0, Math.floor(state?.player?.hp ?? 0)),
+      maxHp: Math.max(1, Math.floor(state?.player?.maxHp ?? 1)),
+      live: normalizeLiveCombatActorState(null, "actor"),
+    };
+    cloned.entities.set(actor.id, actor);
+    cloned.dynamic.set(actor.id, actor);
+  }
+  return exportSave(cloned);
+}
+
+function scheduleSharedDungeonPush(reason = "state-change") {
+  if (!canUseSharedDungeonSync()) return;
+  if (saveRuntime.autoTimer) return;
+  saveRuntime.autoTimer = setTimeout(() => {
+    saveRuntime.autoTimer = 0;
+    void syncSharedDungeonState(reason, { forcePush: true });
+  }, SHARED_DUNGEON_PUSH_DEBOUNCE_MS);
+}
+
+async function fetchSharedDungeonStateFromServer() {
+  if (!canUseSharedDungeonSync()) return null;
+  const browserInstanceId = resolveBrowserInstanceId();
+  return saveApiRequest("GET", null, `shared_run=1&browser_instance_id=${encodeURIComponent(browserInstanceId)}`);
+}
+
+async function persistSharedDungeonStateToServer(state, reason = "sync", options = null) {
+  if (!canUseSharedDungeonSync() || !state) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const payload = exportSharedDungeonPayload(state);
+  if (!payload) return false;
+  const profile = ensureCharacterState(state);
+  const data = await saveApiRequest("POST", {
+    action: opts.adminReset === true ? "admin_universal_new_dungeon" : "shared_run_sync",
+    payload,
+    character_id: normalizeCharacterProfileId(profile?.id ?? ""),
+    character_name: String(profile?.name ?? DEFAULT_CHARACTER_NAME),
+    reason: String(reason ?? "").trim() || "sync",
+  });
+  sharedDungeonRuntime.lastPushAt = Date.now();
+  sharedDungeonRuntime.lastSeenUpdatedAt = String(data?.shared_run?.updated_at ?? sharedDungeonRuntime.lastSeenUpdatedAt);
+  return true;
+}
+
+function restartSharedDungeonSyncLoop() {
+  if (sharedDungeonRuntime.timer) {
+    clearInterval(sharedDungeonRuntime.timer);
+    sharedDungeonRuntime.timer = 0;
+  }
+  if (!canUseSharedDungeonSync()) return;
+  sharedDungeonRuntime.timer = setInterval(() => {
+    void syncSharedDungeonState("interval");
+  }, SHARED_DUNGEON_SYNC_INTERVAL_MS);
+}
+
+function stopSharedDungeonSyncLoop() {
+  if (!sharedDungeonRuntime.timer) return;
+  clearInterval(sharedDungeonRuntime.timer);
+  sharedDungeonRuntime.timer = 0;
+}
+
+async function syncSharedDungeonState(reason = "sync", options = null) {
+  if (!canUseSharedDungeonSync() || !game || sharedDungeonRuntime.syncing) return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentCharacterId = activeSharedDungeonCharacterId();
+  if (!currentCharacterId) return false;
+  sharedDungeonRuntime.syncing = true;
+  try {
+    if (opts.forcePush === true || (saveRuntime.dirty && (Date.now() - sharedDungeonRuntime.lastPushAt) >= SHARED_DUNGEON_PUSH_DEBOUNCE_MS)) {
+      await persistSharedDungeonStateToServer(game, reason);
+    }
+    if (opts.skipPull === true) return true;
+    const sharedData = await fetchSharedDungeonStateFromServer();
+    const updatedAt = String(sharedData?.shared_run?.updated_at ?? "").trim();
+    sharedDungeonRuntime.lastPullAt = Date.now();
+    if (updatedAt) sharedDungeonRuntime.lastSeenUpdatedAt = updatedAt;
+    const sharedPayload = String(sharedData?.shared_run?.payload ?? "").trim();
+    const sharedPullSafeWhileDirty = !!(saveRuntime.lastDirtyAt > 0 && saveRuntime.lastDirtyAt <= sharedDungeonRuntime.lastPushAt);
+    if (
+      sharedPayload &&
+      updatedAt &&
+      sharedPayload !== exportSharedDungeonPayload(game) &&
+      (!saveRuntime.dirty || sharedPullSafeWhileDirty || opts.forceApply === true) &&
+      updatedAt !== sharedDungeonRuntime.lastAppliedUpdatedAt
+    ) {
+      let snapshot = null;
+      if (normalizeCharacterProfileId(game?.character?.id ?? "") === currentCharacterId) {
+        snapshot = exportCharacterSnapshot(game);
+      }
+      if (!snapshot) {
+        snapshot = await resolveLoadableCharacterSnapshot(currentCharacterId);
+      }
+      const sharedStatePreview = importSave(sharedPayload);
+      const sharedDungeonChanged = sharedDungeonInstanceIdForState(game) !== sharedDungeonInstanceIdForState(sharedStatePreview);
+      const nextState = buildRunForCharacterSnapshot(snapshot, {
+        basePayload: sharedPayload,
+        forceEntrance: sharedDungeonChanged,
+      });
+      if (nextState) {
+        game = nextState;
+        enforceAdminControlPolicy(game);
+        updateDebugMenuUi(game);
+        setDebugMenuOpen(false);
+        updateContextActionButton(game);
+        updateDeathOverlay(game);
+        refreshSaveNameFromLive(true);
+        saveResumeSnapshot(game);
+        clearSaveDirty();
+        if (sharedDungeonChanged) {
+          markCharacterStateDirty(game, "shared-dungeon-reset");
+          void syncCharacterStateIfDirty("shared-dungeon-reset");
+        }
+        sharedDungeonRuntime.lastAppliedUpdatedAt = updatedAt;
+        sharedDungeonRuntime.lastAppliedCharacterId = currentCharacterId;
+      }
+    }
+    syncRemoteCharacterActors(game, sharedData);
+    return true;
+  } catch (err) {
+    sharedDungeonRuntime.lastError = String(err?.message ?? "shared-dungeon-sync-failed");
+    return false;
+  } finally {
+    sharedDungeonRuntime.syncing = false;
+  }
+}
+
+const CHARACTER_SESSION_TOUCH_INTERVAL_MS = 10000;
+
+function stopCharacterSessionTouchLoop() {
+  if (!characterSessionRuntime.touchTimer) return;
+  clearInterval(characterSessionRuntime.touchTimer);
+  characterSessionRuntime.touchTimer = 0;
+}
+
+function clearCharacterSessionRuntime() {
+  stopCharacterSessionTouchLoop();
+  characterSessionRuntime.sessionId = "";
+  characterSessionRuntime.characterId = "";
+  characterSessionRuntime.touchInFlight = false;
+  characterSessionRuntime.lastTouchAt = 0;
+}
+
+async function touchCharacterSession(reason = "interval") {
+  if (!isAuthenticatedUser) return false;
+  const sessionId = String(characterSessionRuntime.sessionId ?? "").trim();
+  if (!sessionId || characterSessionRuntime.touchInFlight) return false;
+  characterSessionRuntime.touchInFlight = true;
+  try {
+    await saveApiRequest("POST", {
+      action: "character_session_touch",
+      session_id: sessionId,
+      browser_instance_id: resolveBrowserInstanceId(),
+      reason: String(reason ?? "").trim() || "interval",
+    });
+    characterSessionRuntime.lastTouchAt = Date.now();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    characterSessionRuntime.touchInFlight = false;
+  }
+}
+
+function restartCharacterSessionTouchLoop() {
+  stopCharacterSessionTouchLoop();
+  if (!isAuthenticatedUser || !String(characterSessionRuntime.sessionId ?? "").trim()) return;
+  characterSessionRuntime.touchTimer = setInterval(() => {
+    void touchCharacterSession("interval");
+  }, CHARACTER_SESSION_TOUCH_INTERVAL_MS);
+}
+
+async function openCharacterSession(characterId = "") {
+  if (!isAuthenticatedUser) return true;
+  const normalizedCharacterId = normalizeCharacterProfileId(characterId);
+  if (!normalizedCharacterId) return false;
+  const data = await saveApiRequest("POST", {
+    action: "character_session_open",
+    character_id: normalizedCharacterId,
+    browser_instance_id: resolveBrowserInstanceId(),
+  });
+  characterSessionRuntime.sessionId = String(data?.session?.session_id ?? "").trim();
+  characterSessionRuntime.characterId = normalizedCharacterId;
+  characterSessionRuntime.lastTouchAt = Date.now();
+  restartCharacterSessionTouchLoop();
+  return !!characterSessionRuntime.sessionId;
+}
+
+async function closeCharacterSession(reason = "close") {
+  const sessionId = String(characterSessionRuntime.sessionId ?? "").trim();
+  clearCharacterSessionRuntime();
+  if (!isAuthenticatedUser || !sessionId) return false;
+  try {
+    const payload = {
+      action: "character_session_close",
+      session_id: sessionId,
+      reason: String(reason ?? "").trim() || "close",
+    };
+    const body = JSON.stringify(payload);
+    const url = "./index.php?api=savegames";
+    if (typeof fetch === "function") {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        keepalive: true,
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-CSRF-Token": saveApiCsrfToken,
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          Pragma: "no-cache",
+        },
+        body,
+      });
+      return response.ok;
+    }
+    await saveApiRequest("POST", payload);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function initializeAnalyticsForState(state, snapshot = null, reason = "runtime") {
@@ -10884,8 +11418,22 @@ async function resolveLatestCharacterSnapshot(characterId = "") {
 
 async function fetchCharacterSlotsFromServer() {
   if (!isAuthenticatedUser) return [];
-  const base = await saveApiRequest("GET");
+  const browserInstanceId = resolveBrowserInstanceId();
+  const base = await saveApiRequest("GET", null, `browser_instance_id=${encodeURIComponent(browserInstanceId)}`);
   const characterStates = Array.isArray(base?.character_states) ? base.character_states : [];
+  const activeLocks = Array.isArray(base?.active_character_locks) ? base.active_character_locks : [];
+  const currentSessionId = String(characterSessionRuntime.sessionId ?? "").trim();
+  const lockByCharacterId = new Map();
+  for (const lock of activeLocks) {
+    const characterId = normalizeCharacterProfileId(lock?.character_id ?? "");
+    if (!characterId) continue;
+    lockByCharacterId.set(characterId, {
+      characterId,
+      browserInstanceId: String(lock?.browser_instance_id ?? "").trim().toLowerCase(),
+      sessionId: String(lock?.session_id ?? "").trim(),
+      updatedAt: String(lock?.updated_at ?? "").trim(),
+    });
+  }
   const slotsByCharacterId = new Map();
   for (const stateMeta of characterStates) {
     const characterId = normalizeCharacterProfileId(stateMeta?.id ?? "");
@@ -10910,6 +11458,8 @@ async function fetchCharacterSlotsFromServer() {
       ),
       latestSaveId: "",
       hasDungeonPosition: characterSnapshotHasDungeonPosition(snapshot),
+      lockedElsewhere: false,
+      lockSessionId: "",
     };
     slot.name = String(stateMeta?.name ?? slot.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME);
     slot.updatedAt = String(stateMeta?.updated_at ?? slot.updatedAt ?? "");
@@ -10920,6 +11470,9 @@ async function fetchCharacterSlotsFromServer() {
       Math.floor(snapshot?.character?.deepestDepth ?? slot.profile?.deepestDepth ?? 0)
     );
     slot.hasDungeonPosition = slot.hasDungeonPosition || characterSnapshotHasDungeonPosition(snapshot);
+    const lockInfo = lockByCharacterId.get(characterId) ?? null;
+    slot.lockedElsewhere = !!(lockInfo && (!currentSessionId || lockInfo.sessionId !== currentSessionId));
+    slot.lockSessionId = String(lockInfo?.sessionId ?? "").trim();
     slotsByCharacterId.set(characterId, slot);
   }
 
@@ -10927,6 +11480,13 @@ async function fetchCharacterSlotsFromServer() {
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
   return out;
 }
+
+function firstAvailableCharacterSlotId(slots = []) {
+  const list = Array.isArray(slots) ? slots : [];
+  const available = list.find((slot) => slot && slot.lockedElsewhere !== true);
+  return String(available?.id ?? "").trim();
+}
+
 function resetCharacterCreationDraft(profile = null, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const normalized = normalizeCharacterProfile(profile ?? {
@@ -11073,7 +11633,7 @@ function renderCharacterSelectBody() {
     return;
   }
   if (!slots.find((slot) => slot.id === characterUi.selectedSaveId)) {
-    characterUi.selectedSaveId = slots[0].id;
+    characterUi.selectedSaveId = firstAvailableCharacterSlotId(slots) || slots[0].id;
   }
 
   const purpose = normalizeCharacterSelectionPurpose(characterUi.selectionPurpose);
@@ -11085,16 +11645,20 @@ function renderCharacterSelectBody() {
   characterOverlayBodyEl.innerHTML = characterStatusMarkup();
   for (const slot of slots) {
     const selected = slot.id === characterUi.selectedSaveId;
+    const lockedElsewhere = slot.lockedElsewhere === true;
     const row = document.createElement("button");
     row.type = "button";
     row.className = "charSlotRow";
     row.style.width = "100%";
     row.style.textAlign = "left";
-    row.style.borderColor = selected ? "#4f79b7" : "#2b3956";
-    row.style.background = selected ? "rgba(28, 45, 73, 0.92)" : "rgba(12, 18, 30, 0.9)";
+    row.style.borderColor = lockedElsewhere ? "#6b4b4b" : (selected ? "#4f79b7" : "#2b3956");
+    row.style.background = lockedElsewhere
+      ? "rgba(42, 22, 22, 0.9)"
+      : (selected ? "rgba(28, 45, 73, 0.92)" : "rgba(12, 18, 30, 0.9)");
     const classLabel = characterClassDef(slot.profile?.classId ?? "").name;
     const speciesLabel = characterSpeciesDef(slot.profile?.speciesId ?? "").name;
     const depthLabel = slot.hasDungeonPosition ? String(slot.depth) : "Entrance";
+    const availabilityLabel = lockedElsewhere ? "\nActive in another browser" : "";
     const spriteDisplay = resolveCharacterSpriteDisplay(slot.profile?.speciesId ?? "", slot.profile?.classId ?? "");
     const visual = spriteDisplay.src
       ? `<img class="charSlotSprite" src="${spriteDisplay.src}" alt="${escapeHtmlText(speciesLabel)} ${escapeHtmlText(classLabel)} sprite" />`
@@ -11105,9 +11669,10 @@ function renderCharacterSelectBody() {
       `<div class="charSlotTitle">${escapeHtmlText(slot.profile?.name ?? slot.name)}</div>` +
       `<div class="charSlotMeta">Species: ${speciesLabel}  |  Class: ${classLabel}\n` +
       `Level ${slot.level}  |  Last depth ${depthLabel}  |  Deepest ${slot.deepestDepth}\n` +
-      `Updated ${formatSaveTimestamp(slot.updatedAt)}</div>` +
+      `Updated ${formatSaveTimestamp(slot.updatedAt)}${availabilityLabel}</div>` +
       `</div>`;
     row.addEventListener("click", () => {
+      if (lockedElsewhere) return;
       characterUi.selectedSaveId = slot.id;
       setCharacterOverlayStatus("");
       renderCharacterOverlay();
@@ -11118,7 +11683,8 @@ function renderCharacterSelectBody() {
   characterOverlayPrimaryEl.textContent = purpose === "swap_character"
     ? "Switch to Selected Character"
     : "Load Selected Run";
-  characterOverlayPrimaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId;
+  const selectedSlot = slots.find((slot) => slot.id === characterUi.selectedSaveId) ?? null;
+  characterOverlayPrimaryEl.disabled = characterUi.loading || !characterUi.selectedSaveId || selectedSlot?.lockedElsewhere === true;
   characterOverlayPrimaryEl.style.display = "";
     characterOverlaySecondaryEl.textContent = "New Character";
   characterOverlaySecondaryEl.disabled = characterUi.loading || slots.length >= slotCap;
@@ -11366,20 +11932,6 @@ function renderCharacterOverlay() {
   if (characterUi.mode === "select") renderCharacterSelectBody();
   else renderCharacterCreateBody();
 }
-async function saveStateToServerSlot(state, overwriteId = "", nameOverride = "") {
-  const payload = exportSave(state);
-  const level = Math.max(1, Math.floor(state?.player?.level ?? 1));
-  const depth = Math.trunc(state?.player?.z ?? 0);
-  const name = (String(nameOverride || defaultServerSaveNameForState(state)).trim() || defaultServerSaveNameForState(state)).slice(0, saveNameMaxLen);
-  return saveApiRequest("POST", {
-    action: "save",
-    overwrite_id: overwriteId || undefined,
-    name,
-    payload,
-    level,
-    depth,
-  });
-}
 async function handleCharacterOverlayPrimary() {
   if (characterUi.loading) return;
   if (characterUi.mode === "select") {
@@ -11387,6 +11939,11 @@ async function handleCharacterOverlayPrimary() {
     const selectedId = String(characterUi.selectedSaveId ?? "");
     const purpose = normalizeCharacterSelectionPurpose(characterUi.selectionPurpose);
     const targetSlot = (Array.isArray(characterUi.slots) ? characterUi.slots : []).find((slot) => slot.id === selectedId) ?? null;
+    if (targetSlot?.lockedElsewhere === true) {
+      setCharacterOverlayStatus("That character is already active in another browser. Choose a different character.", true);
+      renderCharacterOverlay();
+      return;
+    }
     const activeSlotId = String(getActiveCharacterSlotId() ?? "");
     const currentSlot = (Array.isArray(characterUi.slots) ? characterUi.slots : []).find((slot) => slot.id === activeSlotId) ?? null;
     if (purpose === "swap_character" && activeSlotId && activeSlotId !== selectedId) {
@@ -11399,13 +11956,13 @@ async function handleCharacterOverlayPrimary() {
     const loaded = purpose === "swap_character"
       ? await switchCharacter(selectedId, {
         characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(selectedId)),
-        latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
         forceEntrance: false,
+        slotMeta: targetSlot,
       })
       : await loadRunFromCharacterSlot(selectedId, {
         forceEntrance: false,
         characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(selectedId)),
-        latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
+        slotMeta: targetSlot,
       });
     characterUi.loading = false;
     if (loaded) {
@@ -11523,12 +12080,6 @@ async function handleCharacterOverlayPrimary() {
         seededRun = createCharacterRunFromCurrentDungeon(game, snapshot);
         if (!seededRun) throw new Error("Could not prepare the new character in the current dungeon.");
       }
-      let firstSaveId = "";
-      if (seededRun) {
-        const slotName = `${profile.name} • ${characterClassDef(profile.classId).name}`.slice(0, saveNameMaxLen);
-        const savedRun = await saveStateToServerSlot(seededRun, "", slotName);
-        firstSaveId = String(savedRun?.save?.id ?? "").trim();
-      }
       characterUi.slots = ensureCharacterSlotsList(await fetchCharacterSlotsFromServer());
       const preferredSlotId = characterStateSlotId(profile.id);
       const preferredExists = !!(preferredSlotId && characterUi.slots.some((slot) => slot.id === preferredSlotId));
@@ -11536,7 +12087,9 @@ async function handleCharacterOverlayPrimary() {
       if (shouldAutoEnterNewCharacter && characterUi.selectedSaveId) {
         const loaded = await loadRunFromCharacterSlot(characterUi.selectedSaveId, {
           characterId: profile.id,
-          latestSaveId: firstSaveId,
+          forceEntrance: shouldUseCurrentDungeon,
+          basePayload: shouldUseCurrentDungeon && game ? exportSharedDungeonPayload(game) || exportSave(game) : "",
+          slotMeta: characterUi.slots.find((slot) => slot.id === characterUi.selectedSaveId) ?? null,
         });
         if (!loaded) throw new Error("Character created, but the first load failed.");
         setActiveCharacterSlotId(characterUi.selectedSaveId);
@@ -11701,7 +12254,7 @@ async function handleCharacterOverlayTertiary() {
         const targetSlot = characterUi.slots.find((s) => s.id === characterUi.selectedSaveId) ?? null;
         const switched = await loadRunFromCharacterSlot(characterUi.selectedSaveId, {
           characterId: normalizeCharacterProfileId(targetSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(characterUi.selectedSaveId)),
-          latestSaveId: String(targetSlot?.latestSaveId ?? "").trim(),
+          slotMeta: targetSlot,
         });
         if (!switched) {
           setActiveCharacterSlotId(characterUi.selectedSaveId);
@@ -11737,8 +12290,9 @@ async function startCharacterFlow() {
       characterUi.slots = ensureCharacterSlotsList(await fetchCharacterSlotsFromServer());
       const activeId = getActiveCharacterSlotId();
       const hasSlots = (characterUi.slots?.length ?? 0) > 0;
-      const activeSlotExists = !!(activeId && characterUi.slots.some((slot) => slot.id === activeId));
-      characterUi.selectedSaveId = activeSlotExists ? activeId : (characterUi.slots[0]?.id || "");
+      const activeSlotExists = !!(activeId && characterUi.slots.some((slot) => slot.id === activeId && slot.lockedElsewhere !== true));
+      const availableSlotId = firstAvailableCharacterSlotId(characterUi.slots);
+      characterUi.selectedSaveId = activeSlotExists ? activeId : (availableSlotId || characterUi.slots[0]?.id || "");
       characterUi.selectionPurpose = "load_run";
       characterUi.mode = hasSlots ? "select" : "create";
       if (isAuthoritativeModeEnabled() && hasSlots && characterUi.selectedSaveId) {
@@ -11755,8 +12309,8 @@ async function startCharacterFlow() {
             characterId: normalizeCharacterProfileId(
               resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
             ),
-            latestSaveId: String(resumeSlot?.latestSaveId ?? "").trim(),
             silent: true,
+            slotMeta: resumeSlot,
           });
           if (!loaded) continue;
           characterUi.selectedSaveId = resumeSlotId;
@@ -11779,23 +12333,67 @@ async function startCharacterFlow() {
           setCharacterOverlayStatus("No available character slot could be resumed. Choose a different character.", true);
         }
       }
+      if (!isAuthoritativeModeEnabled() && hasSlots && availableSlotId) {
+        const preferredSlotId = characterUi.selectedSaveId || availableSlotId;
+        const orderedSlots = [
+          ...(preferredSlotId ? characterUi.slots.filter((slot) => slot.id === preferredSlotId) : []),
+          ...characterUi.slots.filter((slot) => slot.id !== preferredSlotId),
+        ].filter((slot) => slot.lockedElsewhere !== true);
+        for (const resumeSlot of orderedSlots) {
+          const resumeSlotId = String(resumeSlot?.id ?? "").trim();
+          if (!resumeSlotId) continue;
+          const loaded = await loadRunFromCharacterSlot(resumeSlotId, {
+            forceEntrance: false,
+            characterId: normalizeCharacterProfileId(
+              resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
+            ),
+            silent: true,
+            slotMeta: resumeSlot,
+          });
+          if (!loaded) continue;
+          characterUi.selectedSaveId = resumeSlotId;
+          if (!activeSlotExists || preferredSlotId !== resumeSlotId) setActiveCharacterSlotId(resumeSlotId);
+          requiresCharacterCreation = false;
+          setCharacterOverlayStatus("");
+          allowResumeWithoutOverlay = true;
+          return;
+        }
+      }
       // On refresh, keep the in-progress run if the account still has at least one slot.
       // We only block resume when there are zero slots (all characters deleted).
       if (!isAuthoritativeModeEnabled() && bootLoadedFromLocalSave && hasSlots) {
-        if (!activeSlotExists && characterUi.selectedSaveId) setActiveCharacterSlotId(characterUi.selectedSaveId);
-        requiresCharacterCreation = false;
-        setCharacterOverlayStatus("");
-        allowResumeWithoutOverlay = true;
-        return;
+        if (isAuthenticatedUser) {
+          const resumeSlotId = authenticatedBootLoadedSlotId(characterUi.slots);
+          if (!resumeSlotId) {
+            clearCurrentRunResumeSnapshot();
+            bootLoadedFromLocalSave = false;
+          } else {
+            characterUi.selectedSaveId = resumeSlotId;
+            if (!activeSlotExists || activeId !== resumeSlotId) setActiveCharacterSlotId(resumeSlotId);
+            requiresCharacterCreation = false;
+            setCharacterOverlayStatus("");
+            allowResumeWithoutOverlay = true;
+            return;
+          }
+        } else {
+          if (!activeSlotExists && characterUi.selectedSaveId) setActiveCharacterSlotId(characterUi.selectedSaveId);
+          requiresCharacterCreation = false;
+          setCharacterOverlayStatus("");
+          allowResumeWithoutOverlay = true;
+          return;
+        }
       }
       if (!hasSlots) {
         setActiveCharacterSlotId("");
-        try { localStorage.removeItem(SAVE_KEY); } catch {}
+        clearCurrentRunResumeSnapshot();
         bootLoadedFromLocalSave = false;
       }
       if (characterUi.mode === "create") {
         resetCharacterCreationDraft(null, { step: "welcome" });
-        setCharacterOverlayStatus("Create a character to continue.", true);
+        setCharacterOverlayStatus(
+          hasSlots ? "All existing characters are active in other browser windows. Create a new character to continue." : "Create a character to continue.",
+          true
+        );
       } else {
         setCharacterOverlayStatus("Select or create a character to continue.", true);
       }
@@ -11866,6 +12464,47 @@ function hasPendingSaveAfterLoginHandoff() {
   }
 }
 
+function currentRunResumeStorage() {
+  if (!(isAuthenticatedUser && !hasPendingSaveAfterLoginHandoff())) {
+    return localStorage;
+  }
+  try {
+    return sessionStorage;
+  } catch {
+    return localStorage;
+  }
+}
+
+function readCurrentRunResumeSnapshot() {
+  try {
+    return String(currentRunResumeStorage().getItem(SAVE_KEY) ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function writeCurrentRunResumeSnapshot(payload = "") {
+  const storage = currentRunResumeStorage();
+  try {
+    storage.setItem(SAVE_KEY, String(payload ?? ""));
+  } catch {}
+}
+
+function clearCurrentRunResumeSnapshot() {
+  try { sessionStorage.removeItem(SAVE_KEY); } catch {}
+  try { localStorage.removeItem(SAVE_KEY); } catch {}
+}
+
+function authenticatedBootLoadedSlotId(slots = []) {
+  if (!isAuthenticatedUser || !Array.isArray(slots)) return "";
+  const characterId = normalizeCharacterProfileId(game?.character?.id ?? "");
+  const slotId = characterStateSlotId(characterId);
+  if (!slotId) return "";
+  const slot = slots.find((entry) => String(entry?.id ?? "").trim() === slotId);
+  if (!slot || slot.lockedElsewhere === true) return "";
+  return slotId;
+}
+
 function clearPendingSaveAfterLoginHandoff() {
   try { localStorage.removeItem(SAVE_LOGIN_HANDOFF_KEY); } catch {}
 }
@@ -11895,20 +12534,6 @@ function pickMostRecentAutosaveIdForCharacter(saves = [], characterId = "") {
     .slice()
     .sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
   return String(autosaves[0]?.id ?? "").trim();
-}
-async function resolveLatestSaveIdForCharacter(characterId = "") {
-  const cid = normalizeCharacterProfileId(characterId);
-  if (!cid) return "";
-  const cached = pickMostRecentSaveIdForCharacter(saveMenuUi?.saves ?? [], cid);
-  if (cached) return cached;
-  try {
-    const data = await saveApiRequest("GET");
-    const saves = Array.isArray(data?.saves) ? data.saves : [];
-    saveMenuUi.saves = saves;
-    return pickMostRecentSaveIdForCharacter(saves, cid);
-  } catch {
-    return "";
-  }
 }
 function normalizeCharacterSnapshotPosition(src = null) {
   const raw = (src && typeof src === "object") ? src : {};
@@ -11942,8 +12567,17 @@ async function resolveAutosaveOverwriteIdFromServer(state = null) {
 function mostRecentCharacterSlotIdFromSaveListResponse(listData = null) {
   const data = (listData && typeof listData === "object") ? listData : {};
   const states = Array.isArray(data.character_states) ? data.character_states : [];
+  const currentSessionId = String(characterSessionRuntime.sessionId ?? "").trim();
+  const activeLocks = Array.isArray(data.active_character_locks) ? data.active_character_locks : [];
+  const lockedElsewhere = new Set(
+    activeLocks
+      .filter((entry) => String(entry?.session_id ?? "").trim() !== currentSessionId)
+      .map((entry) => normalizeCharacterProfileId(entry?.character_id ?? ""))
+      .filter(Boolean)
+  );
   for (const entry of states) {
     const cid = normalizeCharacterProfileId(entry?.id ?? "");
+    if (!cid || lockedElsewhere.has(cid)) continue;
     const slotId = characterStateSlotId(cid);
     if (slotId) return slotId;
   }
@@ -11952,22 +12586,22 @@ function mostRecentCharacterSlotIdFromSaveListResponse(listData = null) {
 
 async function loadLatestAccountRunAfterGuestDecline() {
   if (!isAuthenticatedUser) return false;
-  let data = null;
   try {
-    data = await saveApiRequest("GET");
+    const slots = ensureCharacterSlotsList(await fetchCharacterSlotsFromServer());
+    const slotId = firstAvailableCharacterSlotId(slots);
+    if (slotId) {
+      setActiveCharacterSlotId(slotId);
+      const characterId = normalizeCharacterProfileIdFromSlotId(slotId);
+      clearSaveDirty();
+      const loadedCharacter = await loadRunFromCharacterSlot(slotId, {
+        forceEntrance: false,
+        characterId,
+        slotMeta: slots.find((slot) => slot.id === slotId) ?? null,
+      });
+      if (loadedCharacter) return true;
+    }
   } catch {
     return false;
-  }
-  const slotId = mostRecentCharacterSlotIdFromSaveListResponse(data);
-  if (slotId) {
-    setActiveCharacterSlotId(slotId);
-    const characterId = normalizeCharacterProfileIdFromSlotId(slotId);
-    clearSaveDirty();
-    const loadedCharacter = await loadRunFromCharacterSlot(slotId, {
-      forceEntrance: false,
-      characterId,
-    });
-    if (loadedCharacter) return true;
   }
   return false;
 }
@@ -12005,7 +12639,7 @@ function applyRespawnRecoveryState(state) {
 }
 function loadLocalAutosaveForRespawn() {
   try {
-    const payload = localStorage.getItem(SAVE_KEY);
+    const payload = readCurrentRunResumeSnapshot();
     if (!payload) return false;
     const loaded = importSave(payload);
     if (!loaded || loaded?.player?.dead) return false;
@@ -12019,36 +12653,14 @@ async function loadLatestAutosaveForRespawn() {
   if (isAuthoritativeModeEnabled()) return false;
 
   if (isAuthenticatedUser) {
-    const activeRunSaveId = String(saveRuntime.activeRunSaveId ?? "").trim();
-    if (activeRunSaveId) {
-      const loadedActive = await loadSaveFromServer(activeRunSaveId, {
-        showStatus: false,
-        closeOverlay: false,
-        forceEntrance: false,
-        requireAlive: true,
-      });
-      if (loadedActive && !game?.player?.dead) return true;
-    }
-    try {
-      const data = await saveApiRequest("GET");
-      const saves = Array.isArray(data?.saves) ? [...data.saves] : [];
-      saves.sort((a, b) => saveEntryUpdatedAtMs(b?.updated_at) - saveEntryUpdatedAtMs(a?.updated_at));
-      const autosave = saves.find((save) => saveNameLooksLikeAutosave(save?.name ?? ""));
-      const fallback = saves[0] ?? null;
-      const tried = new Set();
-      for (const candidate of [autosave, fallback]) {
-        const id = String(candidate?.id ?? "").trim();
-        if (!id || tried.has(id)) continue;
-        tried.add(id);
-        const loaded = await loadSaveFromServer(id, {
-          showStatus: false,
-          closeOverlay: false,
-          forceEntrance: false,
-          requireAlive: true,
-        });
-        if (loaded && !game?.player?.dead) return true;
+    const activeCharacterId = normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId());
+    if (activeCharacterId) {
+      const snapshot = await resolveLoadableCharacterSnapshot(activeCharacterId);
+      if (snapshot) {
+        const currentRun = game ? createCharacterRunFromCurrentDungeon(game, snapshot) : null;
+        if (currentRun && activateLoadedRunStateForRespawn(currentRun, "respawn-character")) return true;
       }
-    } catch {}
+    }
   }
 
   return loadLocalAutosaveForRespawn();
@@ -12171,7 +12783,10 @@ async function openCharacterSelectionOverlay(options = null) {
   try {
     characterUi.slots = ensureCharacterSlotsList(await fetchCharacterSlotsFromServer());
     const activeId = getActiveCharacterSlotId();
-    characterUi.selectedSaveId = activeId || characterUi.slots[0]?.id || "";
+    const activeSlotExists = !!(activeId && characterUi.slots.some((slot) => slot.id === activeId && slot.lockedElsewhere !== true));
+    characterUi.selectedSaveId = activeSlotExists
+      ? activeId
+      : (firstAvailableCharacterSlotId(characterUi.slots) || characterUi.slots[0]?.id || "");
     characterUi.selectionPurpose = mustHaveCharacterSlot() ? "load_run" : requestedPurpose;
     characterUi.mode = (characterUi.slots?.length ?? 0) > 0 ? "select" : "create";
     refreshCharacterCreationRequirement();
@@ -14057,6 +14672,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
 
   const state = {
     world,
+    sharedDungeonId: String(seedStr ?? randomSeedString()),
     player,
     character: characterProfile,
     seen: new Set(),
@@ -22838,6 +23454,7 @@ function exportSave(state) {
   const payload = {
     v: 11,
     seed: state.world.seedStr,
+    sharedDungeonId: String(state.sharedDungeonId ?? state.world.seedStr ?? "").trim(),
     fog: fogEnabled,
     minimap: minimapEnabled,
     player: {
@@ -23199,11 +23816,8 @@ function normalizeLoadedLiveTickState(state) {
   live.enabled = true;
   live.mode = "live_tick";
   if (!isAuthoritativeModeEnabled()) {
-    const customTickMs = optionalLocalDungeonTickMs(live.customTickMs);
-    live.customTickMs = customTickMs;
-    live.tickMs = customTickMs > 0
-      ? customTickMs
-      : normalizeLocalDungeonTickMs(LIVE_SIM_LOCAL_GUEST_TICK_MS, LIVE_SIM_LOCAL_GUEST_TICK_MS);
+    live.customTickMs = currentGlobalDungeonSpeedMs();
+    live.tickMs = currentGlobalDungeonSpeedMs();
   }
   if (!Number.isFinite(Number(live.lastStepAtMs ?? 0)) || Number(live.lastStepAtMs ?? 0) <= 0) {
     live.lastStepAtMs = Date.now();
@@ -25572,6 +26186,7 @@ function importSave(saveStr) {
 
     const state = {
       world,
+      sharedDungeonId: String(payload.sharedDungeonId ?? payload.seed ?? randomSeedString()).trim() || String(payload.seed ?? randomSeedString()),
       player: payload.player,
       seen: new Set(ensureArray(payload.seen)),
       visible: new Set(),
@@ -25995,15 +26610,20 @@ function onKeyUp(e) {
 
 function saveNow(state) {
   if (!state || isQuickSwitchCharacterActive(state)) return;
-  const payload = exportSave(state);
-  try { localStorage.setItem(SAVE_KEY, payload); } catch {}
+  const payload = (isAuthenticatedUser && canUseSharedDungeonSync())
+    ? (exportSharedDungeonPayload(state) || exportSave(state))
+    : exportSave(state);
+  writeCurrentRunResumeSnapshot(payload);
   clearSaveDirty();
   syncItemAuthorityFromStateIfChanged(state, "save-now");
 }
 
 function saveResumeSnapshot(state) {
   if (!state || isQuickSwitchCharacterActive(state)) return;
-  try { localStorage.setItem(SAVE_KEY, exportSave(state)); } catch {}
+  const payload = (isAuthenticatedUser && canUseSharedDungeonSync())
+    ? (exportSharedDungeonPayload(state) || exportSave(state))
+    : exportSave(state);
+  writeCurrentRunResumeSnapshot(payload);
 }
 
 function loadSaveOrNew() {
@@ -26016,15 +26636,35 @@ function loadSaveOrNew() {
     enforceAdminControlPolicy(g);
     return g;
   }
+  if (isAuthenticatedUser && !hasPendingSaveAfterLoginHandoff()) {
+    try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    try {
+      const s = readCurrentRunResumeSnapshot();
+      if (s) {
+        const loaded = importSave(s);
+        if (loaded) {
+          normalizeLoadedLiveTickState(loaded);
+          const changed = enforceAdminControlPolicy(loaded);
+          if (changed) saveNow(loaded);
+          return loaded;
+        }
+      }
+    } catch {}
+    const g = makeNewGame();
+    normalizeLoadedLiveTickState(g);
+    enforceAdminControlPolicy(g);
+    return g;
+  }
   try {
     const prevAuthState = String(localStorage.getItem(SAVE_AUTH_STATE_KEY) ?? "");
     if (authState === "guest" && prevAuthState !== "guest") {
-      localStorage.removeItem(SAVE_KEY);
+      clearCurrentRunResumeSnapshot();
     }
   } catch {}
   try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
   try {
-    const s = localStorage.getItem(SAVE_KEY);
+    const s = readCurrentRunResumeSnapshot();
     if (s) {
       const loaded = importSave(s);
       if (loaded) {
@@ -27159,7 +27799,7 @@ debugLevelInputEl?.addEventListener("keydown", (e) => {
   e.stopPropagation();
   runDebugSetLevel();
 });
-const runDebugSetDungeonSpeed = () => {
+const runDebugSetDungeonSpeed = async () => {
   if (!canUseAdminControls()) return;
   if (!game || !debugDungeonSpeedInputEl) return;
   const raw = debugDungeonSpeedInputEl.value.trim();
@@ -27172,17 +27812,22 @@ const runDebugSetDungeonSpeed = () => {
     pushLog(game, "Invalid dungeon speed value.");
     return;
   }
-  setDungeonSpeedDebug(game, parsed);
+  try {
+    await setDungeonSpeedDebug(game, parsed);
+  } catch (err) {
+    pushLog(game, err?.message ?? "Could not update dungeon speed.");
+    renderLog(game);
+  }
 };
 debugDungeonSpeedGoEl?.addEventListener("click", (e) => {
   e.preventDefault();
-  runDebugSetDungeonSpeed();
+  void runDebugSetDungeonSpeed();
 });
 debugDungeonSpeedInputEl?.addEventListener("keydown", (e) => {
   if (e.key !== "Enter") return;
   e.preventDefault();
   e.stopPropagation();
-  runDebugSetDungeonSpeed();
+  void runDebugSetDungeonSpeed();
 });
 const runDebugClearRadius = () => {
   if (!canUseAdminControls()) return;
@@ -27415,6 +28060,10 @@ if (!HEADLESS_RUNTIME) {
     renderLog(game);
     markCharacterStateDirty(game, "startup");
     void syncCharacterStateIfDirty("startup");
+    restartSharedDungeonSyncLoop();
+    if (canUseSharedDungeonSync()) {
+      void syncSharedDungeonState("startup", { forcePull: true });
+    }
     restartAnalyticsHeartbeatLoop(game);
     void flushAnalyticsIfNeeded(game, "startup-init");
     void refreshSpriteOverridesFromServer(true);
@@ -27429,7 +28078,10 @@ if (!HEADLESS_RUNTIME) {
       if (!game) return;
       saveResumeSnapshot(game);
       if (closeRun) {
+        stopSharedDungeonSyncLoop();
         requestLifecycleAuthoritativeClose("lifecycle-close");
+        void closeCharacterSession("lifecycle-close");
+        releaseBrowserInstanceClaim();
         stopAnalyticsHeartbeatLoop();
         void endAnalyticsRun(game, {
           status: "closed",
@@ -27449,6 +28101,12 @@ if (!HEADLESS_RUNTIME) {
       }
       if (characterSyncRuntime.dirty) {
         void syncCharacterStateIfDirty("lifecycle");
+      }
+      if (canUseSharedDungeonSync()) {
+        void syncSharedDungeonState(closeRun ? "lifecycle-close" : "lifecycle", {
+          forcePush: true,
+          skipPull: closeRun,
+        });
       }
       if (!saveRuntime.dirty) return;
       if (!isAuthenticatedUser) {
