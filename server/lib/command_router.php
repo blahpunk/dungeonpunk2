@@ -461,7 +461,8 @@ function authoritative_poll_movement(
   string $userEmail,
   string $saveSecret,
   string $sessionId,
-  int $timeoutMs = 25000
+  int $timeoutMs = 25000,
+  int $minResponseMs = 8
 ): array {
   $loaded = authoritative_load_session_run_context($userEmail, $sessionId);
   $session = $loaded['session'];
@@ -505,7 +506,7 @@ function authoritative_poll_movement(
   if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
     $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
   }
-  $result = authoritative_worker_poll_movement($worldPayload, $sessionIdNorm, $timeoutMs);
+  $result = authoritative_worker_poll_movement($worldPayload, $sessionIdNorm, $timeoutMs, $minResponseMs);
   $resultTick = is_array($result['tick'] ?? null) ? $result['tick'] : null;
   $resultPerf = is_array($result['perf'] ?? null) ? $result['perf'] : null;
   $resultIntent = is_array($result['intent'] ?? null) ? $result['intent'] : null;
@@ -540,8 +541,8 @@ function authoritative_poll_movement(
 
   $resultDiff = is_array($result['diff'] ?? null) ? $result['diff'] : null;
   $resultHotDelta = is_array($result['hotDelta'] ?? null) ? $result['hotDelta'] : null;
-  // Consistency-first movement polling: always send full snapshot payload.
-  $sendDiff = false;
+  // Prefer payload diffs for movement polls to reduce response size and latency.
+  $sendDiff = is_array($resultDiff);
 
   $response = authoritative_build_snapshot_response($session, $snapshot, [
     'ok' => $moved,

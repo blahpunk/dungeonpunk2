@@ -3,7 +3,7 @@ import {
   LOCAL_SLOT_MAX,
   createLocalSlotStore,
 } from "./client/save/saveManager.js?v=20260315a";
-import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260320b";
+import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260320e";
 import {
   abilityCommand,
   attackCommand,
@@ -221,7 +221,7 @@ const FEATURE_FLAGS = Object.freeze({
   liveTickCombat: true,
 });
 const LIVE_SIM_SCHEMA_VERSION = 1;
-const LIVE_SIM_DEFAULT_TICK_MS = 28;
+const LIVE_SIM_DEFAULT_TICK_MS = 22;
 const LIVE_SIM_TICKS_PER_LEGACY_TURN = 10;
 const LIVE_SIM_MAX_EVENT_HISTORY = 48;
 const LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS = 3;
@@ -1799,22 +1799,21 @@ const surfaceCompassArrowEl = document.getElementById("surfaceCompassArrow");
 // Right-side panels: panels are always visible; keep references for layout if needed
 const wrapEl = document.getElementById("wrap");
 const rightColEl = document.getElementById("rightCol");
-let cacheBustCounter = 0;
 const authoritativeMirror = createServerMirror();
 const authoritativePendingAction = createPendingActionState();
 let lifecycleAuthoritativeCloseRequested = false;
 const AUTHORITATIVE_SESSION_TOUCH_INTERVAL_MS = 15000;
 const AUTHORITATIVE_COMMAND_QUEUE_MAX = 8;
-const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 2;
-const AUTHORITATIVE_MOVE_BATCH_MAX = 1;
+const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 3;
+const AUTHORITATIVE_MOVE_BATCH_MAX = 3;
 const authoritativeCommandQueue = [];
-const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 90;
-const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 28;
-const AUTHORITATIVE_CLIENT_TICK_MS_MIN = 25;
+const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 40;
+const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 22;
+const AUTHORITATIVE_CLIENT_TICK_MS_MIN = 16;
 const AUTHORITATIVE_CLIENT_TICK_MS_MAX = 100;
 const AUTHORITATIVE_CLIENT_PREDICTION_ENABLED = true;
-const AUTHORITATIVE_ATTACK_PREDICTION_ENABLED = false;
-const AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD = 1;
+const AUTHORITATIVE_ATTACK_PREDICTION_ENABLED = true;
+const AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD = 3;
 const AUTHORITATIVE_PAYLOAD_DIFF_FORMAT = "save_payload_delta_v1";
 const AUTHORITATIVE_PAYLOAD_DIFF_MAX_OPS = 1600;
 const AUTHORITATIVE_PAYLOAD_DIFF_MAX_BYTES = 120000;
@@ -1853,7 +1852,9 @@ const authoritativeSessionRuntime = {
   lastTouchAt: 0,
 };
 const AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS = 25000;
-const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 200;
+const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 50;
+const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MAX_MS = 2000;
+const AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS = 8;
 const AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED = true;
 const authoritativeMovementChannelRuntime = {
   pollInFlight: false,
@@ -1913,6 +1914,7 @@ const authoritativeVisualMotionRuntime = {
   startAtMs: 0,
   durationMs: 45,
 };
+const entityVisualMotionRuntimes = new Map();
 
 function resolveAuthoritativeVisualPlayerPosition(fallbackX = 0, fallbackY = 0, nowMs = Date.now()) {
   if (!AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) {
@@ -1923,14 +1925,69 @@ function resolveAuthoritativeVisualPlayerPosition(fallbackX = 0, fallbackY = 0, 
   }
   const start = Number(authoritativeVisualMotionRuntime.startAtMs ?? 0);
   const duration = Math.max(1, Number(authoritativeVisualMotionRuntime.durationMs ?? 45));
-  const progress = Math.max(0, Math.min(1, (Number(nowMs) - start) / duration));
+  const t = Math.max(0, Math.min(1, (Number(nowMs) - start) / duration));
+  const progress = 1 - Math.pow(1 - t, 3);
   const x = authoritativeVisualMotionRuntime.fromX + (authoritativeVisualMotionRuntime.toX - authoritativeVisualMotionRuntime.fromX) * progress;
   const y = authoritativeVisualMotionRuntime.fromY + (authoritativeVisualMotionRuntime.toY - authoritativeVisualMotionRuntime.fromY) * progress;
-  if (progress >= 1) {
+  if (t >= 1) {
     authoritativeVisualMotionRuntime.fromX = authoritativeVisualMotionRuntime.toX;
     authoritativeVisualMotionRuntime.fromY = authoritativeVisualMotionRuntime.toY;
   }
   return { x, y };
+}
+
+function resolveEntityVisualPosition(entityId = "", fallbackX = 0, fallbackY = 0, nowMs = Date.now()) {
+  const id = String(entityId ?? "").trim();
+  if (!id || !AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) {
+    return { x: Number(fallbackX) || 0, y: Number(fallbackY) || 0 };
+  }
+  const runtime = entityVisualMotionRuntimes.get(id);
+  if (!runtime || runtime.initialized !== true) {
+    return { x: Number(fallbackX) || 0, y: Number(fallbackY) || 0 };
+  }
+  const start = Number(runtime.startAtMs ?? 0);
+  const duration = Math.max(1, Number(runtime.durationMs ?? 45));
+  const t = Math.max(0, Math.min(1, (Number(nowMs) - start) / duration));
+  const progress = 1 - Math.pow(1 - t, 3);
+  const x = Number(runtime.fromX ?? 0) + (Number(runtime.toX ?? 0) - Number(runtime.fromX ?? 0)) * progress;
+  const y = Number(runtime.fromY ?? 0) + (Number(runtime.toY ?? 0) - Number(runtime.fromY ?? 0)) * progress;
+  if (t >= 1) {
+    runtime.fromX = runtime.toX;
+    runtime.fromY = runtime.toY;
+    entityVisualMotionRuntimes.set(id, runtime);
+  }
+  return { x, y };
+}
+
+function noteEntityVisualTarget(entityId = "", nextX = 0, nextY = 0, nowMs = Date.now(), tickMs = 50) {
+  const id = String(entityId ?? "").trim();
+  if (!id || !AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) return;
+  const nx = Number(nextX) || 0;
+  const ny = Number(nextY) || 0;
+  const existing = entityVisualMotionRuntimes.get(id);
+  if (!existing || existing.initialized !== true) {
+    entityVisualMotionRuntimes.set(id, {
+      initialized: true,
+      fromX: nx,
+      fromY: ny,
+      toX: nx,
+      toY: ny,
+      startAtMs: Number(nowMs) || Date.now(),
+      durationMs: 1,
+    });
+    return;
+  }
+  const current = resolveEntityVisualPosition(id, existing.toX, existing.toY, nowMs);
+  if (Math.abs(nx - Number(existing.toX ?? nx)) < 0.001 && Math.abs(ny - Number(existing.toY ?? ny)) < 0.001) return;
+  const dist = Math.abs(nx - current.x) + Math.abs(ny - current.y);
+  existing.fromX = current.x;
+  existing.fromY = current.y;
+  existing.toX = nx;
+  existing.toY = ny;
+  existing.startAtMs = Number(nowMs) || Date.now();
+  existing.durationMs = Math.max(18, Math.min(96, Math.round(Number(tickMs) * (dist > 1 ? 0.95 : 0.82))));
+  existing.initialized = true;
+  entityVisualMotionRuntimes.set(id, existing);
 }
 
 function resetAuthoritativeVisualMotion(x = 0, y = 0) {
@@ -1986,18 +2043,10 @@ function resolveBrowserInstanceId() {
   return id;
 }
 
-function withCacheBust(url) {
-  const sep = url.includes("?") ? "&" : "?";
-  cacheBustCounter += 1;
-  const token = `${appBuildVersion}.${Date.now().toString(36)}.${Math.floor(Math.random() * 1e9).toString(36)}.${cacheBustCounter.toString(36)}`;
-  return `${url}${sep}_cb=${encodeURIComponent(token)}`;
-}
-
 const authoritativeApi = createAuthoritativeApi({
   baseUrl: "./index.php",
   csrfToken: saveApiCsrfToken,
   browserInstanceId: resolveBrowserInstanceId(),
-  cacheBust: withCacheBust,
   liveTickCombat: () => resolveLiveTickCombatRequestMode(),
 });
 
@@ -3036,6 +3085,7 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
   if (authoritativeMovementChannelRuntime.pollInFlight) return false;
   authoritativeMovementChannelRuntime.stopRequested = false;
   authoritativeMovementChannelRuntime.sessionId = sid;
+  let retryCount = 0;
   while (
     !authoritativeMovementChannelRuntime.stopRequested &&
     isAuthoritativeSessionActive() &&
@@ -3048,6 +3098,7 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
       const response = await authoritativeApi.pollMovement({
         sessionId: sid,
         timeoutMs: AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS,
+        minResponseMs: AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS,
         signal: controller?.signal,
       });
       if (
@@ -3066,6 +3117,7 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
       } else if (response?.tick) {
         noteAuthoritativeTickFromResponse(response);
       }
+      retryCount = 0;
     } catch (err) {
       if (authoritativeMovementChannelRuntime.stopRequested) break;
       if (String(err?.name ?? "").trim() === "AbortError") break;
@@ -3079,7 +3131,12 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
         renderLog(game);
         authoritativeMovementChannelRuntime.lastErrorAt = now;
       }
-      await new Promise((resolve) => setTimeout(resolve, AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS));
+      const backoffMs = Math.min(
+        AUTHORITATIVE_MOVEMENT_POLL_RETRY_MAX_MS,
+        AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS * Math.pow(2, retryCount)
+      );
+      retryCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     } finally {
       if (authoritativeMovementChannelRuntime.abortController === controller) {
         authoritativeMovementChannelRuntime.abortController = null;
@@ -9450,7 +9507,7 @@ async function switchToCharacterSlot(slotId, options = null) {
 
 async function saveApiRequest(method = "GET", body = null, query = "") {
   const q = query ? `&${query}` : "";
-  const url = withCacheBust(`./index.php?api=savegames${q}`);
+  const url = `./index.php?api=savegames${q}`;
   const headers = {
     Accept: "application/json",
     "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -19121,7 +19178,7 @@ async function monsterEditorApiRequest(method = "GET", body = null) {
   }
   let resp = null;
   try {
-    resp = await fetch(withCacheBust("./index.php?api=monsters"), init);
+    resp = await fetch("./index.php?api=monsters", init);
   } catch {
     throw new Error("Network error while contacting the monster API.");
   }
@@ -19740,7 +19797,7 @@ async function spriteApiRequest(method = "GET", body = null) {
   }
   let resp = null;
   try {
-    resp = await fetch(withCacheBust("./index.php?api=sprites"), init);
+    resp = await fetch("./index.php?api=sprites", init);
   } catch {
     throw new Error("Network error while contacting the sprite API.");
   }
@@ -19814,7 +19871,7 @@ function verifySpriteAssetUrlLoad(url) {
       resolve(true);
     };
     img.onerror = () => reject(new Error("Uploaded sprite could not be loaded from the server."));
-    img.src = withCacheBust(src);
+    img.src = src;
   });
 }
 
@@ -20775,16 +20832,25 @@ function draw(state) {
 
         if (mk) {
           const ent = state.entities.get(mk);
+          const visualEntity = (isAuthoritativeSessionActive() && ent?.id)
+            ? (() => {
+                const tickMs = authoritativeClientTickMs();
+                noteEntityVisualTarget(ent.id, ent.x, ent.y, nowMs, tickMs);
+                return resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs);
+              })()
+            : { x: ent?.x ?? wx, y: ent?.y ?? wy };
+          const monsterDrawSx = Number(visualEntity.x ?? wx) - player.x + viewRadiusX;
+          const monsterDrawSy = Number(visualEntity.y ?? wy) - player.y + viewRadiusY;
           const monsterSpriteIdValue = monsterSpriteId(ent?.type);
           const monsterSprite = getSpriteIfReady(monsterSpriteIdValue);
           if (monsterSprite) {
             deferredWorldObjects.push({
               kind: "monster-sprite",
-              sortY: wy,
-              sortX: wx,
+              sortY: Number(visualEntity.y ?? wy),
+              sortX: Number(visualEntity.x ?? wx),
               order: 1,
-              sx,
-              sy,
+              sx: monsterDrawSx,
+              sy: monsterDrawSy,
               img: monsterSprite,
               spriteId: monsterSpriteIdValue,
               entityId: ent?.id ?? "",
@@ -20809,16 +20875,25 @@ function draw(state) {
         }
         if (ak) {
           const ent = state.entities.get(ak);
+          const visualEntity = (isAuthoritativeSessionActive() && ent?.id)
+            ? (() => {
+                const tickMs = authoritativeClientTickMs();
+                noteEntityVisualTarget(ent.id, ent.x, ent.y, nowMs, tickMs);
+                return resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs);
+              })()
+            : { x: ent?.x ?? wx, y: ent?.y ?? wy };
+          const actorDrawSx = Number(visualEntity.x ?? wx) - player.x + viewRadiusX;
+          const actorDrawSy = Number(visualEntity.y ?? wy) - player.y + viewRadiusY;
           const actorSpriteIdValue = (ent?.spriteId && SPRITE_SOURCES[ent.spriteId]) ? ent.spriteId : (SPRITE_SOURCES.hero ? "hero" : "");
           const actorSprite = actorSpriteIdValue ? getSpriteIfReady(actorSpriteIdValue) : null;
           if (actorSprite) {
             deferredWorldObjects.push({
               kind: "actor-sprite",
-              sortY: wy,
-              sortX: wx,
+              sortY: Number(visualEntity.y ?? wy),
+              sortX: Number(visualEntity.x ?? wx),
               order: 1.5,
-              sx,
-              sy,
+              sx: actorDrawSx,
+              sy: actorDrawSy,
               img: actorSprite,
               spriteId: actorSpriteIdValue,
               entityId: ent?.id ?? "",
@@ -22069,7 +22144,7 @@ function pushLiveSimulationEvent(state, type = "", options = null) {
 
 function liveMovementRecoveryTicks(actor = null, actorKind = "player") {
   const speed = Math.max(0.5, Number(actor?.spd ?? 1) || 1);
-  const baseTicks = actorKind === "player" ? 2 : 4;
+  const baseTicks = actorKind === "player" ? 1 : 2;
   return Math.max(1, Math.min(12, Math.round(baseTicks / speed)));
 }
 
@@ -22194,6 +22269,15 @@ function reserveLivePlayerAbilityResources(state, ability = null) {
   );
   state.lastPlayerActionKind = "ability";
   return true;
+}
+
+function syncLiveAbilityCooldownFromPlayerLegacy(state) {
+  if (!state?.player) return;
+  const playerLive = ensureLiveActorState(state.player, "player");
+  playerLive.cooldowns.abilityTicks = Math.max(
+    playerLive.cooldowns.abilityTicks,
+    liveTicksFromLegacyTurns(Math.max(0, Math.floor(Number(state.player.abilityCd ?? 0) || 0)))
+  );
 }
 
 function liveTelegraphShapeForAbility(ability = null) {
@@ -23908,6 +23992,9 @@ function executeLiveTickCommandOnState(state, rawCommand = null, options = null)
         snapshot: snapshotWithAreaRespawn(),
       };
     }
+    // Instant abilities still need live cooldown bookkeeping so the HUD
+    // countdown remains accurate under live-tick simulation.
+    syncLiveAbilityCooldownFromPlayerLegacy(state);
     stepResult = {
       ok: true,
       advancedTicks: 0,

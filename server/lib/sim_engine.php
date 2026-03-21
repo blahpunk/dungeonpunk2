@@ -136,7 +136,7 @@ function authoritative_worker_decode_response(?string $stdout, ?string $stderr =
   return $decoded;
 }
 
-function authoritative_worker_socket_connect(float $timeoutSeconds = 0.35)
+function authoritative_worker_socket_connect(float $timeoutSeconds = 0.08)
 {
   $errno = 0;
   $errstr = '';
@@ -401,7 +401,8 @@ function authoritative_worker_set_movement_intent(
 function authoritative_worker_poll_movement(
   string $worldPayload,
   string $sessionId,
-  int $timeoutMs = 25000
+  int $timeoutMs = 25000,
+  int $minResponseMs = 8
 ): array {
   $sid = trim($sessionId);
   if ($sid === '') {
@@ -412,5 +413,6 @@ function authoritative_worker_poll_movement(
     'sessionId' => $sid,
     'worldPayload' => $worldPayload,
     'timeoutMs' => max(100, min(30000, $timeoutMs)),
+    'minResponseMs' => max(0, min(1000, $minResponseMs)),
   ]);
 }

@@ -4,6 +4,12 @@ export function createAuthoritativeApi(options = {}) {
   const browserInstanceId = String(options.browserInstanceId ?? "").trim();
   const cacheBust = typeof options.cacheBust === "function" ? options.cacheBust : ((url) => url);
   const liveTickCombatOption = options.liveTickCombat;
+  let requestSeq = 0;
+
+  function nextRequestId() {
+    requestSeq = (requestSeq + 1) >>> 0;
+    return `${Date.now().toString(36)}_${requestSeq.toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
+  }
 
   function buildPayload(body = null) {
     const payload = (body && typeof body === "object")
@@ -15,6 +21,7 @@ export function createAuthoritativeApi(options = {}) {
       : liveTickCombatOption;
     if (typeof liveTickCombat === "boolean") payload.live_tick_combat = liveTickCombat;
     if (csrfToken) payload._csrf = csrfToken;
+    payload._req_id = nextRequestId();
     return payload;
   }
 
@@ -92,11 +99,12 @@ export function createAuthoritativeApi(options = {}) {
         intent_seq: Math.max(0, Math.floor(Number(intentSeq) || 0)),
       });
     },
-    pollMovement({ sessionId = "", timeoutMs = 25000, signal } = {}) {
+    pollMovement({ sessionId = "", timeoutMs = 25000, minResponseMs = 8, signal } = {}) {
       return request({
         action: "poll_movement",
         session_id: sessionId,
         timeout_ms: Math.max(100, Math.floor(Number(timeoutMs) || 25000)),
+        min_response_ms: Math.max(0, Math.floor(Number(minResponseMs) || 0)),
       }, { signal });
     },
     touchSession({ sessionId = "" } = {}) {

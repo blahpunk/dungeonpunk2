@@ -348,15 +348,6 @@ function versioned_relative_asset_url(string $relativePath): string
   return './' . $trimmed . '?v=' . rawurlencode($version);
 }
 
-function random_cache_bust_token(): string
-{
-  try {
-    return bin2hex(random_bytes(6));
-  } catch (Throwable $e) {
-    return bin2hex(pack('N', time())) . substr(bin2hex(pack('N', mt_rand())), 0, 4);
-  }
-}
-
 /**
  * @param array<string, mixed> $payload
  */
@@ -464,14 +455,12 @@ function sprite_metadata_file_path_candidates(): array
   return $paths;
 }
 
-function sprite_custom_asset_url(string $category, string $fileName, int $mtime = 0): string
+function sprite_custom_asset_url(string $category, string $fileName): string
 {
-  $version = $mtime > 0 ? $mtime : time();
   return sprintf(
-    './index.php?api=sprite_asset&category=%s&file=%s&v=%d',
+    './index.php?api=sprite_asset&category=%s&file=%s',
     rawurlencode($category),
-    rawurlencode($fileName),
-    $version
+    rawurlencode($fileName)
   );
 }
 
@@ -752,7 +741,7 @@ function list_custom_sprite_overrides(): array
           continue;
         }
         $mtime = (int) (@filemtime($fullPath) ?: time());
-        $url = sprite_custom_asset_url($category, $name, $mtime);
+        $url = sprite_custom_asset_url($category, $name);
         $overrides[$spriteId] = $url;
         $entries[] = [
           'sprite_id' => $spriteId,
@@ -2448,7 +2437,6 @@ function item_authority_states_public_meta(array $statesById): array
 $currentUrl = current_request_url();
 $currentBaseUrl = current_request_base_url();
 $pageVersion = app_asset_version(__FILE__) . '-' . app_asset_version(__DIR__ . DIRECTORY_SEPARATOR . 'game.js');
-$renderCacheBust = random_cache_bust_token();
 $logoutRequested = trim((string) ($_GET['logout'] ?? '')) === '1';
 if ($logoutRequested) {
   clear_local_auth_cookie();
@@ -2476,32 +2464,9 @@ if ($logoutRequested) {
   exit;
 }
 
-// Force a versioned page URL so stale edge-cached HTML is less likely to persist.
 $apiMode = trim((string) ($_GET['api'] ?? ''));
 $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 $requestedVersion = trim((string) ($_GET['v'] ?? ''));
-if (
-  $apiMode === ''
-  && !$logoutRequested
-  && $method === 'GET'
-  && ($requestedVersion !== $pageVersion || $requestedBust === '')
-) {
-  $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
-  $path = (string) (parse_url($uri, PHP_URL_PATH) ?? '/');
-  $queryRaw = (string) (parse_url($uri, PHP_URL_QUERY) ?? '');
-  $query = [];
-  if ($queryRaw !== '') {
-    parse_str($queryRaw, $query);
-  }
-  $query['v'] = $pageVersion;
-  $query['rb'] = bin2hex(random_bytes(6));
-  $redirectTarget = $path . '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
-  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-  header('CDN-Cache-Control: no-store');
-  header('Surrogate-Control: no-store');
-  header('Location: ' . $redirectTarget, true, 302);
-  exit;
-}
 
 $user = get_authenticated_user();
 $userEmail = strtolower(trim((string) ($user['email'] ?? '')));
@@ -2716,7 +2681,7 @@ if ($apiMode === 'sprites') {
   }
   @chmod($targetPath, 0644);
   $mtime = (int) (@filemtime($targetPath) ?: time());
-  $publicUrl = sprite_custom_asset_url($category, $targetName, $mtime);
+  $publicUrl = sprite_custom_asset_url($category, $targetName);
 
   $payload = list_custom_sprite_overrides();
   json_response([
@@ -2992,7 +2957,8 @@ if ($apiMode === 'authoritative') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
       }
       $timeoutMs = max(100, min(30000, (int) ($body['timeout_ms'] ?? 25000)));
-      json_response(authoritative_poll_movement($userEmail, $saveSecret, $sessionId, $timeoutMs));
+      $minResponseMs = max(0, min(1000, (int) ($body['min_response_ms'] ?? 8)));
+      json_response(authoritative_poll_movement($userEmail, $saveSecret, $sessionId, $timeoutMs, $minResponseMs));
     }
     if ($action === 'touch_session') {
       $sessionId = trim((string) ($body['session_id'] ?? ''));
@@ -3714,9 +3680,8 @@ if ($apiMode === 'savegames') {
 }
 app_apply_html_security_headers();
 $gameScriptUrl = versioned_relative_asset_url('game.js');
-$shopkeeperFullUrl = versioned_relative_asset_url('client/assets/shopkeeper_full.png');
-$gameScriptUrl .= '&rb=' . rawurlencode($renderCacheBust);
-$appBuildVersion = $pageVersion . '-' . $renderCacheBust;
+$shopkeeperFullUrl = './client/assets/shopkeeper_full.png';
+$appBuildVersion = $pageVersion;
 $spriteOverridesPayload = list_custom_sprite_overrides();
 $spriteOverridesJson = json_encode(
   $spriteOverridesPayload,
