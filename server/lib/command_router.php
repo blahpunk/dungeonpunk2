@@ -5,6 +5,13 @@ if (!function_exists('authoritative_shop_bind_payload_to_shared')) {
   require_once __DIR__ . DIRECTORY_SEPARATOR . 'shop_manager.php';
 }
 
+function authoritative_release_php_session_lock(): void
+{
+  if (session_status() === PHP_SESSION_ACTIVE) {
+    session_write_close();
+  }
+}
+
 /**
  * @param array<string, mixed> $session
  * @param array<string, mixed> $snapshot
@@ -16,8 +23,10 @@ function authoritative_persist_canonical_snapshot(
   string $saveSecret,
   array $session,
   array $snapshot,
-  array $runRecord = []
+  array $runRecord = [],
+  array $options = []
 ): array {
+  $opts = $options;
   $payload = trim((string) ($snapshot['payload'] ?? ''));
   $characterId = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
   $characterName = trim((string) ($snapshot['character']['name'] ?? 'Adventurer'));
@@ -39,7 +48,8 @@ function authoritative_persist_canonical_snapshot(
   }
 
   $characterSnapshotPayload = trim((string) ($snapshot['characterSnapshotPayload'] ?? ''));
-  if ($characterId !== '' && $characterSnapshotPayload !== '') {
+  $persistCharacterState = !array_key_exists('persist_character_state', $opts) || !empty($opts['persist_character_state']);
+  if ($persistCharacterState && $characterId !== '' && $characterSnapshotPayload !== '') {
     authoritative_persist_character_state_payload(
       $userEmail,
       $saveSecret,
@@ -62,6 +72,7 @@ function authoritative_open_session_for_character(
   string $characterId,
   array $options = []
 ): array {
+  authoritative_release_php_session_lock();
   $context = authoritative_bootstrap_context($userEmail, $saveSecret, $characterId, $options);
   $snapshotResponse = authoritative_worker_bootstrap(
     (string) ($context['world_payload'] ?? ''),
@@ -101,9 +112,9 @@ function authoritative_open_session_for_character(
 }
 
 /**
- * @return array{session: array<string, mixed>, run_record: array<string, mixed>}
+ * @return array{session: array<string, mixed>}
  */
-function authoritative_load_session_run_context(
+function authoritative_load_session_context(
   string $userEmail,
   string $sessionId
 ): array {
@@ -111,6 +122,29 @@ function authoritative_load_session_run_context(
   if (!is_array($session)) {
     throw new RuntimeException('Authoritative session not found.');
   }
+  return [
+    'session' => $session,
+  ];
+}
+
+function authoritative_bind_run_payload_for_worker(string $payload): string
+{
+  $worldPayload = trim($payload);
+  if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
+    $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
+  }
+  return $worldPayload;
+}
+
+/**
+ * @return array{session: array<string, mixed>, run_record: array<string, mixed>}
+ */
+function authoritative_load_session_run_context(
+  string $userEmail,
+  string $sessionId
+): array {
+  $loaded = authoritative_load_session_context($userEmail, $sessionId);
+  $session = $loaded['session'];
   $runRecord = authoritative_load_run_record($userEmail);
   if (!is_array($runRecord) || trim((string) ($runRecord['payload'] ?? '')) === '') {
     throw new RuntimeException('Canonical run state not found.');
@@ -158,6 +192,7 @@ function authoritative_switch_session_character(
   string $characterId,
   array $options = []
 ): array {
+  authoritative_release_php_session_lock();
   $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
   $session = $loaded['session'];
   $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
@@ -232,6 +267,7 @@ function authoritative_start_new_dungeon(
   string $sessionId,
   array $options = []
 ): array {
+  authoritative_release_php_session_lock();
   $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
   $session = $loaded['session'];
   $runRecord = $loaded['run_record'];
@@ -278,6 +314,7 @@ function authoritative_handle_command(
   int $clientCommandSeq,
   array $command
 ): array {
+  authoritative_release_php_session_lock();
   if ($clientCommandSeq <= 0) {
     throw new RuntimeException('Missing client command sequence.');
   }
@@ -368,7 +405,9 @@ function authoritative_handle_command(
       }
       $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
       $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
-      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord);
+      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord, [
+        'persist_character_state' => false,
+      ]);
     }
     if (!authoritative_persist_session($session)) {
       throw new RuntimeException('Could not persist authoritative command session.');
@@ -413,37 +452,35 @@ function authoritative_set_movement_intent(
   string $enqueueDir = '',
   int $intentSeq = 0
 ): array {
-  $loaded = authoritative_load_session_run_context($userEmail, $sessionId);
+  authoritative_release_php_session_lock();
+  $loaded = authoritative_load_session_context($userEmail, $sessionId);
   $session = $loaded['session'];
-  $runRecord = $loaded['run_record'];
-  $sessionCharacterId = normalize_character_profile_id((string) ($session['character_id'] ?? ''));
   $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
-  $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
 
-  if ($sessionCharacterId !== '') {
-    $conflict = authoritative_find_character_session_conflict(
-      $userEmail,
-      $sessionCharacterId,
-      $sessionBrowserInstanceId,
-      $sessionIdNorm
+  try {
+    $result = authoritative_worker_set_movement_intent(
+      '',
+      $sessionIdNorm,
+      $holdDir,
+      $active,
+      $enqueueDir,
+      $intentSeq
     );
-    if (is_array($conflict)) {
-      throw new RuntimeException('This character is active in another browser instance. Choose a different character.');
+  } catch (RuntimeException $err) {
+    $runRecord = authoritative_load_run_record($userEmail);
+    if (!is_array($runRecord) || trim((string) ($runRecord['payload'] ?? '')) === '') {
+      throw $err;
     }
+    $worldPayload = authoritative_bind_run_payload_for_worker((string) ($runRecord['payload'] ?? ''));
+    $result = authoritative_worker_set_movement_intent(
+      $worldPayload,
+      $sessionIdNorm,
+      $holdDir,
+      $active,
+      $enqueueDir,
+      $intentSeq
+    );
   }
-
-  $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
-  if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
-    $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
-  }
-  $result = authoritative_worker_set_movement_intent(
-    $worldPayload,
-    $sessionIdNorm,
-    $holdDir,
-    $active,
-    $enqueueDir,
-    $intentSeq
-  );
   return [
     'ok' => true,
     'sessionId' => $sessionIdNorm,
@@ -464,49 +501,21 @@ function authoritative_poll_movement(
   int $timeoutMs = 25000,
   int $minResponseMs = 8
 ): array {
-  $loaded = authoritative_load_session_run_context($userEmail, $sessionId);
+  authoritative_release_php_session_lock();
+  $loaded = authoritative_load_session_context($userEmail, $sessionId);
   $session = $loaded['session'];
-  $runRecord = $loaded['run_record'];
-  $sessionCharacterId = normalize_character_profile_id((string) ($session['character_id'] ?? ''));
   $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
-  $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
 
-  $snapshotFromCanonicalPayload = function (array $runRecordInput) use ($sessionIdNorm): array {
-    $worldPayload = trim((string) ($runRecordInput['payload'] ?? ''));
-    if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
-      $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
+  try {
+    $result = authoritative_worker_poll_movement('', $sessionIdNorm, $timeoutMs, $minResponseMs);
+  } catch (RuntimeException $err) {
+    $runRecord = authoritative_load_run_record($userEmail);
+    if (!is_array($runRecord) || trim((string) ($runRecord['payload'] ?? '')) === '') {
+      throw $err;
     }
-    $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionIdNorm);
-    $snapshot = is_array($snapshotResponse['snapshot'] ?? null) ? $snapshotResponse['snapshot'] : null;
-    if (!is_array($snapshot)) {
-      throw new RuntimeException('Could not build authoritative snapshot.');
-    }
-    return $snapshot;
-  };
-
-  if ($sessionCharacterId !== '') {
-    $conflict = authoritative_find_character_session_conflict(
-      $userEmail,
-      $sessionCharacterId,
-      $sessionBrowserInstanceId,
-      $sessionIdNorm
-    );
-    if (is_array($conflict)) {
-      $snapshot = $snapshotFromCanonicalPayload($runRecord);
-      return authoritative_build_snapshot_response($session, $snapshot, [
-        'ok' => false,
-        'accepted_command_seq' => max(0, (int) ($session['last_command_seq'] ?? 0)),
-        'error' => 'This character is active in another browser instance. Choose a different character.',
-        'ui_hints' => ['resyncRecommended' => true],
-      ]);
-    }
+    $worldPayload = authoritative_bind_run_payload_for_worker((string) ($runRecord['payload'] ?? ''));
+    $result = authoritative_worker_poll_movement($worldPayload, $sessionIdNorm, $timeoutMs, $minResponseMs);
   }
-
-  $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
-  if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
-    $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
-  }
-  $result = authoritative_worker_poll_movement($worldPayload, $sessionIdNorm, $timeoutMs, $minResponseMs);
   $resultTick = is_array($result['tick'] ?? null) ? $result['tick'] : null;
   $resultPerf = is_array($result['perf'] ?? null) ? $result['perf'] : null;
   $resultIntent = is_array($result['intent'] ?? null) ? $result['intent'] : null;
@@ -533,7 +542,9 @@ function authoritative_poll_movement(
   if ($moved) {
     $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
     $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
-    authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord);
+    authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
+      'persist_character_state' => false,
+    ]);
     if (!authoritative_persist_session($session)) {
       throw new RuntimeException('Could not persist authoritative movement session.');
     }
@@ -541,19 +552,20 @@ function authoritative_poll_movement(
 
   $resultDiff = is_array($result['diff'] ?? null) ? $result['diff'] : null;
   $resultHotDelta = is_array($result['hotDelta'] ?? null) ? $result['hotDelta'] : null;
-  // Prefer payload diffs for movement polls to reduce response size and latency.
-  $sendDiff = is_array($resultDiff);
+  // For live movement polls, prefer hot deltas over payload diffs so we avoid
+  // rebuilding and shipping large payload patches on every streamed step.
+  $sendHotDelta = is_array($resultHotDelta);
+  $sendDiff = !$sendHotDelta && is_array($resultDiff);
 
   $response = authoritative_build_snapshot_response($session, $snapshot, [
     'ok' => $moved,
     'accepted_command_seq' => max(0, (int) ($session['last_command_seq'] ?? 0)),
     'error' => $moved ? '' : trim((string) ($result['error'] ?? 'Movement blocked.')),
     'diff' => $sendDiff ? $resultDiff : null,
-    'strip_snapshot_payload' => $sendDiff,
+    'strip_snapshot_payload' => ($sendDiff || $sendHotDelta),
     'tick' => $resultTick,
     'perf' => $resultPerf,
-    // Hot delta is useful even when payload diff is unavailable.
-    'hot_delta' => $moved ? $resultHotDelta : null,
+    'hot_delta' => $moved ? ($sendHotDelta ? $resultHotDelta : null) : null,
     'save' => null,
     'saves' => [],
   ]);
@@ -576,6 +588,7 @@ function authoritative_create_character_and_enter(
   string $characterName = '',
   array $options = []
 ): array {
+  authoritative_release_php_session_lock();
   $payload = trim($characterPayload);
   if ($payload === '') {
     throw new RuntimeException('Missing character payload.');
@@ -625,6 +638,7 @@ function authoritative_manual_save_current_run(
   string $overwriteId = '',
   bool $autosave = false
 ): array {
+  authoritative_release_php_session_lock();
   $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
   $session = $loaded['session'];
   $snapshot = $loaded['snapshot'];
@@ -654,6 +668,7 @@ function authoritative_save_and_exit(
   string $saveSecret,
   string $sessionId
 ): array {
+  authoritative_release_php_session_lock();
   $response = authoritative_manual_save_current_run($userEmail, $saveSecret, $sessionId, '', '', true);
   authoritative_close_session($sessionId, $userEmail);
   $response['message'] = 'Character progress saved and session closed.';

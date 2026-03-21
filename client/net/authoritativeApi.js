@@ -41,6 +41,7 @@ export function createAuthoritativeApi(options = {}) {
   async function request(body = null, requestOptions = null) {
     const opts = (requestOptions && typeof requestOptions === "object") ? requestOptions : {};
     const payload = buildPayload(body);
+    const requestStartedAt = Date.now();
     const headers = {
       Accept: "application/json",
       "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -57,14 +58,47 @@ export function createAuthoritativeApi(options = {}) {
       signal: opts.signal,
       body: JSON.stringify(payload),
     });
+    const responseReceivedAt = Date.now();
+    let bodyReadCompletedAt = responseReceivedAt;
     let data = null;
+    let rawText = "";
     try {
-      data = await resp.json();
+      rawText = await resp.text();
+      bodyReadCompletedAt = Date.now();
     } catch {}
+    const parseStartedAt = bodyReadCompletedAt;
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch {}
+    const responseReadyAt = Date.now();
+    const responseBytes = rawText
+      ? ((typeof TextEncoder !== "undefined") ? new TextEncoder().encode(rawText).length : rawText.length)
+      : 0;
+    const transport = {
+      requestId: String(payload._req_id ?? "").trim(),
+      requestStartedAt,
+      responseReceivedAt,
+      bodyReadCompletedAt,
+      responseReadyAt,
+      totalMs: Math.max(0, responseReadyAt - requestStartedAt),
+      headerWaitMs: Math.max(0, responseReceivedAt - requestStartedAt),
+      bodyReadMs: Math.max(0, bodyReadCompletedAt - responseReceivedAt),
+      jsonParseMs: Math.max(0, responseReadyAt - parseStartedAt),
+      responseBytes,
+      status: resp.status,
+      contentLength: Math.max(0, Math.floor(Number(resp.headers.get("content-length") ?? 0) || 0)),
+    };
+    if (data && typeof data === "object") {
+      data._transport = transport;
+    }
     if (!resp.ok) {
       const msg = data?.error ?? `Authoritative request failed (${resp.status})`;
       const err = new Error(msg);
-      err.response = { ...(data && typeof data === "object" ? data : {}), status_code: resp.status };
+      err.response = {
+        ...(data && typeof data === "object" ? data : {}),
+        status_code: resp.status,
+        _transport: transport,
+      };
       throw err;
     }
     return data && typeof data === "object" ? data : { ok: false, error: "Invalid authoritative response." };

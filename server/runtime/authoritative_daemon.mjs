@@ -26,8 +26,8 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
 let appliedMonsterConfigRaw = "";
 const SESSION_STATE_CACHE_TTL_MS = 300000;
 const SESSION_STATE_CACHE_MAX = 128;
-const AUTHORITATIVE_TICK_MS = 16;
-const AUTHORITATIVE_INPUT_WINDOW_MS = 16;
+const AUTHORITATIVE_TICK_MS = 12;
+const AUTHORITATIVE_INPUT_WINDOW_MS = 12;
 const AUTHORITATIVE_POLL_MIN_RESPONSE_MS = 2;
 const AUTHORITATIVE_POLL_MAX_BATCH_CHANGED_TICKS = 1;
 const sessionStateCache = new Map();
@@ -69,7 +69,8 @@ function getCachedSessionState(sessionId = "", worldPayload = "") {
   pruneSessionStateCache(Date.now());
   const entry = sessionStateCache.get(key);
   if (!entry || typeof entry !== "object") return null;
-  if (String(entry.worldPayload ?? "") !== String(worldPayload ?? "")) return null;
+  const requestedPayload = String(worldPayload ?? "");
+  if (requestedPayload.trim() !== "" && String(entry.worldPayload ?? "") !== requestedPayload) return null;
   entry.updatedAt = Date.now();
   return entry;
 }
@@ -427,6 +428,7 @@ async function handleOperation(raw = "") {
     let entry = getCachedSessionState(sessionId, worldPayload);
     let state = entry?.state ?? null;
     if (!state) {
+      if (!worldPayload.trim()) return fail("Authoritative session cache miss.");
       state = engine.headlessStateFromPayload(worldPayload);
       if (!state) return fail("Invalid canonical run payload.");
       if (sessionId) {
@@ -462,6 +464,7 @@ async function handleOperation(raw = "") {
     let entry = getCachedSessionState(sessionId, worldPayload);
     let state = entry?.state ?? null;
     if (!state) {
+      if (!worldPayload.trim()) return fail("Authoritative session cache miss.");
       state = engine.headlessStateFromPayload(worldPayload);
       if (!state) return fail("Invalid canonical run payload.");
       if (sessionId) {

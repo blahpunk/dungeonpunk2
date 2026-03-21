@@ -116,6 +116,52 @@ function authoritative_worker_daemon_command(): string
     ' 2>&1 &';
 }
 
+/**
+ * @return list<int>
+ */
+function authoritative_worker_daemon_pids(): array
+{
+  if (!function_exists('shell_exec')) {
+    return [];
+  }
+  $pattern = authoritative_worker_daemon_script_path() . ' ' . authoritative_worker_socket_path();
+  $raw = @shell_exec('pgrep -f ' . escapeshellarg($pattern) . ' 2>/dev/null');
+  if (!is_string($raw) || trim($raw) === '') {
+    return [];
+  }
+  $out = [];
+  foreach (preg_split('/\s+/', trim($raw)) as $pidRaw) {
+    $pid = (int) $pidRaw;
+    if ($pid > 0) {
+      $out[$pid] = $pid;
+    }
+  }
+  return array_values($out);
+}
+
+function authoritative_worker_kill_daemons(): void
+{
+  $pids = authoritative_worker_daemon_pids();
+  if (!$pids || !function_exists('shell_exec')) {
+    return;
+  }
+  $pidList = implode(' ', array_map(static fn(int $pid): string => (string) $pid, $pids));
+  if ($pidList === '') {
+    return;
+  }
+  @shell_exec('kill ' . $pidList . ' 2>/dev/null');
+  usleep(150000);
+  $remaining = authoritative_worker_daemon_pids();
+  if (!$remaining) {
+    return;
+  }
+  $remainingList = implode(' ', array_map(static fn(int $pid): string => (string) $pid, $remaining));
+  if ($remainingList !== '') {
+    @shell_exec('kill -9 ' . $remainingList . ' 2>/dev/null');
+    usleep(100000);
+  }
+}
+
 function authoritative_worker_decode_response(?string $stdout, ?string $stderr = ''): array
 {
   $decoded = is_string($stdout) ? json_decode($stdout, true) : null;
@@ -163,7 +209,12 @@ function authoritative_worker_daemon_start(): bool
   $currentVersion = authoritative_worker_code_version();
   $storedVersion = authoritative_worker_stored_version();
   $socketPath = authoritative_worker_socket_path();
+  $existingPids = authoritative_worker_daemon_pids();
+  if (count($existingPids) > 1) {
+    authoritative_worker_kill_daemons();
+  }
   if ($currentVersion !== '' && $storedVersion !== '' && !hash_equals($storedVersion, $currentVersion)) {
+    authoritative_worker_kill_daemons();
     @unlink($socketPath);
   }
   $existing = authoritative_worker_socket_connect(0.1);
@@ -171,12 +222,16 @@ function authoritative_worker_daemon_start(): bool
     fclose($existing);
     if ($currentVersion !== '' && ($storedVersion === '' || !hash_equals($storedVersion, $currentVersion))) {
       // Socket reachable but code changed; force daemon recycle.
+      authoritative_worker_kill_daemons();
       @unlink($socketPath);
     } else {
       return true;
     }
   }
   if (is_file($socketPath) || file_exists($socketPath)) {
+    if (!authoritative_worker_socket_connect(0.05)) {
+      authoritative_worker_kill_daemons();
+    }
     @unlink($socketPath);
   }
 

@@ -1808,10 +1808,10 @@ const AUTHORITATIVE_MOVE_QUEUE_PER_SOURCE_MAX = 4;
 const AUTHORITATIVE_MOVE_BATCH_MAX = 2;
 const authoritativeCommandQueue = [];
 const AUTHORITATIVE_RATE_LIMIT_FALLBACK_MS = 40;
-const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 16;
-const AUTHORITATIVE_CLIENT_TICK_MS_MIN = 16;
+const AUTHORITATIVE_CLIENT_DEFAULT_TICK_MS = 12;
+const AUTHORITATIVE_CLIENT_TICK_MS_MIN = 12;
 const AUTHORITATIVE_CLIENT_TICK_MS_MAX = 100;
-const AUTHORITATIVE_CLIENT_PREDICTION_ENABLED = true;
+const AUTHORITATIVE_CLIENT_PREDICTION_ENABLED = false;
 const AUTHORITATIVE_ATTACK_PREDICTION_ENABLED = false;
 const AUTHORITATIVE_MAX_PREDICTED_MOVE_LEAD = 1;
 const AUTHORITATIVE_PAYLOAD_DIFF_FORMAT = "save_payload_delta_v1";
@@ -1835,6 +1835,7 @@ const AUTHORITATIVE_FAST_UI_REASONS = new Set([
 const AUTHORITATIVE_HOT_DELTA_TYPES = new Set([
   "MOVE",
   "MOVE_BATCH",
+  "LIVE_POLL_TICK",
   "ATTACK",
   "WAIT",
   "PICKUP",
@@ -1856,6 +1857,7 @@ const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 35;
 const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MAX_MS = 2000;
 const AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS = 2;
 const AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED = true;
+const AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED = false;
 const authoritativeMovementChannelRuntime = {
   pollInFlight: false,
   stopRequested: false,
@@ -1867,6 +1869,9 @@ const authoritativeMovementChannelRuntime = {
   abortController: null,
   disabled: !AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED,
   disableReason: AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED ? "" : "client-disabled",
+  lastPollStartedAt: 0,
+  lastPollResponseAt: 0,
+  lastApplyCompletedAt: 0,
 };
 const authoritativeLockAuditRuntime = {
   inFlight: false,
@@ -1896,6 +1901,10 @@ const authoritativeMoveTelemetryRuntime = {
     acked: 0,
     predicted: 0,
     corrected: 0,
+    hotDeltaSeen: 0,
+    hotDeltaApplied: 0,
+    hotDeltaRejected: 0,
+    hotDeltaSnapshotFallback: 0,
     totalCorrectionDist: 0,
     totalRttMs: 0,
     totalInputToVisualMs: 0,
@@ -1905,6 +1914,17 @@ const authoritativeMoveTelemetryRuntime = {
     inputToPredictedMs: [],
     inputToSendMs: [],
     inputToAckMs: [],
+    inputToIntentAckMs: [],
+    inputToPollResponseMs: [],
+    inputToApplyMs: [],
+    pollResponseToStateApplyMs: [],
+    stateApplyDurationMs: [],
+    stateApplyToNextPollMs: [],
+    snapshotImportMs: [],
+    activateLoadedStateMs: [],
+    intentAckTransportMs: [],
+    pollTransportMs: [],
+    pollResponseBytes: [],
     inputToVisualCompleteMs: [],
     correctionDistance: [],
   },
@@ -2068,6 +2088,7 @@ const authoritativeApi = createAuthoritativeApi({
 });
 
 let authoritativeMovementStreamCompatibilityWarned = false;
+let authoritativeMovementStatusBadgeEl = null;
 
 function isAuthoritativeMovementStreamAvailable() {
   return (
@@ -2077,13 +2098,81 @@ function isAuthoritativeMovementStreamAvailable() {
   );
 }
 
+function ensureAuthoritativeMovementStatusBadge() {
+  if (HEADLESS_RUNTIME || typeof document === "undefined") return null;
+  if (authoritativeMovementStatusBadgeEl?.isConnected) return authoritativeMovementStatusBadgeEl;
+  const el = document.createElement("div");
+  el.id = "authoritativeMovementStatusBadge";
+  el.style.position = "fixed";
+  el.style.left = "12px";
+  el.style.bottom = "12px";
+  el.style.zIndex = "140";
+  el.style.maxWidth = "min(420px, calc(100vw - 24px))";
+  el.style.padding = "8px 10px";
+  el.style.borderRadius = "10px";
+  el.style.fontFamily = "'IBM Plex Sans', 'Segoe UI', sans-serif";
+  el.style.fontSize = "12px";
+  el.style.lineHeight = "1.35";
+  el.style.letterSpacing = "0.01em";
+  el.style.boxShadow = "0 8px 22px rgba(0, 0, 0, 0.24)";
+  el.style.pointerEvents = "none";
+  el.style.backdropFilter = "blur(10px)";
+  el.style.display = "none";
+  document.body.appendChild(el);
+  authoritativeMovementStatusBadgeEl = el;
+  return el;
+}
+
+function movementStreamStatusText() {
+  if (!isAuthoritativeSessionActive()) return "";
+  const streamHealthy = isAuthoritativeMovementStreamAvailable();
+  const tickMs = authoritativeClientTickMs();
+  if (streamHealthy) return `Realtime movement: LIVE stream | ${tickMs}ms auth tick | authoritative interpolation`;
+  const reason = String(authoritativeMovementChannelRuntime.disableReason ?? "").trim() || "stream unavailable";
+  if (AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED) {
+    return `Realtime movement: DEGRADED compatibility mode | ${reason}`;
+  }
+  return `Realtime movement: OFFLINE | ${reason} | compatibility movement disabled`;
+}
+
+function renderAuthoritativeMovementStatusBadge() {
+  const el = ensureAuthoritativeMovementStatusBadge();
+  if (!el) return;
+  if (!isAuthoritativeSessionActive()) {
+    el.style.display = "none";
+    return;
+  }
+  const streamHealthy = isAuthoritativeMovementStreamAvailable();
+  const text = movementStreamStatusText();
+  el.textContent = text;
+  el.title = text;
+  el.style.display = "block";
+  if (streamHealthy) {
+    el.style.background = "rgba(19, 79, 47, 0.9)";
+    el.style.border = "1px solid rgba(129, 225, 164, 0.65)";
+    el.style.color = "#def7e6";
+  } else if (AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED) {
+    el.style.background = "rgba(104, 69, 13, 0.92)";
+    el.style.border = "1px solid rgba(245, 201, 87, 0.7)";
+    el.style.color = "#fff2bf";
+  } else {
+    el.style.background = "rgba(106, 20, 20, 0.92)";
+    el.style.border = "1px solid rgba(255, 145, 145, 0.72)";
+    el.style.color = "#ffe2e2";
+  }
+}
+
 function noteAuthoritativeMovementStreamCompatibilityFallback() {
   if (authoritativeMovementStreamCompatibilityWarned) return;
   authoritativeMovementStreamCompatibilityWarned = true;
   noteAuthoritativeMovementStreamMode("fallback");
   if (!game?.log) return;
   if (authoritativeMovementChannelRuntime.disableReason === "client-disabled") return;
-  pushLog(game, "Movement stream unavailable in this tab; using compatibility movement mode.");
+  if (AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED) {
+    pushLog(game, "Movement stream unavailable in this tab; using compatibility movement mode.");
+  } else {
+    pushLog(game, "Realtime movement stream unavailable in this tab. Compatibility movement is disabled.");
+  }
   renderLog(game);
 }
 
@@ -2120,7 +2209,11 @@ function disableAuthoritativeMovementStream(reason = "", err = null) {
   }
   if (!game?.log || !err) return;
   const message = authoritativeErrorMessage(err, "Movement stream unavailable.");
-  pushLog(game, `${message} Falling back to compatibility movement.`);
+  if (AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED) {
+    pushLog(game, `${message} Falling back to compatibility movement.`);
+  } else {
+    pushLog(game, `${message} Realtime movement is paused until the stream recovers.`);
+  }
   renderLog(game);
 }
 
@@ -2458,6 +2551,10 @@ function clearAuthoritativeMoveTelemetry() {
   authoritativeMoveTelemetryRuntime.totals.acked = 0;
   authoritativeMoveTelemetryRuntime.totals.predicted = 0;
   authoritativeMoveTelemetryRuntime.totals.corrected = 0;
+  authoritativeMoveTelemetryRuntime.totals.hotDeltaSeen = 0;
+  authoritativeMoveTelemetryRuntime.totals.hotDeltaApplied = 0;
+  authoritativeMoveTelemetryRuntime.totals.hotDeltaRejected = 0;
+  authoritativeMoveTelemetryRuntime.totals.hotDeltaSnapshotFallback = 0;
   authoritativeMoveTelemetryRuntime.totals.totalCorrectionDist = 0;
   authoritativeMoveTelemetryRuntime.totals.totalRttMs = 0;
   authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs = 0;
@@ -2465,6 +2562,17 @@ function clearAuthoritativeMoveTelemetry() {
   authoritativeMoveTelemetryRuntime.samples.inputToPredictedMs = [];
   authoritativeMoveTelemetryRuntime.samples.inputToSendMs = [];
   authoritativeMoveTelemetryRuntime.samples.inputToAckMs = [];
+  authoritativeMoveTelemetryRuntime.samples.inputToIntentAckMs = [];
+  authoritativeMoveTelemetryRuntime.samples.inputToPollResponseMs = [];
+  authoritativeMoveTelemetryRuntime.samples.inputToApplyMs = [];
+  authoritativeMoveTelemetryRuntime.samples.pollResponseToStateApplyMs = [];
+  authoritativeMoveTelemetryRuntime.samples.stateApplyDurationMs = [];
+  authoritativeMoveTelemetryRuntime.samples.stateApplyToNextPollMs = [];
+  authoritativeMoveTelemetryRuntime.samples.snapshotImportMs = [];
+  authoritativeMoveTelemetryRuntime.samples.activateLoadedStateMs = [];
+  authoritativeMoveTelemetryRuntime.samples.intentAckTransportMs = [];
+  authoritativeMoveTelemetryRuntime.samples.pollTransportMs = [];
+  authoritativeMoveTelemetryRuntime.samples.pollResponseBytes = [];
   authoritativeMoveTelemetryRuntime.samples.inputToVisualCompleteMs = [];
   authoritativeMoveTelemetryRuntime.samples.correctionDistance = [];
   authoritativeMoveTelemetryRuntime.queueDepthHistogram = {};
@@ -2473,6 +2581,9 @@ function clearAuthoritativeMoveTelemetry() {
   authoritativeMoveTelemetryRuntime.streamMode.streamMs = 0;
   authoritativeMoveTelemetryRuntime.streamMode.fallbackMs = 0;
   authoritativeMoveTelemetryRuntime.last = null;
+  authoritativeMovementChannelRuntime.lastPollStartedAt = 0;
+  authoritativeMovementChannelRuntime.lastPollResponseAt = 0;
+  authoritativeMovementChannelRuntime.lastApplyCompletedAt = 0;
 }
 
 function noteAuthoritativeMovementStreamMode(mode = "stream", atMs = Date.now()) {
@@ -2495,11 +2606,202 @@ function noteAuthoritativeMoveSample(sampleKey = "", value = null) {
   if (list.length > 240) list.splice(0, list.length - 240);
 }
 
+function authoritativeResponseTransportMeta(data = null) {
+  return (data && typeof data === "object" && data._transport && typeof data._transport === "object")
+    ? data._transport
+    : null;
+}
+
+function authoritativeResponseReadyAt(data = null, fallbackAt = Date.now()) {
+  const transport = authoritativeResponseTransportMeta(data);
+  return normalizeAuthoritativeMoveInputAt(
+    transport?.responseReadyAt
+      ?? transport?.responseReceivedAt
+      ?? fallbackAt
+  );
+}
+
+function authoritativeResponseBytes(data = null) {
+  const transport = authoritativeResponseTransportMeta(data);
+  const explicit = Math.max(0, Math.floor(Number(transport?.responseBytes ?? 0) || 0));
+  if (explicit > 0) return explicit;
+  return Math.max(0, Math.floor(Number(transport?.contentLength ?? 0) || 0));
+}
+
+function findPendingAuthoritativeStreamMove(intentSeq = 0) {
+  const seq = Math.max(0, Math.floor(Number(intentSeq) || 0));
+  if (!seq || !Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)) return null;
+  return authoritativeMoveTelemetryRuntime.pendingStreamMoves.find((entry) =>
+    entry && typeof entry === "object" && Math.max(0, Math.floor(Number(entry.intentSeq ?? 0) || 0)) === seq
+  ) ?? null;
+}
+
 function noteAuthoritativeMoveQueueDepth(depth = 0) {
   const normalized = Math.max(0, Math.floor(Number(depth) || 0));
   const bucket = normalized >= 6 ? "6+" : String(normalized);
   authoritativeMoveTelemetryRuntime.queueDepthHistogram[bucket] =
     Math.max(0, Math.floor(Number(authoritativeMoveTelemetryRuntime.queueDepthHistogram[bucket] ?? 0) || 0)) + 1;
+}
+
+function noteAuthoritativeMovementHotDeltaTelemetry(data = null, options = null) {
+  const delta = (data?.hotDelta && typeof data.hotDelta === "object") ? data.hotDelta : null;
+  const type = String(delta?.type ?? "").trim().toUpperCase();
+  if (type !== "MOVE" && type !== "MOVE_BATCH" && type !== "LIVE_POLL_TICK") return;
+  const opts = (options && typeof options === "object") ? options : {};
+  const totals = authoritativeMoveTelemetryRuntime.totals;
+  totals.hotDeltaSeen += 1;
+  if (opts.applied === true) totals.hotDeltaApplied += 1;
+  else totals.hotDeltaRejected += 1;
+  if (opts.snapshotFallback === true) totals.hotDeltaSnapshotFallback += 1;
+  const pendingRecord = Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)
+    ? authoritativeMoveTelemetryRuntime.pendingStreamMoves[0]
+    : null;
+  const applyAt = normalizeAuthoritativeMoveInputAt(opts.applyAt ?? Date.now());
+  const inputAt = normalizeAuthoritativeMoveInputAt(
+    opts.inputAt
+      ?? pendingRecord?.inputAt
+      ?? pendingRecord?.queuedAt
+      ?? applyAt
+  );
+  const inputToApplyMs = Math.max(0, applyAt - inputAt);
+  noteAuthoritativeMoveSample("inputToApplyMs", inputToApplyMs);
+  authoritativeMoveTelemetryRuntime.last = {
+    ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+      ? authoritativeMoveTelemetryRuntime.last
+      : {}),
+    kind: opts.applied === true ? "stream_hot_delta" : "stream_snapshot_fallback",
+    hotDeltaType: type,
+    hotDeltaApplied: opts.applied === true,
+    hotDeltaRejected: opts.applied !== true,
+    hotDeltaSnapshotFallback: opts.snapshotFallback === true,
+    inputToApplyMs,
+    perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
+    at: applyAt,
+  };
+}
+
+function noteAuthoritativeMovementIntentAckTelemetry(data = null, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const responseIntentSeq = Math.max(
+    0,
+    Math.floor(Number(data?.intent?.seq ?? opts.intentSeq ?? 0) || 0)
+  );
+  const record = findPendingAuthoritativeStreamMove(responseIntentSeq);
+  if (!record) return;
+  const ackAt = authoritativeResponseReadyAt(data);
+  const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? record.inputAt ?? ackAt);
+  const inputToIntentAckMs = Math.max(0, ackAt - inputAt);
+  const transport = authoritativeResponseTransportMeta(data);
+  const transportMs = Math.max(0, Number(transport?.totalMs ?? 0) || 0);
+  const responseBytes = authoritativeResponseBytes(data);
+  record.intentAckAt = ackAt;
+  record.intentAckTransportMs = transportMs;
+  record.intentAckResponseBytes = responseBytes;
+  noteAuthoritativeMoveSample("inputToIntentAckMs", inputToIntentAckMs);
+  noteAuthoritativeMoveSample("intentAckTransportMs", transportMs);
+  authoritativeMoveTelemetryRuntime.last = {
+    ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+      ? authoritativeMoveTelemetryRuntime.last
+      : {}),
+    kind: "stream_intent_ack",
+    seq: responseIntentSeq,
+    inputToIntentAckMs,
+    intentAckTransportMs: transportMs,
+    intentAckResponseBytes: responseBytes,
+    perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
+    at: ackAt,
+  };
+}
+
+function noteAuthoritativeMovementPollResponseTelemetry(data = null, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  if (opts.changed !== true) return;
+  const responseIntentSeq = Math.max(0, Math.floor(Number(data?.intent?.seq ?? 0) || 0));
+  const record = findPendingAuthoritativeStreamMove(responseIntentSeq)
+    ?? (Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)
+      ? authoritativeMoveTelemetryRuntime.pendingStreamMoves[0]
+      : null);
+  const responseAt = authoritativeResponseReadyAt(data);
+  const transport = authoritativeResponseTransportMeta(data);
+  const transportMs = Math.max(0, Number(transport?.totalMs ?? 0) || 0);
+  const responseBytes = authoritativeResponseBytes(data);
+  noteAuthoritativeMoveSample("pollTransportMs", transportMs);
+  noteAuthoritativeMoveSample("pollResponseBytes", responseBytes);
+  if (record) {
+    const inputToPollResponseMs = Math.max(0, responseAt - normalizeAuthoritativeMoveInputAt(record.inputAt ?? responseAt));
+    record.pollResponseAt = responseAt;
+    record.pollTransportMs = transportMs;
+    record.pollResponseBytes = responseBytes;
+    noteAuthoritativeMoveSample("inputToPollResponseMs", inputToPollResponseMs);
+    authoritativeMoveTelemetryRuntime.last = {
+      ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+        ? authoritativeMoveTelemetryRuntime.last
+        : {}),
+      kind: "stream_poll_response",
+      seq: Math.max(0, Math.floor(Number(record.intentSeq ?? responseIntentSeq) || 0)),
+      inputToPollResponseMs,
+      pollTransportMs: transportMs,
+      pollResponseBytes: responseBytes,
+      changed: true,
+      perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
+      at: responseAt,
+    };
+    return;
+  }
+  authoritativeMoveTelemetryRuntime.last = {
+    ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+      ? authoritativeMoveTelemetryRuntime.last
+      : {}),
+    kind: "stream_poll_response",
+    pollTransportMs: transportMs,
+    pollResponseBytes: responseBytes,
+    changed: true,
+    perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
+    at: responseAt,
+  };
+}
+
+function noteAuthoritativeMovementStateApplyTelemetry(data = null, options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
+  const responseAt = normalizeAuthoritativeMoveInputAt(
+    opts.responseReadyAt
+      ?? authoritativeResponseReadyAt(data)
+  );
+  const applyCompletedAt = normalizeAuthoritativeMoveInputAt(opts.applyCompletedAt ?? Date.now());
+  const applyDurationMs = Math.max(0, Number(opts.applyDurationMs ?? 0) || 0);
+  const responseToApplyMs = Math.max(0, applyCompletedAt - responseAt);
+  const snapshotImportMs = Number(opts.snapshotImportMs ?? NaN);
+  const activateMs = Number(opts.activateLoadedStateMs ?? NaN);
+  noteAuthoritativeMoveSample("pollResponseToStateApplyMs", responseToApplyMs);
+  noteAuthoritativeMoveSample("stateApplyDurationMs", applyDurationMs);
+  if (Number.isFinite(snapshotImportMs)) noteAuthoritativeMoveSample("snapshotImportMs", snapshotImportMs);
+  if (Number.isFinite(activateMs)) noteAuthoritativeMoveSample("activateLoadedStateMs", activateMs);
+  const responseIntentSeq = Math.max(0, Math.floor(Number(data?.intent?.seq ?? 0) || 0));
+  const record = findPendingAuthoritativeStreamMove(responseIntentSeq)
+    ?? (Array.isArray(authoritativeMoveTelemetryRuntime.pendingStreamMoves)
+      ? authoritativeMoveTelemetryRuntime.pendingStreamMoves[0]
+      : null);
+  if (record) {
+    record.applyCompletedAt = applyCompletedAt;
+    record.pollResponseToStateApplyMs = responseToApplyMs;
+    record.stateApplyDurationMs = applyDurationMs;
+    if (Number.isFinite(snapshotImportMs)) record.snapshotImportMs = snapshotImportMs;
+    if (Number.isFinite(activateMs)) record.activateLoadedStateMs = activateMs;
+  }
+  authoritativeMoveTelemetryRuntime.last = {
+    ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+      ? authoritativeMoveTelemetryRuntime.last
+      : {}),
+    kind: "stream_state_apply",
+    seq: record ? Math.max(0, Math.floor(Number(record.intentSeq ?? responseIntentSeq) || 0)) : responseIntentSeq,
+    pollResponseToStateApplyMs: responseToApplyMs,
+    stateApplyDurationMs: applyDurationMs,
+    snapshotImportMs: Number.isFinite(snapshotImportMs) ? snapshotImportMs : 0,
+    activateLoadedStateMs: Number.isFinite(activateMs) ? activateMs : 0,
+    hotDeltaApplied: opts.hotDeltaApplied === true,
+    perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
+    at: applyCompletedAt,
+  };
 }
 
 function percentileFromSamples(values = [], fraction = 0.5) {
@@ -2555,9 +2857,39 @@ function authoritativeMoveTelemetrySnapshot() {
       inputToVisualCompleteMedianMs: Math.round(percentileFromSamples(samples.inputToVisualCompleteMs, 0.5) * 10) / 10,
       inputToVisualCompleteP95Ms: Math.round(percentileFromSamples(samples.inputToVisualCompleteMs, 0.95) * 10) / 10,
     },
+    phases: {
+      inputToIntentAckMedianMs: Math.round(percentileFromSamples(samples.inputToIntentAckMs, 0.5) * 10) / 10,
+      inputToIntentAckP95Ms: Math.round(percentileFromSamples(samples.inputToIntentAckMs, 0.95) * 10) / 10,
+      inputToPollResponseMedianMs: Math.round(percentileFromSamples(samples.inputToPollResponseMs, 0.5) * 10) / 10,
+      inputToPollResponseP95Ms: Math.round(percentileFromSamples(samples.inputToPollResponseMs, 0.95) * 10) / 10,
+      pollResponseToStateApplyMedianMs: Math.round(percentileFromSamples(samples.pollResponseToStateApplyMs, 0.5) * 10) / 10,
+      pollResponseToStateApplyP95Ms: Math.round(percentileFromSamples(samples.pollResponseToStateApplyMs, 0.95) * 10) / 10,
+      stateApplyDurationMedianMs: Math.round(percentileFromSamples(samples.stateApplyDurationMs, 0.5) * 10) / 10,
+      stateApplyDurationP95Ms: Math.round(percentileFromSamples(samples.stateApplyDurationMs, 0.95) * 10) / 10,
+      stateApplyToNextPollMedianMs: Math.round(percentileFromSamples(samples.stateApplyToNextPollMs, 0.5) * 10) / 10,
+      stateApplyToNextPollP95Ms: Math.round(percentileFromSamples(samples.stateApplyToNextPollMs, 0.95) * 10) / 10,
+      snapshotImportMedianMs: Math.round(percentileFromSamples(samples.snapshotImportMs, 0.5) * 10) / 10,
+      snapshotImportP95Ms: Math.round(percentileFromSamples(samples.snapshotImportMs, 0.95) * 10) / 10,
+      activateLoadedStateMedianMs: Math.round(percentileFromSamples(samples.activateLoadedStateMs, 0.5) * 10) / 10,
+      activateLoadedStateP95Ms: Math.round(percentileFromSamples(samples.activateLoadedStateMs, 0.95) * 10) / 10,
+      intentAckTransportMedianMs: Math.round(percentileFromSamples(samples.intentAckTransportMs, 0.5) * 10) / 10,
+      intentAckTransportP95Ms: Math.round(percentileFromSamples(samples.intentAckTransportMs, 0.95) * 10) / 10,
+      pollTransportMedianMs: Math.round(percentileFromSamples(samples.pollTransportMs, 0.5) * 10) / 10,
+      pollTransportP95Ms: Math.round(percentileFromSamples(samples.pollTransportMs, 0.95) * 10) / 10,
+      pollResponseBytesMedian: Math.round(percentileFromSamples(samples.pollResponseBytes, 0.5)),
+      pollResponseBytesP95: Math.round(percentileFromSamples(samples.pollResponseBytes, 0.95)),
+    },
     correction: {
       medianDistance: Math.round(percentileFromSamples(samples.correctionDistance, 0.5) * 100) / 100,
       p95Distance: Math.round(percentileFromSamples(samples.correctionDistance, 0.95) * 100) / 100,
+    },
+    hotDelta: {
+      seen: Math.max(0, Math.floor(Number(totals.hotDeltaSeen ?? 0) || 0)),
+      applied: Math.max(0, Math.floor(Number(totals.hotDeltaApplied ?? 0) || 0)),
+      rejected: Math.max(0, Math.floor(Number(totals.hotDeltaRejected ?? 0) || 0)),
+      snapshotFallback: Math.max(0, Math.floor(Number(totals.hotDeltaSnapshotFallback ?? 0) || 0)),
+      inputToApplyMedianMs: Math.round(percentileFromSamples(samples.inputToApplyMs, 0.5) * 10) / 10,
+      inputToApplyP95Ms: Math.round(percentileFromSamples(samples.inputToApplyMs, 0.95) * 10) / 10,
     },
     queueDepthHistogram: { ...authoritativeMoveTelemetryRuntime.queueDepthHistogram },
     pending: {
@@ -2631,31 +2963,31 @@ function noteAuthoritativeMoveDispatch(clientCommandSeq = 0, command = null, opt
   }
 }
 
-function registerAuthoritativeStreamPredictedMove(intentSeq = 0, trace = null, options = null) {
+function registerAuthoritativeStreamMoveTelemetry(intentSeq = 0, trace = null, options = null) {
   const seq = Math.max(0, Math.floor(Number(intentSeq) || 0));
+  if (!seq) return null;
   const predictedTrace = (trace && typeof trace === "object") ? trace : null;
-  if (!predictedTrace) return null;
   const opts = (options && typeof options === "object") ? options : {};
-  const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? predictedTrace.predictedAt ?? Date.now());
+  const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? predictedTrace?.predictedAt ?? Date.now());
   const queuedAt = normalizeAuthoritativeMoveInputAt(opts.queuedAt ?? inputAt);
-  const predictedAt = normalizeAuthoritativeMoveInputAt(predictedTrace.predictedAt ?? Date.now());
+  const predictedAt = normalizeAuthoritativeMoveInputAt(predictedTrace?.predictedAt ?? queuedAt);
   const sentAt = normalizeAuthoritativeMoveInputAt(opts.sentAt ?? Date.now());
-  const visualMotionStartAt = normalizeAuthoritativeMoveInputAt(predictedTrace.visualMotionStartAt ?? predictedAt);
-  const visualMotionEndAt = normalizeAuthoritativeMoveInputAt(predictedTrace.visualMotionEndAt ?? visualMotionStartAt);
+  const visualMotionStartAt = normalizeAuthoritativeMoveInputAt(predictedTrace?.visualMotionStartAt ?? predictedAt);
+  const visualMotionEndAt = normalizeAuthoritativeMoveInputAt(predictedTrace?.visualMotionEndAt ?? visualMotionStartAt);
   const queueDepthAtSend = Math.max(0, Math.floor(Number(opts.queueDepthAtSend ?? 0) || 0));
   const record = {
     intentSeq: seq,
-    dir: String(opts.dir ?? "").trim().toUpperCase() || String(predictedTrace.dir ?? "").trim().toUpperCase(),
+    dir: String(opts.dir ?? "").trim().toUpperCase() || String(predictedTrace?.dir ?? "").trim().toUpperCase(),
     inputAt,
     queuedAt,
     predictedAt,
     sentAt,
     visualMotionStartAt,
     visualMotionEndAt,
-    startX: Math.floor(Number(predictedTrace.startX ?? 0) || 0),
-    startY: Math.floor(Number(predictedTrace.startY ?? 0) || 0),
-    expectedX: Math.floor(Number(predictedTrace.endX ?? 0) || 0),
-    expectedY: Math.floor(Number(predictedTrace.endY ?? 0) || 0),
+    startX: Number.isFinite(Number(predictedTrace?.startX)) ? Math.floor(Number(predictedTrace.startX)) : null,
+    startY: Number.isFinite(Number(predictedTrace?.startY)) ? Math.floor(Number(predictedTrace.startY)) : null,
+    expectedX: Number.isFinite(Number(predictedTrace?.endX)) ? Math.floor(Number(predictedTrace.endX)) : null,
+    expectedY: Number.isFinite(Number(predictedTrace?.endY)) ? Math.floor(Number(predictedTrace.endY)) : null,
     queueDepthAtSend,
   };
   authoritativeMoveTelemetryRuntime.pendingStreamMoves = authoritativeMoveTelemetryRuntime.pendingStreamMoves
@@ -2668,21 +3000,25 @@ function registerAuthoritativeStreamPredictedMove(intentSeq = 0, trace = null, o
     );
   }
   authoritativeMoveTelemetryRuntime.totals.sent += 1;
-  authoritativeMoveTelemetryRuntime.totals.predicted += 1;
-  authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs += Math.max(0, predictedAt - inputAt);
-  noteAuthoritativeMoveSample("inputToPredictedMs", Math.max(0, predictedAt - inputAt));
   noteAuthoritativeMoveSample("inputToSendMs", Math.max(0, sentAt - inputAt));
-  noteAuthoritativeMoveSample("inputToVisualCompleteMs", Math.max(0, visualMotionEndAt - inputAt));
+  if (predictedTrace) {
+    authoritativeMoveTelemetryRuntime.totals.predicted += 1;
+    authoritativeMoveTelemetryRuntime.totals.totalInputToVisualMs += Math.max(0, predictedAt - inputAt);
+    noteAuthoritativeMoveSample("inputToPredictedMs", Math.max(0, predictedAt - inputAt));
+    noteAuthoritativeMoveSample("inputToVisualCompleteMs", Math.max(0, visualMotionEndAt - inputAt));
+  }
   noteAuthoritativeMoveQueueDepth(queueDepthAtSend);
-  authoritativeTickRuntime.nextMoveAt = Math.max(
-    authoritativeTickRuntime.nextMoveAt,
-    predictedAt + authoritativeClientTickMs()
-  );
-  authoritativePredictionRuntime.inFlightMovePredicted = true;
+  if (predictedTrace) {
+    authoritativeTickRuntime.nextMoveAt = Math.max(
+      authoritativeTickRuntime.nextMoveAt,
+      predictedAt + authoritativeClientTickMs()
+    );
+    authoritativePredictionRuntime.inFlightMovePredicted = true;
+  }
   return record;
 }
 
-function clearAuthoritativeStreamPredictedMove(intentSeq = 0) {
+function clearAuthoritativeStreamMoveTelemetry(intentSeq = 0) {
   const seq = Math.max(0, Math.floor(Number(intentSeq) || 0));
   const before = authoritativeMoveTelemetryRuntime.pendingStreamMoves.length;
   authoritativeMoveTelemetryRuntime.pendingStreamMoves =
@@ -2736,6 +3072,9 @@ function acknowledgeAuthoritativeStreamMoveTelemetry(data = null, authoritativeP
   noteAuthoritativeMoveSample("inputToAckMs", inputToAckMs);
   noteAuthoritativeMoveSample("correctionDistance", correctionDist);
   authoritativeMoveTelemetryRuntime.last = {
+    ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+      ? authoritativeMoveTelemetryRuntime.last
+      : {}),
     seq: recordIntentSeq,
     kind: "stream_move",
     rttMs,
@@ -2745,6 +3084,7 @@ function acknowledgeAuthoritativeStreamMoveTelemetry(data = null, authoritativeP
     authY,
     queueDepthAtSend: Math.max(0, Math.floor(Number(nextRecord.queueDepthAtSend ?? 0) || 0)),
     tickMs: Math.max(0, Math.floor(Number(data?.tick?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())),
+    perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
     pending: authoritativeMoveTelemetryRuntime.pendingBySeq.size + authoritativeMoveTelemetryRuntime.pendingStreamMoves.length,
     at: ackAt,
   };
@@ -2780,6 +3120,9 @@ function acknowledgeAuthoritativeMoveTelemetry(data = null, authoritativePlayer 
     noteAuthoritativeMoveSample("inputToAckMs", inputToAckMs);
     noteAuthoritativeMoveSample("correctionDistance", correctionDist);
     authoritativeMoveTelemetryRuntime.last = {
+      ...(authoritativeMoveTelemetryRuntime.last && typeof authoritativeMoveTelemetryRuntime.last === "object"
+        ? authoritativeMoveTelemetryRuntime.last
+        : {}),
       seq,
       rttMs,
       inputToAckMs,
@@ -2788,6 +3131,7 @@ function acknowledgeAuthoritativeMoveTelemetry(data = null, authoritativePlayer 
       authY,
       queueDepthAtSend: Math.max(0, Math.floor(Number(record.queueDepthAtSend ?? 0) || 0)),
       tickMs: Math.max(0, Math.floor(Number(data?.tick?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())),
+      perf: (data?.perf && typeof data.perf === "object") ? { ...data.perf } : null,
       pending: authoritativeMoveTelemetryRuntime.pendingBySeq.size + authoritativeMoveTelemetryRuntime.pendingStreamMoves.length,
       at: ackAt,
     };
@@ -2801,19 +3145,29 @@ function authoritativeMoveDiagnosticsLabel() {
     0,
     Math.floor(Number(snapshot?.last?.tickMs ?? authoritativeClientTickMs()) || authoritativeClientTickMs())
   );
+  const modeLabel = snapshot?.movementStream?.current === "fallback" ? "fallback" : "stream";
+  const streamPct = Math.round(Number(snapshot?.movementStream?.streamPct ?? 0));
+  const authOnlyLabel = AUTHORITATIVE_CLIENT_PREDICTION_ENABLED ? "predicted" : "auth-only";
   if (acked <= 0) {
-    return `MOVE diag: collecting... | ${snapshot?.movementStream?.current === "fallback" ? "fallback" : "stream"} ${Math.round(Number(snapshot?.movementStream?.streamPct ?? 0))}%`;
+    return `MOVE diag: collecting... | ${modeLabel} ${streamPct}% | ${authOnlyLabel}`;
   }
   const correctionRate = Math.round(
     (Math.max(0, Math.floor(Number(snapshot?.totals?.corrected ?? 0) || 0)) / Math.max(1, acked)) * 1000
   ) / 10;
+  const hotSeen = Math.max(0, Math.floor(Number(snapshot?.hotDelta?.seen ?? 0) || 0));
+  const hotApplied = Math.max(0, Math.floor(Number(snapshot?.hotDelta?.applied ?? 0) || 0));
+  const hotRejected = Math.max(0, Math.floor(Number(snapshot?.hotDelta?.rejected ?? 0) || 0));
+  const hotSnapshotFallback = Math.max(0, Math.floor(Number(snapshot?.hotDelta?.snapshotFallback ?? 0) || 0));
+  const phpMs = Math.round(Number(snapshot?.last?.perf?.phpMs ?? 0) * 10) / 10;
   const pending = Math.max(
     0,
     Math.floor(Number(snapshot?.pending?.commandSeq ?? 0) || 0) +
       Math.floor(Number(snapshot?.pending?.streamMoves ?? 0) || 0)
   );
   const lead = Math.max(0, Math.floor(Number(snapshot?.pending?.predictedLead ?? 0) || 0));
-  return `MOVE diag: ${snapshot?.movementStream?.current === "fallback" ? "fallback" : "stream"} ${Math.round(Number(snapshot?.movementStream?.streamPct ?? 0))}% | tick ${tickMs}ms | input->pred ${snapshot?.latency?.inputToPredictedMedianMs ?? 0}/${snapshot?.latency?.inputToPredictedP95Ms ?? 0}ms | input->ack ${snapshot?.latency?.inputToAckMedianMs ?? 0}/${snapshot?.latency?.inputToAckP95Ms ?? 0}ms | corr ${correctionRate}% med ${snapshot?.correction?.medianDistance ?? 0} | lead ${lead} | pending ${pending}`;
+  const pollBytesMedian = Math.max(0, Math.floor(Number(snapshot?.phases?.pollResponseBytesMedian ?? 0) || 0));
+  const pollKb = pollBytesMedian >= 1024 ? `${Math.round((pollBytesMedian / 1024) * 10) / 10}kb` : `${pollBytesMedian}b`;
+  return `MOVE diag: ${modeLabel} ${streamPct}% | ${authOnlyLabel} | tick ${tickMs}ms | php ${phpMs}ms | intent ${snapshot?.phases?.inputToIntentAckMedianMs ?? 0}/${snapshot?.phases?.inputToIntentAckP95Ms ?? 0}ms | poll ${snapshot?.phases?.inputToPollResponseMedianMs ?? 0}/${snapshot?.phases?.inputToPollResponseP95Ms ?? 0}ms | apply ${snapshot?.phases?.pollResponseToStateApplyMedianMs ?? 0}/${snapshot?.phases?.pollResponseToStateApplyP95Ms ?? 0}ms dur ${snapshot?.phases?.stateApplyDurationMedianMs ?? 0}/${snapshot?.phases?.stateApplyDurationP95Ms ?? 0} gap ${snapshot?.phases?.stateApplyToNextPollMedianMs ?? 0}/${snapshot?.phases?.stateApplyToNextPollP95Ms ?? 0} | hot ${hotApplied}/${hotSeen} rej ${hotRejected} snap ${hotSnapshotFallback} | poll ${pollKb} | corr ${correctionRate}% med ${snapshot?.correction?.medianDistance ?? 0} | lead ${lead} | pending ${pending}`;
 }
 
 function scheduleAuthoritativeQueueDrain(delayMs = 0) {
@@ -3064,11 +3418,14 @@ function normalizeLoadedStateCollections(state) {
   return state;
 }
 
-function activateLoadedGameState(nextGame, reason = "load") {
+function activateLoadedGameState(nextGame, reason = "load", options = null) {
   if (!nextGame?.player || !nextGame?.world) return false;
-  const prevPlayer = game?.player
-    ? { x: Number(game.player.x ?? 0), y: Number(game.player.y ?? 0) }
+  const opts = (options && typeof options === "object") ? options : {};
+  const providedPrevPlayer = (opts.previousPlayer && typeof opts.previousPlayer === "object")
+    ? opts.previousPlayer
     : null;
+  const prevPlayer = providedPrevPlayer
+    ?? (game?.player ? { x: Number(game.player.x ?? 0), y: Number(game.player.y ?? 0) } : null);
   const reasonKey = String(reason ?? "").trim().toLowerCase();
   const fastUiUpdate = isAuthoritativeSessionActive() && isFastAuthoritativeUiReason(reasonKey);
   normalizeLoadedStateCollections(nextGame);
@@ -3098,6 +3455,7 @@ function activateLoadedGameState(nextGame, reason = "load") {
   if (shopUi.open) renderShopOverlay(game);
   updateContextActionButton(game);
   updateDeathOverlay(game);
+  renderAuthoritativeMovementStatusBadge();
   refreshSaveNameFromLive(true);
   resetItemAuthorityRuntime(itemAuthorityCharacterIdForState(game));
   if (reason === "respawn-autosave") {
@@ -3112,9 +3470,17 @@ function activateLoadedGameState(nextGame, reason = "load") {
 
 function applyAuthoritativeSnapshotToGame(response, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
+  const perfNow = () => ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
+  const applyStartedAt = Date.now();
+  const applyPerfStartedAt = perfNow();
   const data = (response && typeof response === "object") ? response : {};
   const runtimeSessionId = String(authoritativePredictionRuntime.lastSessionId ?? "").trim();
   const incomingSessionId = String(data?.sessionId ?? "").trim();
+  const trackMovePhaseTelemetry = opts.trackMovePhaseTelemetry === true;
+  const responseReadyAt = normalizeAuthoritativeMoveInputAt(
+    opts.responseReadyAt
+      ?? authoritativeResponseReadyAt(data, applyStartedAt)
+  );
   const allowSessionChange = opts.allowSessionChange === true;
   if (incomingSessionId && runtimeSessionId && incomingSessionId !== runtimeSessionId && !allowSessionChange) {
     return true;
@@ -3127,33 +3493,61 @@ function applyAuthoritativeSnapshotToGame(response, options = null) {
     resetAuthoritativePredictionRuntime(incomingSessionId);
   }
   if (isAuthoritativeResponseStale(data)) return true;
+  const reason = String(opts.reason ?? "authoritative");
   const resolvedPayload = resolveAuthoritativeResponsePayload(data);
   const payload = String(resolvedPayload?.payload ?? "").trim();
-  if (!payload) return false;
-  const reason = String(opts.reason ?? "authoritative");
   const snapshotBase = (data.snapshot && typeof data.snapshot === "object") ? data.snapshot : {};
-  const mirrorSnapshot = String(snapshotBase?.payload ?? "").trim()
-    ? snapshotBase
-    : { ...snapshotBase, payload };
-  const mirrorResponse = { ...data, snapshot: mirrorSnapshot };
   let nextState = null;
+  let snapshotImportMs = NaN;
+  const previousPlayer = game?.player
+    ? { x: Number(game.player.x ?? 0), y: Number(game.player.y ?? 0) }
+    : null;
   const hotDeltaApplied = (
     isAuthoritativeSessionActive() &&
     game &&
     shouldApplyAuthoritativeHotDelta(data) &&
     applyAuthoritativeHotDeltaToState(game, data.hotDelta)
   );
+  noteAuthoritativeMovementHotDeltaTelemetry(data, {
+    applied: hotDeltaApplied,
+    snapshotFallback: !!(data?.hotDelta && !hotDeltaApplied),
+    applyAt: applyStartedAt,
+  });
+  if (!hotDeltaApplied && !payload) return false;
+  const mirrorSnapshot = String(snapshotBase?.payload ?? "").trim()
+    ? snapshotBase
+    : (payload ? { ...snapshotBase, payload } : snapshotBase);
+  const mirrorResponse = { ...data, snapshot: mirrorSnapshot };
   if (hotDeltaApplied) {
     nextState = game;
   } else {
+    const importStartedAt = perfNow();
     const loaded = importSave(payload);
+    snapshotImportMs = Math.max(0, perfNow() - importStartedAt);
     if (!loaded) return false;
     nextState = loaded;
   }
   applyAuthoritativeResponseToMirror(authoritativeMirror, mirrorResponse);
   noteAppliedAuthoritativeResponse(data);
   noteAuthoritativeTickFromResponse(data);
-  if (!activateLoadedGameState(nextState, reason)) return false;
+  const activateStartedAt = perfNow();
+  if (!activateLoadedGameState(nextState, reason, {
+    previousPlayer: hotDeltaApplied ? previousPlayer : null,
+  })) return false;
+  const activateLoadedStateMs = Math.max(0, perfNow() - activateStartedAt);
+  const applyCompletedAt = Date.now();
+  const stateApplyDurationMs = Math.max(0, perfNow() - applyPerfStartedAt);
+  if (trackMovePhaseTelemetry) {
+    noteAuthoritativeMovementStateApplyTelemetry(data, {
+      responseReadyAt,
+      applyCompletedAt,
+      applyDurationMs: stateApplyDurationMs,
+      snapshotImportMs,
+      activateLoadedStateMs,
+      hotDeltaApplied,
+    });
+    authoritativeMovementChannelRuntime.lastApplyCompletedAt = applyCompletedAt;
+  }
   acknowledgeAuthoritativeMoveTelemetry(data, game?.player ?? null);
   acknowledgeAuthoritativeStreamMoveTelemetry(data, game?.player ?? null);
   replayQueuedAuthoritativeMovePredictions();
@@ -3420,6 +3814,14 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
     isAuthoritativeSessionActive() &&
     String(authoritativeMirror.sessionId ?? "").trim() === sid
   ) {
+    const pollStartedAt = Date.now();
+    if (authoritativeMovementChannelRuntime.lastApplyCompletedAt > 0) {
+      noteAuthoritativeMoveSample(
+        "stateApplyToNextPollMs",
+        Math.max(0, pollStartedAt - authoritativeMovementChannelRuntime.lastApplyCompletedAt)
+      );
+    }
+    authoritativeMovementChannelRuntime.lastPollStartedAt = pollStartedAt;
     authoritativeMovementChannelRuntime.pollInFlight = true;
     const controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
     authoritativeMovementChannelRuntime.abortController = controller;
@@ -3430,6 +3832,8 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
         minResponseMs: AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS,
         signal: controller?.signal,
       });
+      const responseReadyAt = authoritativeResponseReadyAt(response);
+      authoritativeMovementChannelRuntime.lastPollResponseAt = responseReadyAt;
       noteAuthoritativeMovementStreamMode("stream");
       if (
         authoritativeMovementChannelRuntime.stopRequested ||
@@ -3439,6 +3843,7 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
         break;
       }
       if (response?.changed && response?.snapshot) {
+        noteAuthoritativeMovementPollResponseTelemetry(response, { changed: true });
         if (shouldSkipAuthoritativeMovementPollSnapshot(response)) {
           noteAuthoritativeTickFromResponse(response);
           retryCount = 0;
@@ -3448,6 +3853,8 @@ async function runAuthoritativeMovementPollLoop(sessionId = "") {
           markDirty: !!response?.ok,
           dirtyReason: "move-stream",
           reason: "move-stream",
+          responseReadyAt,
+          trackMovePhaseTelemetry: true,
         });
       } else if (response?.tick) {
         noteAuthoritativeTickFromResponse(response);
@@ -16115,12 +16522,14 @@ function submitAuthoritativeMovementInput(dx = 0, dy = 0, options = null) {
   if (!enqueueDir) return false;
   if (!isAuthoritativeMovementStreamAvailable()) {
     noteAuthoritativeMovementStreamCompatibilityFallback();
-    return performAuthoritativeCommand(moveCommand(dx, dy), opts);
+    return AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED
+      ? performAuthoritativeCommand(moveCommand(dx, dy), opts)
+      : false;
   }
   const inputAt = normalizeAuthoritativeMoveInputAt(opts.inputAt ?? Date.now());
   const intentSeq = nextAuthoritativeMovementIntentSeq();
-  const predictedStep = tryPredictAuthoritativeMovementStreamStep(enqueueDir, {
-    intentSeq,
+  registerAuthoritativeStreamMoveTelemetry(intentSeq, null, {
+    dir: enqueueDir,
     inputAt,
     queuedAt: inputAt,
     sentAt: Date.now(),
@@ -16133,29 +16542,9 @@ function submitAuthoritativeMovementInput(dx = 0, dy = 0, options = null) {
     inputAt,
   })).then((ok) => {
     if (ok) return true;
-    if (!isAuthoritativeMovementStreamAvailable()) {
-      if (predictedStep?.intentSeq) clearAuthoritativeStreamPredictedMove(predictedStep.intentSeq);
-      return performAuthoritativeCommand(moveCommand(dx, dy), {
-        ...opts,
-        inputAt,
-        predictionAlreadyApplied: predictedStep?.predicted === true,
-        predictedSteps: predictedStep?.trace
-          ? [{
-              dir: enqueueDir,
-              startX: Math.floor(Number(predictedStep.trace.startX ?? 0) || 0),
-              startY: Math.floor(Number(predictedStep.trace.startY ?? 0) || 0),
-              endX: Math.floor(Number(predictedStep.trace.endX ?? 0) || 0),
-              endY: Math.floor(Number(predictedStep.trace.endY ?? 0) || 0),
-              predictedAt: normalizeAuthoritativeMoveInputAt(predictedStep.trace.predictedAt ?? inputAt),
-              visualMotionEndAt: normalizeAuthoritativeMoveInputAt(predictedStep.trace.visualMotionEndAt ?? predictedStep.trace.predictedAt ?? inputAt),
-              inputAt,
-            }]
-          : [],
-      });
-    }
-    if (predictedStep?.predicted === true) {
-      if (predictedStep?.intentSeq) clearAuthoritativeStreamPredictedMove(predictedStep.intentSeq);
-      void requestAuthoritativeResync("movement-intent-sync-failed");
+    clearAuthoritativeStreamMoveTelemetry(intentSeq);
+    if (!isAuthoritativeMovementStreamAvailable() && AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED) {
+      return performAuthoritativeCommand(moveCommand(dx, dy), { ...opts, inputAt });
     }
     return false;
   });
@@ -20923,6 +21312,7 @@ function draw(state) {
   if (!state || !state.world || !state.player) return;
   const frameStartMs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const nowMs = Date.now();
+  renderAuthoritativeMovementStatusBadge();
   const visualPlayer = isAuthoritativeSessionActive()
     ? resolveAuthoritativeVisualPlayerPosition(state.player.x, state.player.y, nowMs)
     : { x: Number(state.player.x ?? 0), y: Number(state.player.y ?? 0) };
@@ -21769,35 +22159,6 @@ function resolvePreferredAuthoritativeMovementIntent() {
   };
 }
 
-function tryPredictAuthoritativeMovementStreamStep(dir = "", options = null) {
-  if (!AUTHORITATIVE_CLIENT_PREDICTION_ENABLED) return null;
-  if (!isAuthoritativeSessionActive()) return null;
-  if (!isAuthoritativeMovementStreamAvailable()) return null;
-  if (!canPredictAuthoritativeMoveNow()) return null;
-  const normalizedDir = String(dir ?? "").trim().toUpperCase();
-  if (normalizedDir !== "N" && normalizedDir !== "S" && normalizedDir !== "E" && normalizedDir !== "W") return null;
-  const moveCommandPayload = { type: "MOVE", dir: normalizedDir };
-  if (shouldDropAuthoritativeCommand(moveCommandPayload, { suppressWallLog: true })) return null;
-  const trace = { dir: normalizedDir };
-  const predicted = tryApplyImmediateAuthoritativeMovePrediction(moveCommandPayload, trace);
-  if (!predicted) return null;
-  const opts = (options && typeof options === "object") ? options : {};
-  const intentSeq = Math.max(0, Math.floor(Number(opts.intentSeq ?? authoritativeMovementChannelRuntime.lastSentIntentSeq ?? 0) || 0));
-  const record = registerAuthoritativeStreamPredictedMove(intentSeq, trace, {
-    dir: normalizedDir,
-    inputAt: opts.inputAt ?? Date.now(),
-    queuedAt: opts.queuedAt ?? opts.inputAt ?? Date.now(),
-    sentAt: opts.sentAt ?? Date.now(),
-    queueDepthAtSend: opts.queueDepthAtSend ?? 0,
-  });
-  return {
-    predicted: true,
-    record,
-    trace,
-    intentSeq,
-  };
-}
-
 async function syncAuthoritativeMovementControl(options = null) {
   if (!isAuthoritativeSessionActive()) return false;
   if (!isAuthoritativeMovementStreamAvailable()) {
@@ -21832,6 +22193,12 @@ async function syncAuthoritativeMovementControl(options = null) {
         responseIntentSeq
       );
     }
+    if (enqueueDir) {
+      noteAuthoritativeMovementIntentAckTelemetry(response, {
+        intentSeq,
+        inputAt: opts.inputAt ?? selected?.updatedAt ?? Date.now(),
+      });
+    }
     noteAuthoritativeMovementStreamMode("stream");
     return true;
   } catch (err) {
@@ -21847,27 +22214,6 @@ async function syncAuthoritativeMovementControl(options = null) {
     }
     return false;
   }
-}
-
-function pumpAuthoritativeMovementIntent() {
-  if (!AUTHORITATIVE_CLIENT_PREDICTION_ENABLED) return false;
-  if (!isAuthoritativeSessionActive()) return false;
-  if (!isAuthoritativeMovementStreamAvailable()) return false;
-  if (!game?.player || game.player.dead) return false;
-  if (Date.now() < Math.max(0, Math.floor(Number(authoritativeTickRuntime.nextMoveAt ?? 0) || 0))) return false;
-  const selected = resolvePreferredAuthoritativeMovementIntent();
-  if (!selected) return false;
-  const holdDir = authoritativeMoveDirFromDelta(selected.dx, selected.dy);
-  if (!holdDir) return false;
-  const intentSeq = Math.max(0, Math.floor(Number(authoritativeMovementChannelRuntime.lastSentIntentSeq ?? 0) || 0));
-  if (!intentSeq) return false;
-  return !!tryPredictAuthoritativeMovementStreamStep(holdDir, {
-    intentSeq,
-    inputAt: Date.now(),
-    queuedAt: Date.now(),
-    sentAt: Date.now(),
-    queueDepthAtSend: 0,
-  });
 }
 
 function onKey(state, e) {
@@ -24329,6 +24675,7 @@ function executeLiveTickCommandOnState(state, rawCommand = null, options = null)
   const command = (rawCommand && typeof rawCommand === "object") ? rawCommand : {};
   const type = String(command.type ?? "").trim().toUpperCase();
   const buildHotDelta = AUTHORITATIVE_HOT_DELTA_TYPES.has(type);
+  const buildDiff = type !== "LIVE_POLL_TICK";
   const hotBaseline = buildHotDelta ? captureAuthoritativeHotBaseline(state) : null;
   const logStart = Array.isArray(state?.log) ? state.log.length : 0;
   const beforePayload = String(opts.basePayload ?? "").trim() || exportSave(state);
@@ -24518,9 +24865,13 @@ function executeLiveTickCommandOnState(state, rawCommand = null, options = null)
   const snapshot = snapshotWithAreaRespawn();
   const snapshotMs = Math.max(0, perfNow() - snapshotStartMs);
   const snapshotPayload = String(snapshot?.payload ?? "");
-  const diffStartMs = perfNow();
-  const diff = stepResult.ok ? buildAuthoritativePayloadDiff(beforePayload, snapshotPayload) : null;
-  const diffMs = Math.max(0, perfNow() - diffStartMs);
+  let diff = null;
+  let diffMs = 0;
+  if (buildDiff && stepResult.ok) {
+    const diffStartMs = perfNow();
+    diff = buildAuthoritativePayloadDiff(beforePayload, snapshotPayload);
+    diffMs = Math.max(0, perfNow() - diffStartMs);
+  }
   const hotDeltaStartMs = perfNow();
   const hotDelta = (stepResult.ok && buildHotDelta) ? buildAuthoritativeHotDelta(hotBaseline, state, type, logStart) : null;
   const hotDeltaMs = Math.max(0, perfNow() - hotDeltaStartMs);
@@ -25295,18 +25646,11 @@ function shouldApplyAuthoritativeHotDelta(data = null) {
     const authX = Math.floor(Number(player.x ?? NaN));
     const authY = Math.floor(Number(player.y ?? NaN));
     const authZ = Math.floor(Number(player.z ?? NaN));
-    const localX = Math.floor(Number(game.player.x ?? NaN));
-    const localY = Math.floor(Number(game.player.y ?? NaN));
     const localZ = Math.floor(Number(game.player.z ?? NaN));
-    // In compatibility mode we may not have a full predicted chain, so accept
-    // movement hot deltas as long as the floor matches to avoid expensive full
-    // snapshot imports between rapid turns.
-    if (authoritativeMovementChannelRuntime.disabled) {
-      return authZ === localZ;
-    }
-    // Only hot-apply movement when the authoritative tile matches the already
-    // visible local tile, so this stays a confirmation path rather than a correction path.
-    return authX === localX && authY === localY && authZ === localZ;
+    // In interpolation-only stream movement, authoritative move deltas are the
+    // normal fast path. Staleness/session checks happen before this gate, so we
+    // only need a valid player position on the same floor.
+    return Number.isFinite(authX) && Number.isFinite(authY) && Number.isFinite(authZ) && authZ === localZ;
   }
   return true;
 }
@@ -26852,7 +27196,6 @@ if (!HEADLESS_RUNTIME) {
         ? ts
         : ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now());
       try {
-        pumpAuthoritativeMovementIntent();
         draw(game);
       } catch (err) {
         showFatal(err);

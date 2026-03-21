@@ -22,7 +22,7 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
   path.join(PROJECT_ROOT, "src", "content", "monsters.seed.json"),
 ].filter(Boolean);
 let appliedMonsterConfigRaw = "";
-const AUTHORITATIVE_TICK_MS = 16;
+const AUTHORITATIVE_TICK_MS = 12;
 
 function sleep(ms = 0) {
   const delay = Math.max(0, Math.floor(Number(ms) || 0));

@@ -353,6 +353,16 @@ function versioned_relative_asset_url(string $relativePath): string
  */
 function json_response(array $payload, int $status = 200): void
 {
+  global $authoritativeApiRequestStartedAt;
+  if (
+    trim((string) ($_GET['api'] ?? '')) === 'authoritative'
+    && is_float($authoritativeApiRequestStartedAt ?? null)
+  ) {
+    $perf = is_array($payload['perf'] ?? null) ? $payload['perf'] : [];
+    $perf['phpMs'] = round((microtime(true) - $authoritativeApiRequestStartedAt) * 1000, 2);
+    $perf['sessionLockReleased'] = session_status() !== PHP_SESSION_ACTIVE;
+    $payload['perf'] = $perf;
+  }
   app_apply_baseline_security_headers();
   http_response_code($status);
   header('Content-Type: application/json; charset=UTF-8');
@@ -361,6 +371,13 @@ function json_response(array $payload, int $status = 200): void
   header('Surrogate-Control: no-store');
   echo json_encode($payload, JSON_UNESCAPED_SLASHES);
   exit;
+}
+
+function release_php_session_lock(): void
+{
+  if (session_status() === PHP_SESSION_ACTIVE) {
+    session_write_close();
+  }
 }
 
 /**
@@ -2467,6 +2484,7 @@ if ($logoutRequested) {
 $apiMode = trim((string) ($_GET['api'] ?? ''));
 $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 $requestedVersion = trim((string) ($_GET['v'] ?? ''));
+$authoritativeApiRequestStartedAt = $apiMode === 'authoritative' ? microtime(true) : null;
 
 $user = get_authenticated_user();
 $userEmail = strtolower(trim((string) ($user['email'] ?? '')));
@@ -2484,6 +2502,10 @@ if (empty($_SESSION['savegames_csrf'])) {
   $_SESSION['savegames_csrf'] = bin2hex(random_bytes(32));
 }
 $saveGamesCsrf = (string) $_SESSION['savegames_csrf'];
+
+// All later request paths only need session-derived values read above.
+// Release the PHP session lock now so long-poll and intent requests can run concurrently.
+release_php_session_lock();
 
 if ($apiMode === 'sprite_asset') {
   if (!app_rate_limit('api_sprite_asset', 2400, 60)) {
@@ -2860,6 +2882,7 @@ if ($apiMode === 'analytics') {
   }
 }
 if ($apiMode === 'authoritative') {
+  release_php_session_lock();
   $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
   if ($method === 'POST' && !app_rate_limit('api_authoritative_post', 1800, 60)) {
     json_response(['ok' => false, 'error' => 'Too many authoritative requests. Please retry shortly.'], 429);
@@ -2952,6 +2975,7 @@ if ($apiMode === 'authoritative') {
       ));
     }
     if ($action === 'poll_movement') {
+      release_php_session_lock();
       $sessionId = trim((string) ($body['session_id'] ?? ''));
       if ($sessionId === '') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
