@@ -15269,7 +15269,8 @@ function updateAreaRespawnSystem(state, now = Date.now()) {
 function computeVisibility(state) {
   updateViewportMetrics();
   const canTrackDiscovery = canMutateGameplayStateLocally();
-  const shouldPrimeSeenForRender = !canTrackDiscovery && (state?.seen?.size ?? 0) === 0;
+  const shouldTrackRevealForRender = canTrackDiscovery || isAuthoritativeSessionActive();
+  const shouldPrimeSeenForRender = !shouldTrackRevealForRender && (state?.seen?.size ?? 0) === 0;
   const { world, player, seen, visible } = state;
   if (visibilityStateRef !== state) {
     visibilityStateRef = state;
@@ -15292,16 +15293,18 @@ function computeVisibility(state) {
 
       if (!fogEnabled) {
         visible.add(keyXY(wx, wy));
-        if (canTrackDiscovery || shouldPrimeSeenForRender) {
+        if (shouldTrackRevealForRender || shouldPrimeSeenForRender) {
           const seenKey = keyXYZ(wx, wy, player.z);
-          if (!seen.has(seenKey) && canTrackDiscovery) {
-            newlySeenTiles += 1;
+          const hadSeen = seen.has(seenKey);
+          if (!hadSeen) {
             const { cx, cy } = splitWorldToChunk(wx, wy);
             const chunkKey = keyZCXCY(player.z, cx, cy);
-            if (!state.exploredChunks.has(chunkKey)) {
+            const hadChunk = state.exploredChunks.has(chunkKey);
+            if (!hadChunk) {
               state.exploredChunks.add(chunkKey);
-              newlySeenChunks += 1;
+              if (canTrackDiscovery) newlySeenChunks += 1;
             }
+            if (canTrackDiscovery) newlySeenTiles += 1;
           }
           seen.add(seenKey);
         }
@@ -15310,16 +15313,18 @@ function computeVisibility(state) {
 
       if (hasLineOfSight(world, player.z, player.x, player.y, wx, wy)) {
         visible.add(keyXY(wx, wy));
-        if (canTrackDiscovery || shouldPrimeSeenForRender) {
+        if (shouldTrackRevealForRender || shouldPrimeSeenForRender) {
           const seenKey = keyXYZ(wx, wy, player.z);
-          if (!seen.has(seenKey) && canTrackDiscovery) {
-            newlySeenTiles += 1;
+          const hadSeen = seen.has(seenKey);
+          if (!hadSeen) {
             const { cx, cy } = splitWorldToChunk(wx, wy);
             const chunkKey = keyZCXCY(player.z, cx, cy);
-            if (!state.exploredChunks.has(chunkKey)) {
+            const hadChunk = state.exploredChunks.has(chunkKey);
+            if (!hadChunk) {
               state.exploredChunks.add(chunkKey);
-              newlySeenChunks += 1;
+              if (canTrackDiscovery) newlySeenChunks += 1;
             }
+            if (canTrackDiscovery) newlySeenTiles += 1;
           }
           seen.add(seenKey);
         }
@@ -25914,10 +25919,18 @@ function cloneAuthoritativeHotEntity(entity = null) {
   return null;
 }
 
-function captureAuthoritativeHotEntities(state, z = 0) {
+function authoritativeHotDeltaRadiusTiles() {
+  return Math.max(viewRadiusX, viewRadiusY) + CHUNK + 8;
+}
+
+function captureAuthoritativeHotEntities(state, z = 0, centerX = 0, centerY = 0, radiusTiles = authoritativeHotDeltaRadiusTiles()) {
   const out = new Map();
+  const radius = Math.max(1, Math.floor(Number(radiusTiles ?? authoritativeHotDeltaRadiusTiles()) || authoritativeHotDeltaRadiusTiles()));
   for (const entity of state?.entities?.values?.() ?? []) {
     if (!entity || Math.floor(Number(entity.z ?? 0)) !== z) continue;
+    const ex = Math.floor(Number(entity.x ?? 0));
+    const ey = Math.floor(Number(entity.y ?? 0));
+    if (Math.abs(ex - centerX) > radius || Math.abs(ey - centerY) > radius) continue;
     const cloned = cloneAuthoritativeHotEntity(entity);
     if (!cloned?.id) continue;
     const sig = JSON.stringify(cloned);
@@ -25926,11 +25939,18 @@ function captureAuthoritativeHotEntities(state, z = 0) {
   return out;
 }
 
-function captureAuthoritativeHotTileOverrides(state, z = 0) {
+function captureAuthoritativeHotTileOverrides(state, z = 0, centerX = 0, centerY = 0, radiusTiles = authoritativeHotDeltaRadiusTiles()) {
   const out = new Map();
+  const radius = Math.max(1, Math.floor(Number(radiusTiles ?? authoritativeHotDeltaRadiusTiles()) || authoritativeHotDeltaRadiusTiles()));
   for (const [key, value] of state?.world?.tileOverrides?.entries?.() ?? []) {
     const rawKey = String(key ?? "");
     if (!rawKey.startsWith(`${z}|`)) continue;
+    const parts = rawKey.split("|");
+    if (parts.length !== 4) continue;
+    const x = Math.floor(Number(parts[1] ?? NaN));
+    const y = Math.floor(Number(parts[2] ?? NaN));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (Math.abs(x - centerX) > radius || Math.abs(y - centerY) > radius) continue;
     out.set(rawKey, String(value ?? ""));
   }
   return out;
@@ -25939,11 +25959,17 @@ function captureAuthoritativeHotTileOverrides(state, z = 0) {
 function captureAuthoritativeHotBaseline(state) {
   if (!state?.player || !state?.world) return null;
   const z = Math.floor(Number(state.player.z ?? 0));
+  const centerX = Math.floor(Number(state.player.x ?? 0));
+  const centerY = Math.floor(Number(state.player.y ?? 0));
+  const radiusTiles = authoritativeHotDeltaRadiusTiles();
   return {
     depth: z,
     turn: Math.max(0, Math.floor(Number(state.turn ?? 0))),
-    entities: captureAuthoritativeHotEntities(state, z),
-    tiles: captureAuthoritativeHotTileOverrides(state, z),
+    centerX,
+    centerY,
+    radiusTiles,
+    entities: captureAuthoritativeHotEntities(state, z, centerX, centerY, radiusTiles),
+    tiles: captureAuthoritativeHotTileOverrides(state, z, centerX, centerY, radiusTiles),
   };
 }
 
@@ -25951,8 +25977,14 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
   if (!before || !state?.player || !state?.world) return null;
   const depth = Math.floor(Number(state.player.z ?? 0));
   if (depth !== Math.floor(Number(before.depth ?? depth))) return null;
-  const afterEntities = captureAuthoritativeHotEntities(state, depth);
-  const afterTiles = captureAuthoritativeHotTileOverrides(state, depth);
+  const centerX = Math.floor(Number(state.player.x ?? before.centerX ?? 0));
+  const centerY = Math.floor(Number(state.player.y ?? before.centerY ?? 0));
+  const radiusTiles = Math.max(
+    Math.floor(Number(before.radiusTiles ?? authoritativeHotDeltaRadiusTiles()) || authoritativeHotDeltaRadiusTiles()),
+    authoritativeHotDeltaRadiusTiles()
+  );
+  const afterEntities = captureAuthoritativeHotEntities(state, depth, centerX, centerY, radiusTiles);
+  const afterTiles = captureAuthoritativeHotTileOverrides(state, depth, centerX, centerY, radiusTiles);
 
   const entitiesUpsert = [];
   const entitiesRemove = [];
@@ -26006,7 +26038,7 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
     tileUpsert,
     tileRemove,
     events: Array.isArray(state.log) ? state.log.slice(Math.max(0, Math.floor(logStart ?? 0))) : [],
-    logTail: Array.isArray(state.log) ? state.log.slice(-110) : [],
+    logTail: Array.isArray(state.log) ? state.log.slice(-40) : [],
     hudTargets: normalizeCombatHudTargets(combat?.hudTargets ?? {}),
   };
 }
