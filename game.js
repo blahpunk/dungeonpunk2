@@ -3,7 +3,7 @@ import {
   LOCAL_SLOT_MAX,
   createLocalSlotStore,
 } from "./client/save/saveManager.js?v=20260315a";
-import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260320e";
+import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260321e";
 import {
   abilityCommand,
   attackCommand,
@@ -21,7 +21,7 @@ import {
   useItemCommand,
   useShrineCommand,
   waitCommand,
-} from "./client/input/authoritativeCommands.js?v=20260318c";
+} from "./client/input/authoritativeCommands.js?v=20260321d";
 import {
   drawCellHighlight,
   drawFootShadow,
@@ -287,7 +287,8 @@ const BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE = resolveBrowserLiveTickCombatReques
 function resolveLiveTickCombatRequestMode() {
   const runtimeValue = parseLiveTickCombatFlagValue(globalThis.__DUNGEONPUNK_LIVE_TICK_COMBAT__);
   if (runtimeValue !== null) return runtimeValue;
-  return BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE;
+  if (BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE !== null) return BROWSER_LIVE_TICK_COMBAT_REQUEST_MODE;
+  return FEATURE_FLAGS.liveTickCombat === true;
 }
 
 function liveTickCombatRequestedByClient() {
@@ -11732,11 +11733,15 @@ async function startCharacterFlow() {
       } else {
         setCharacterOverlayStatus("Select or create a character to continue.", true);
       }
-    } catch {
+    } catch (err) {
       characterUi.mode = "create";
       characterUi.selectionPurpose = "load_run";
       requiresCharacterCreation = true;
-      setCharacterOverlayStatus("Could not load your character slots. Create a new one to continue.", true);
+      const msg = String(err?.message ?? "").trim();
+      setCharacterOverlayStatus(
+        msg ? `Could not load your characters: ${msg}` : "Could not load your character slots. Create a new one to continue.",
+        true
+      );
       resetCharacterCreationDraft(null, { step: "welcome" });
     } finally {
       characterUi.loading = false;
@@ -21373,6 +21378,12 @@ function draw(state) {
   };
   const canSimulateLocally = canMutateGameplayStateLocally();
   if (canSimulateLocally) {
+    if (!isAuthoritativeSessionActive() && liveTickCombatEnabled(state)) {
+      advanceLiveSimulationToWallClock(state, {
+        nowMs,
+        maxTicks: Math.max(1, LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS),
+      });
+    }
     touchCharacterProgress(state);
     updateAreaRespawnSystem(state, nowMs);
     applyOutOfCombatRegen(state, nowMs);
@@ -22066,6 +22077,57 @@ function takeTurn(state, didSpendTurn) {
   void flushAnalyticsIfNeeded(state, actionKind);
 }
 
+function runLocalLiveTickCommand(state, command = null, options = null) {
+  if (!state || typeof state !== "object") return false;
+  if (isAuthoritativeSessionActive()) return false;
+  if (!liveTickCombatEnabled(state)) return false;
+  const result = executeLiveTickCommandOnState(state, command, {
+    nowMs: Date.now(),
+    maxCatchupTicks: LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS,
+    ...(options && typeof options === "object" ? options : {}),
+  });
+  if (!result || typeof result !== "object") return false;
+  renderInventory(state);
+  renderEquipment(state);
+  renderEffects(state);
+  renderLog(state);
+  updateContextActionButton(state);
+  updateDeathOverlay(state);
+  markSaveDirty(state, `live-${String(command?.type ?? "command").trim().toLowerCase() || "command"}`);
+  return result.ok === true;
+}
+
+function buildLocalLiveTickContextCommand(state, action = null) {
+  const current = (action && typeof action === "object") ? action : null;
+  const type = String(current?.type ?? "").trim().toLowerCase();
+  if (!type) return null;
+  if (type === "attack") {
+    return {
+      type: "ATTACK",
+      monsterId: String(current?.targetMonsterId ?? "").trim(),
+    };
+  }
+  if (type === "pickup") return { type: "PICKUP" };
+  if (type === "open-door") return { type: "OPEN_DOOR" };
+  if (type === "close-door") return { type: "CLOSE_DOOR" };
+  if (type === "disarm-trap") return { type: "DISARM_TRAP" };
+  if (type === "shrine") return { type: "USE_SHRINE" };
+  if (type === "stairs-down") return { type: "USE_STAIRS", dir: "down" };
+  if (type === "stairs-up") return { type: "USE_STAIRS", dir: "up" };
+  return null;
+}
+
+function buildLocalLiveTickAbilityCommand(state, action = null) {
+  const current = (action && typeof action === "object") ? action : null;
+  const ability = playerActiveAbility(state);
+  if (!ability) return null;
+  return {
+    type: "ACTIVATE_ABILITY",
+    abilityId: ability.id,
+    monsterId: String(current?.targetMonsterId ?? "").trim(),
+  };
+}
+
 // ---------- Input ----------
 function isTextEntryElement(el) {
   if (!(el instanceof Element)) return false;
@@ -22357,39 +22419,96 @@ function onKey(state, e) {
     if (isAuthoritativeSessionActive() && isAuthoritativeMovementStreamAvailable()) {
       if (e.repeat) return;
       setAuthoritativeMovementIntent(movementInput.source, movementInput.dx, movementInput.dy);
+    } else if (liveTickCombatEnabled(state)) {
+      if (e.repeat) return;
+      const dir = deltaToCardinalDir(movementInput.dx, movementInput.dy);
+      if (dir) {
+        runLocalLiveTickCommand(state, { type: "MOVE", dir });
+      }
+      return;
     }
     takeTurn(state, playerMoveOrAttack(state, movementInput.dx, movementInput.dy, {
       movementSource: movementInput.source,
       inputAt: Date.now(),
     }));
   }
-  else if (k === "." || k === " " || k === "spacebar") { e.preventDefault(); takeTurn(state, waitTurn(state)); }
+  else if (k === "." || k === " " || k === "spacebar") {
+    e.preventDefault();
+    if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) {
+      runLocalLiveTickCommand(state, { type: "WAIT" });
+    } else {
+      takeTurn(state, waitTurn(state));
+    }
+  }
   else if (k === "q") {
     e.preventDefault();
     const action = activeAbilityAction(state);
-    if (action && !action.disabled) takeTurn(state, action.run());
+    if (action && !action.disabled) {
+      if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) {
+        const command = buildLocalLiveTickAbilityCommand(state, action);
+        if (command) runLocalLiveTickCommand(state, command);
+      } else {
+        takeTurn(state, action.run());
+      }
+    }
   }
-  else if (k === "g") { e.preventDefault(); takeTurn(state, pickup(state)); }
+  else if (k === "g") {
+    e.preventDefault();
+    if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) runLocalLiveTickCommand(state, { type: "PICKUP" });
+    else takeTurn(state, pickup(state));
+  }
   else if (k === "c") { e.preventDefault(); {
       // Try to close an open adjacent door; if none, try to open a closed adjacent door.
-      const closed = tryCloseAdjacentDoor(state);
-      if (closed) takeTurn(state, true);
-      else takeTurn(state, tryOpenAdjacentDoor(state));
+      if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) {
+        const closed = buildLocalLiveTickContextCommand(state, { type: "close-door" });
+        if (closed && runLocalLiveTickCommand(state, closed)) return;
+        runLocalLiveTickCommand(state, { type: "OPEN_DOOR" });
+      } else {
+        const closed = tryCloseAdjacentDoor(state);
+        if (closed) takeTurn(state, true);
+        else takeTurn(state, tryOpenAdjacentDoor(state));
+      }
     }
   }
 
   // E is now contextual: stairs (up/down) OR shop/shrine interaction
-  else if (k === "e") { e.preventDefault(); takeTurn(state, interactContext(state)); }
+  else if (k === "e") {
+    e.preventDefault();
+    if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) {
+      const action = resolveContextAction(state);
+      const command = buildLocalLiveTickContextCommand(state, action);
+      if (command) runLocalLiveTickCommand(state, command);
+      else takeTurn(state, interactContext(state));
+    } else {
+      takeTurn(state, interactContext(state));
+    }
+  }
   else if (k === "enter") {
     e.preventDefault();
     const action = resolveContextAction(state);
-    if (action) takeTurn(state, action.run());
+    if (action) {
+      if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) {
+        const command = buildLocalLiveTickContextCommand(state, action);
+        if (command) runLocalLiveTickCommand(state, command);
+        else takeTurn(state, action.run());
+      } else {
+        takeTurn(state, action.run());
+      }
+    }
   }
 
   else if (k === "i") { e.preventDefault(); renderInventory(state); }
   else if (k === "m") { e.preventDefault(); minimapEnabled = !minimapEnabled; markSaveDirty(state, "toggle-minimap"); }
-  else if (e.key === ">") { e.preventDefault(); takeTurn(state, tryUseStairs(state, "down")); }
-  else if (e.key === "<") { e.preventDefault(); takeTurn(state, tryUseStairs(state, "up")); }
+  else if (e.key === ">") {
+    e.preventDefault();
+    if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) runLocalLiveTickCommand(state, { type: "USE_STAIRS", dir: "down" });
+    else takeTurn(state, tryUseStairs(state, "down"));
+  }
+  else if (e.key === "<") {
+    e.preventDefault();
+    if (liveTickCombatEnabled(state) && !isAuthoritativeSessionActive()) runLocalLiveTickCommand(state, { type: "USE_STAIRS", dir: "up" });
+    else takeTurn(state, tryUseStairs(state, "up"));
+  }
   else if (k === "f") {
     if (!canUseAdminControls()) return;
     e.preventDefault();
@@ -22934,6 +23053,18 @@ function syncLegacyTurnStateIntoLiveTickState(state, options = null) {
 function liveTickCombatEnabled(state = null) {
   if (state?.live?.enabled === true) return true;
   return resolveLiveTickCombatRequestMode() === true || FEATURE_FLAGS.liveTickCombat === true;
+}
+
+function normalizeLoadedLiveTickState(state) {
+  if (!state || typeof state !== "object") return state;
+  if (!liveTickCombatEnabled(state)) return state;
+  const live = ensureLiveSimulationState(state);
+  live.enabled = true;
+  live.mode = "live_tick";
+  if (!Number.isFinite(Number(live.lastStepAtMs ?? 0)) || Number(live.lastStepAtMs ?? 0) <= 0) {
+    live.lastStepAtMs = Date.now();
+  }
+  return state;
 }
 
 function normalizeCardinalDirection(value = "") {
@@ -25730,6 +25861,13 @@ function saveResumeSnapshot(state) {
 function loadSaveOrNew() {
   bootLoadedFromLocalSave = false;
   const authState = isAuthenticatedUser ? "auth" : "guest";
+  if (isAuthoritativeModeEnabled()) {
+    try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const g = makeNewGame();
+    enforceAdminControlPolicy(g);
+    return g;
+  }
   try {
     const prevAuthState = String(localStorage.getItem(SAVE_AUTH_STATE_KEY) ?? "");
     if (authState === "guest" && prevAuthState !== "guest") {
@@ -25742,6 +25880,7 @@ function loadSaveOrNew() {
     if (s) {
       const loaded = importSave(s);
       if (loaded) {
+        normalizeLoadedLiveTickState(loaded);
         bootLoadedFromLocalSave = true;
         const changed = enforceAdminControlPolicy(loaded);
         if (changed) saveNow(loaded);
@@ -25753,6 +25892,7 @@ function loadSaveOrNew() {
   // Avoid leaking transformed state to any future direct canvas operations.
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   const g = makeNewGame();
+  normalizeLoadedLiveTickState(g);
   enforceAdminControlPolicy(g);
   return g;
 }
@@ -25920,7 +26060,7 @@ function cloneAuthoritativeHotEntity(entity = null) {
 }
 
 function authoritativeHotDeltaRadiusTiles() {
-  return Math.max(viewRadiusX, viewRadiusY) + CHUNK + 8;
+  return Math.max(viewRadiusX, viewRadiusY) + 6;
 }
 
 function captureAuthoritativeHotEntities(state, z = 0, centerX = 0, centerY = 0, radiusTiles = authoritativeHotDeltaRadiusTiles()) {
@@ -26038,7 +26178,7 @@ function buildAuthoritativeHotDelta(before, state, commandType = "", logStart = 
     tileUpsert,
     tileRemove,
     events: Array.isArray(state.log) ? state.log.slice(Math.max(0, Math.floor(logStart ?? 0))) : [],
-    logTail: Array.isArray(state.log) ? state.log.slice(-40) : [],
+    logTail: Array.isArray(state.log) ? state.log.slice(-16) : [],
     hudTargets: normalizeCombatHudTargets(combat?.hudTargets ?? {}),
   };
 }
@@ -27003,12 +27143,26 @@ contextActionBtn?.addEventListener("click", () => {
   if (!game) return;
   const action = currentContextAction ?? resolveContextAction(game);
   if (!action) return;
+  if (liveTickCombatEnabled(game) && !isAuthoritativeSessionActive()) {
+    const command = buildLocalLiveTickContextCommand(game, action);
+    if (command) {
+      runLocalLiveTickCommand(game, command);
+      return;
+    }
+  }
   takeTurn(game, action.run());
 });
 contextAbilityBtn?.addEventListener("click", () => {
   if (!game) return;
   const action = currentAbilityContextAction ?? activeAbilityAction(game);
   if (!action || action.disabled) return;
+  if (liveTickCombatEnabled(game) && !isAuthoritativeSessionActive()) {
+    const command = buildLocalLiveTickAbilityCommand(game, action);
+    if (command) {
+      runLocalLiveTickCommand(game, command);
+      return;
+    }
+  }
   takeTurn(game, action.run());
 });
 contextPotionBtn?.addEventListener("click", () => {
@@ -27151,12 +27305,12 @@ if (!HEADLESS_RUNTIME) {
       }
       void autosaveIfDirty("lifecycle");
     };
-    window.addEventListener("pagehide", () => flushAutosaveLifecycle({ closeRun: false }));
+    window.addEventListener("pagehide", () => flushAutosaveLifecycle({ closeRun: true }));
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "hidden") return;
       flushAutosaveLifecycle({ closeRun: false });
     });
-    window.addEventListener("beforeunload", () => flushAutosaveLifecycle({ closeRun: false }));
+    window.addEventListener("beforeunload", () => flushAutosaveLifecycle({ closeRun: true }));
     document.addEventListener("keydown", (e) => onKey(game, e));
     document.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", () => clearHeldKeyboardMovement());

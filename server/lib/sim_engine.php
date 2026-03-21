@@ -4,7 +4,19 @@ declare(strict_types=1);
 function authoritative_worker_node_binary(): string
 {
   $env = trim((string) getenv('NODE_BINARY'));
-  return $env !== '' ? $env : 'node';
+  if ($env !== '') {
+    return $env;
+  }
+  if (function_exists('shell_exec')) {
+    $resolved = trim((string) @shell_exec('command -v node 2>/dev/null'));
+    if ($resolved !== '') {
+      return $resolved;
+    }
+  }
+  if (is_file('/usr/bin/node')) {
+    return '/usr/bin/node';
+  }
+  return 'node';
 }
 
 function authoritative_worker_script_path(): string
@@ -109,7 +121,7 @@ function authoritative_worker_direct_command(): array
 function authoritative_worker_daemon_command(): string
 {
   return
-    'setsid ' .
+    'nohup ' .
     escapeshellarg(authoritative_worker_node_binary()) .
     ' --experimental-default-type=module ' .
     escapeshellarg(authoritative_worker_daemon_script_path()) .
@@ -366,10 +378,6 @@ function authoritative_worker_call_direct(array $input): array
  */
 function authoritative_worker_call(array $input): array
 {
-  $daemon = authoritative_worker_call_via_daemon($input);
-  if (is_array($daemon)) {
-    return $daemon;
-  }
   return authoritative_worker_call_direct($input);
 }
 

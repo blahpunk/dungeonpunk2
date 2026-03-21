@@ -2913,7 +2913,7 @@ if ($apiMode === 'authoritative') {
   $action = strtolower(trim((string) ($body['action'] ?? '')));
   $liveTickCombat = array_key_exists('live_tick_combat', $body)
     ? filter_var($body['live_tick_combat'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)
-    : null;
+    : true;
   try {
     if ($action === 'open_session') {
       $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
@@ -3071,12 +3071,13 @@ if ($apiMode === 'authoritative') {
       if ($sessionId === '') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
       }
-      $closed = authoritative_close_session($sessionId, $userEmail);
+      $reason = trim((string) ($body['reason'] ?? ''));
+      $closed = authoritative_close_session($sessionId, $userEmail, false, $reason);
       json_response([
         'ok' => true,
         'closed' => $closed,
         'sessionId' => $sessionId,
-        'message' => $closed ? 'Authoritative session closed.' : 'Session already closed.',
+        'message' => $closed ? 'Authoritative session closing.' : 'Session already closed.',
       ]);
     }
     json_response(['ok' => false, 'error' => 'Unsupported authoritative action.'], 400);

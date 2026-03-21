@@ -99,6 +99,52 @@ function authoritative_should_persist_character_snapshot_checkpoint(array $sessi
  * @param array<string, mixed> $session
  * @param array<string, mixed> $snapshot
  */
+function authoritative_should_persist_canonical_snapshot_checkpoint(array $session, array $snapshot): bool
+{
+  $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
+  $x = array_key_exists('x', $summary) ? (int) $summary['x'] : null;
+  $y = array_key_exists('y', $summary) ? (int) $summary['y'] : null;
+  $z = array_key_exists('depth', $summary) ? (int) $summary['depth'] : null;
+  if (!is_int($x) || !is_int($y) || !is_int($z)) {
+    return true;
+  }
+
+  $lastX = array_key_exists('last_canonical_checkpoint_x', $session) ? (int) $session['last_canonical_checkpoint_x'] : null;
+  $lastY = array_key_exists('last_canonical_checkpoint_y', $session) ? (int) $session['last_canonical_checkpoint_y'] : null;
+  $lastZ = array_key_exists('last_canonical_checkpoint_z', $session) ? (int) $session['last_canonical_checkpoint_z'] : null;
+  $lastAtMs = max(0, (int) ($session['last_canonical_checkpoint_at_ms'] ?? 0));
+  $nowMs = (int) floor(microtime(true) * 1000);
+
+  if (!is_int($lastX) || !is_int($lastY) || !is_int($lastZ) || $lastAtMs <= 0) {
+    return true;
+  }
+  if ($lastZ !== $z) {
+    return true;
+  }
+  $dist = abs($x - $lastX) + abs($y - $lastY);
+  if ($dist >= 4) {
+    return true;
+  }
+  return ($nowMs - $lastAtMs) >= 900;
+}
+
+/**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $snapshot
+ */
+function authoritative_update_canonical_snapshot_checkpoint(array &$session, array $snapshot): void
+{
+  $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
+  $session['last_canonical_checkpoint_x'] = (int) ($summary['x'] ?? 0);
+  $session['last_canonical_checkpoint_y'] = (int) ($summary['y'] ?? 0);
+  $session['last_canonical_checkpoint_z'] = (int) ($summary['depth'] ?? 0);
+  $session['last_canonical_checkpoint_at_ms'] = (int) floor(microtime(true) * 1000);
+}
+
+/**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $snapshot
+ */
 function authoritative_update_character_snapshot_checkpoint(array &$session, array $snapshot): void
 {
   $summary = is_array($snapshot['summary'] ?? null) ? $snapshot['summary'] : [];
@@ -129,6 +175,7 @@ function authoritative_open_session_for_character(
         $loaded = authoritative_load_session_snapshot($userEmail, $existingSessionId);
         $session = $loaded['session'];
         $snapshot = $loaded['snapshot'];
+        authoritative_clear_pending_close($session);
         if (!authoritative_persist_session($session)) {
           throw new RuntimeException('Could not refresh authoritative session.');
         }
@@ -620,11 +667,21 @@ function authoritative_poll_movement(
   if ($moved) {
     $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
     $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
+    $persistCanonicalState = authoritative_should_persist_canonical_snapshot_checkpoint($session, $snapshot);
     $persistCharacterState = authoritative_should_persist_character_snapshot_checkpoint($session, $snapshot);
-    authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
-      'persist_character_state' => $persistCharacterState,
-    ]);
+    if ($persistCanonicalState) {
+      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
+        'persist_character_state' => $persistCharacterState,
+      ]);
+      authoritative_update_canonical_snapshot_checkpoint($session, $snapshot);
+    }
     if ($persistCharacterState) {
+      if (!$persistCanonicalState) {
+        authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
+          'persist_character_state' => true,
+        ]);
+        authoritative_update_canonical_snapshot_checkpoint($session, $snapshot);
+      }
       authoritative_update_character_snapshot_checkpoint($session, $snapshot);
     }
     if (!authoritative_persist_session($session)) {
@@ -755,7 +812,7 @@ function authoritative_save_and_exit(
 ): array {
   authoritative_release_php_session_lock();
   $response = authoritative_manual_save_current_run($userEmail, $saveSecret, $sessionId, '', '', true);
-  authoritative_close_session($sessionId, $userEmail);
+  authoritative_close_session($sessionId, $userEmail, true, 'save-and-exit');
   $response['message'] = 'Character progress saved and session closed.';
   return $response;
 }

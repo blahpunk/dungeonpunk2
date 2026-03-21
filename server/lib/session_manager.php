@@ -90,6 +90,55 @@ function authoritative_character_lock_ttl_seconds(): int
   return max(30, min(900, $seconds));
 }
 
+function authoritative_close_grace_seconds(): int
+{
+  $raw = getenv('DUNGEON25_AUTH_CLOSE_GRACE');
+  $seconds = is_string($raw) ? (int) floor((float) $raw) : 0;
+  if ($seconds <= 0) {
+    $seconds = 8;
+  }
+  return max(2, min(60, $seconds));
+}
+
+/**
+ * @param array<string, mixed> $session
+ */
+function authoritative_session_pending_close_timestamp(array $session): int
+{
+  $closeRequestedAt = trim((string) ($session['close_requested_at'] ?? ''));
+  $closeRequestedTs = $closeRequestedAt !== '' ? strtotime($closeRequestedAt) : false;
+  return (is_int($closeRequestedTs) && $closeRequestedTs > 0) ? $closeRequestedTs : 0;
+}
+
+/**
+ * @param array<string, mixed> $session
+ */
+function authoritative_session_is_pending_close(array $session): bool
+{
+  return authoritative_session_pending_close_timestamp($session) > 0;
+}
+
+/**
+ * @param array<string, mixed> $session
+ */
+function authoritative_session_pending_close_expired(array $session, ?int $nowTs = null): bool
+{
+  $closeRequestedTs = authoritative_session_pending_close_timestamp($session);
+  if ($closeRequestedTs <= 0) {
+    return false;
+  }
+  $now = $nowTs ?? time();
+  return ($now - $closeRequestedTs) >= authoritative_close_grace_seconds();
+}
+
+/**
+ * @param array<string, mixed> $session
+ */
+function authoritative_clear_pending_close(array &$session): void
+{
+  unset($session['close_requested_at'], $session['close_reason']);
+}
+
 /**
  * @param array<string, mixed> $session
  */
@@ -163,6 +212,12 @@ function authoritative_persist_session(array $session): bool
   $next['session_id'] = $sessionId;
   $next['character_id'] = trim((string) ($session['character_id'] ?? ''));
   $next['browser_instance_id'] = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
+  if (!empty($session['close_requested_at'])) {
+    $next['close_requested_at'] = trim((string) $session['close_requested_at']);
+    $next['close_reason'] = trim((string) ($session['close_reason'] ?? ''));
+  } else {
+    unset($next['close_requested_at'], $next['close_reason']);
+  }
   $next['updated_at'] = date('c');
   return authoritative_json_write_file(authoritative_session_file_path($sessionId), $next);
 }
@@ -187,6 +242,10 @@ function authoritative_load_session(string $sessionId, string $userEmail): ?arra
   $session['character_id'] = trim((string) ($session['character_id'] ?? ''));
   $session['browser_instance_id'] = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
   if (!authoritative_session_is_fresh($session, time())) {
+    @unlink(authoritative_session_file_path($id));
+    return null;
+  }
+  if (authoritative_session_pending_close_expired($session, time())) {
     @unlink(authoritative_session_file_path($id));
     return null;
   }
@@ -233,6 +292,12 @@ function authoritative_list_user_sessions(string $userEmail, bool $pruneStale = 
     $session['character_id'] = trim((string) ($session['character_id'] ?? ''));
     $session['browser_instance_id'] = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
     if (!authoritative_session_is_fresh($session, $now)) {
+      if ($pruneStale) {
+        @unlink($path);
+      }
+      continue;
+    }
+    if (authoritative_session_pending_close_expired($session, $now)) {
       if ($pruneStale) {
         @unlink($path);
       }
@@ -361,6 +426,7 @@ function authoritative_touch_session(
   if ($sessionBrowserId === '' && $incomingBrowserId !== '') {
     $session['browser_instance_id'] = $incomingBrowserId;
   }
+  authoritative_clear_pending_close($session);
   if (!authoritative_persist_session($session)) {
     throw new RuntimeException('Could not refresh authoritative session.');
   }
@@ -371,11 +437,16 @@ function authoritative_touch_session(
   ];
 }
 
-function authoritative_close_session(string $sessionId, string $userEmail): bool
+function authoritative_close_session(string $sessionId, string $userEmail, bool $immediate = false, string $reason = ''): bool
 {
   $session = authoritative_load_session($sessionId, $userEmail);
   if ($session === null) {
     return false;
+  }
+  if (!$immediate) {
+    $session['close_requested_at'] = date('c');
+    $session['close_reason'] = trim($reason);
+    return authoritative_persist_session($session);
   }
   return @unlink(authoritative_session_file_path($sessionId));
 }
