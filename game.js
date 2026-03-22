@@ -10946,7 +10946,13 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
         snapshot = await resolveLoadableCharacterSnapshot(currentCharacterId);
       }
       const sharedStatePreview = importSave(sharedPayload);
-      const sharedDungeonChanged = sharedDungeonInstanceIdForState(game) !== sharedDungeonInstanceIdForState(sharedStatePreview);
+      const currentDungeonId = sharedDungeonInstanceIdForState(game);
+      const previewDungeonId = sharedDungeonInstanceIdForState(sharedStatePreview);
+      const sharedDungeonChanged = !!(
+        currentDungeonId
+        && previewDungeonId
+        && currentDungeonId !== previewDungeonId
+      );
       const nextState = buildRunForCharacterSnapshot(snapshot, {
         basePayload: sharedPayload,
         forceEntrance: sharedDungeonChanged,
