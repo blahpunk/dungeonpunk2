@@ -173,6 +173,7 @@ const LOCAL_CHARACTER_STATE_PREFIX = "infinite_dungeon_character_state_v1:";
 const CHARACTER_SYNC_DEBOUNCE_MS = 300;
 const SHARED_DUNGEON_SYNC_INTERVAL_MS = 1000;
 const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 220;
+const REMOTE_CHARACTER_STALE_GRACE_MS = 5000;
 const XP_SCALE = 100;
 const COMBAT_SCALE = 100;
 const POTION_HEAL_PCT = 0.35;
@@ -4452,6 +4453,9 @@ const sharedDungeonRuntime = {
   lastAppliedCharacterId: "",
   lastError: "",
 };
+const remoteCharacterVisibilityRuntime = {
+  lastSeenAtByCharacterId: new Map(),
+};
 const itemAuthorityRuntime = {
   ready: false,
   loading: false,
@@ -4567,6 +4571,10 @@ function stateDebug(state) {
   state.debug = normalizeDebugFlags(state?.debug);
   return state.debug;
 }
+function playerHasGodmode(state, player = null) {
+  const actor = (player && typeof player === "object") ? player : (state?.player ?? null);
+  return !!(stateDebug(state).godmode || actor?.godmode === true);
+}
 function canUseAdminControls() {
   return !!canAdminControls;
 }
@@ -4665,6 +4673,10 @@ function enforceAdminControlPolicy(state) {
   let changed = false;
   if (d.godmode) {
     d.godmode = false;
+    changed = true;
+  }
+  if (state?.player?.godmode) {
+    state.player.godmode = false;
     changed = true;
   }
   if (d.freeShopping) {
@@ -4992,6 +5004,9 @@ function setDebugFlag(state, key, enabled) {
   const next = !!enabled;
   if (d[key] === next) return;
   d[key] = next;
+  if (key === "godmode" && state?.player) {
+    state.player.godmode = next;
+  }
   if (key === "godmode") pushLog(state, `Godmode ${next ? "enabled" : "disabled"}.`);
   if (key === "freeShopping") pushLog(state, `Free shopping ${next ? "enabled" : "disabled"}.`);
   if (key === "ghost") pushLog(state, `Ghost ${next ? "enabled" : "disabled"}.`);
@@ -9958,6 +9973,7 @@ function exportCharacterSnapshot(state) {
       hp: Math.max(0, Math.floor(p.hp ?? 0)),
       maxHp: Math.max(1, Math.floor(p.maxHp ?? 1)),
       dead: !!p.dead,
+      godmode: !!p.godmode,
       gold: Math.max(0, Math.floor(p.gold ?? 0)),
       inv: normalizeInventoryEntries(src.inv ?? [], {
         speciesId: profile.speciesId,
@@ -10016,6 +10032,7 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
         hp: Math.max(0, Math.floor(decoded?.player?.hp ?? 0)),
         maxHp: Math.max(1, Math.floor(decoded?.player?.maxHp ?? 1)),
         dead: !!decoded?.player?.dead,
+        godmode: !!decoded?.player?.godmode,
         gold: Math.max(0, Math.floor(decoded?.player?.gold ?? 0)),
         inv: normalizeInventoryEntries(decoded?.player?.inv ?? [], {
           speciesId,
@@ -10091,6 +10108,7 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
       hp: Math.max(0, Math.floor(decoded?.player?.hp ?? 0)),
       maxHp: Math.max(1, Math.floor(decoded?.player?.maxHp ?? 1)),
       dead: !!decoded?.player?.dead,
+      godmode: !!decoded?.player?.godmode,
       gold: Math.max(0, Math.floor(decoded?.player?.gold ?? 0)),
       inv: normalizeInventoryEntries(decoded?.player?.inv ?? [], {
         speciesId,
@@ -10253,6 +10271,7 @@ function applyCharacterSnapshot(state, snapshot) {
   p.attackAfterMove = false;
   p.abilityCd = 0;
   p.dead = !!snapPlayer.dead;
+  p.godmode = !!snapPlayer.godmode;
   p.live = normalizeLiveCombatActorState(null, "player");
   state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
     speciesId: profile.speciesId,
@@ -10725,6 +10744,7 @@ function preserveLocalMonsterState(sourceState, targetState) {
 
 function syncRemoteCharacterActors(state, sharedData = null) {
   if (!state?.entities || !canUseSharedDungeonSync()) return;
+  const nowMs = Date.now();
   const activeLocks = Array.isArray(sharedData?.active_character_locks) ? sharedData.active_character_locks : [];
   const activeStates = Array.isArray(sharedData?.active_character_states) ? sharedData.active_character_states : [];
   const currentCharacterId = activeSharedDungeonCharacterId();
@@ -10736,10 +10756,13 @@ function syncRemoteCharacterActors(state, sharedData = null) {
   for (const [id, ent] of Array.from(state.entities.entries())) {
     if (ent?.kind !== "actor" || !ent?.remoteCharacterId) continue;
     const remoteId = normalizeCharacterProfileId(ent.remoteCharacterId);
-    if (!remoteId || remoteId === currentCharacterId || !activeCharacterIds.has(remoteId)) {
+    const lastSeenAt = Number(remoteCharacterVisibilityRuntime.lastSeenAtByCharacterId.get(remoteId) ?? 0) || 0;
+    const missingTooLong = (nowMs - lastSeenAt) > REMOTE_CHARACTER_STALE_GRACE_MS;
+    if (!remoteId || remoteId === currentCharacterId || (!activeCharacterIds.has(remoteId) && missingTooLong)) {
       state.entities.delete(id);
       if (state.dynamic instanceof Map) state.dynamic.delete(id);
       if (state.entityOverrides instanceof Map) state.entityOverrides.delete(id);
+      remoteCharacterVisibilityRuntime.lastSeenAtByCharacterId.delete(remoteId);
     }
   }
   removeSharedDungeonActorForCharacter(state, currentCharacterId);
@@ -10753,6 +10776,7 @@ function syncRemoteCharacterActors(state, sharedData = null) {
     const y = Math.floor(Number(entry?.y ?? NaN));
     const z = Math.floor(Number(entry?.z ?? NaN));
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    remoteCharacterVisibilityRuntime.lastSeenAtByCharacterId.set(remoteId, nowMs);
     const speciesId = normalizeCharacterSpeciesId(entry?.species_id ?? DEFAULT_CHARACTER_SPECIES_ID);
     const classId = normalizeCharacterClassId(entry?.class_id ?? DEFAULT_CHARACTER_CLASS_ID, speciesId);
     const display = resolveCharacterSpriteDisplay(speciesId, classId);
@@ -10775,6 +10799,7 @@ function syncRemoteCharacterActors(state, sharedData = null) {
     state.entities.set(actorId, actor);
     if (state.dynamic instanceof Map) state.dynamic.set(actorId, actor);
     if (state.entityOverrides instanceof Map) state.entityOverrides.delete(actorId);
+    noteEntityVisualTarget(actorId, x, y, nowMs, currentLocalVisualTickMs(state));
   }
 }
 
@@ -15277,7 +15302,7 @@ function triggerTrapForEntity(state, trap, entity) {
   } else {
     const player = state?.player;
     if (!player || player.dead) return false;
-    if (stateDebug(state).godmode && familyId !== "alarm_trap") {
+    if (playerHasGodmode(state, player) && familyId !== "alarm_trap") {
       pushLog(state, `${label} triggers, but godmode negates it.`);
       triggered = true;
     } else {
@@ -15988,6 +16013,7 @@ function respawnEntitiesForArea(state, areaKey, now = Date.now()) {
   for (const ent of Array.from(state.dynamic.values())) {
     const id = String(ent?.id ?? "");
     if (!(id.startsWith(respawnMonsterPrefix) || id.startsWith(respawnItemPrefix))) continue;
+    noteSharedDynamicEntityRemoved(state, id);
     state.dynamic.delete(id);
     state.entities.delete(id);
   }
@@ -16001,6 +16027,7 @@ function respawnEntitiesForArea(state, areaKey, now = Date.now()) {
       state.removedIds.add(ent.id);
       state.entityOverrides.delete(ent.id);
     } else if (ent.origin === "dynamic") {
+      noteSharedDynamicEntityRemoved(state, ent.id);
       state.dynamic.delete(ent.id);
     }
     state.entities.delete(ent.id);
@@ -16080,6 +16107,23 @@ function respawnEntitiesForArea(state, areaKey, now = Date.now()) {
   return true;
 }
 
+function areaHasAnyCharacterOccupant(state, areaKey = "") {
+  if (!state?.world) return false;
+  const parsed = parseChunkAreaKey(areaKey);
+  if (!parsed) return false;
+  const targetZ = Math.floor(Number(parsed.z ?? 0));
+  const playerKey = String(state.world.areaKeyAt(state.player.x, state.player.y, state.player.z) ?? "");
+  if (targetZ === Math.floor(Number(state.player?.z ?? 0)) && playerKey === areaKey) return true;
+  for (const ent of state.entities?.values?.() ?? []) {
+    if (!ent || ent.kind !== "actor" || !ent.remoteCharacterId) continue;
+    const ez = Math.floor(Number(ent.z ?? NaN));
+    if (!Number.isFinite(ez) || ez !== targetZ) continue;
+    const entAreaKey = String(state.world.areaKeyAt(ent.x, ent.y, ent.z) ?? "");
+    if (entAreaKey === areaKey) return true;
+  }
+  return false;
+}
+
 function updateAreaRespawnTracking(state, now = Date.now()) {
   const areaState = ensureAreaRespawnState(state);
   const currentKey = state.world.areaKeyAt(state.player.x, state.player.y, state.player.z);
@@ -16103,6 +16147,10 @@ function processAreaRespawns(state, now = Date.now()) {
       continue;
     }
     if (areaKey === areaState.currentAreaKey) {
+      areaState.schedules[areaKey] = now + 1000;
+      continue;
+    }
+    if (areaHasAnyCharacterOccupant(state, areaKey)) {
       areaState.schedules[areaKey] = now + 1000;
       continue;
     }
@@ -17266,6 +17314,9 @@ function handleMonsterDefeat(state, monster, options = null) {
   }
 
   state.entities.delete(monster.id);
+  // Critical: persist kills immediately so shared sync cannot re-apply stale
+  // pre-kill snapshots while the player remains stationary.
+  markSaveDirty(state, "monster-defeat");
 }
 
 function playerAttack(state, monster) {
@@ -17398,7 +17449,7 @@ function playerAttack(state, monster) {
   ) {
     const reflectPct = clamp(Number(mSpec?.meleeReflectPct ?? 0.2), 0, 0.8);
     const reflectedRaw = Math.max(1, Math.round(damageApplied * reflectPct));
-    if (stateDebug(state).godmode) {
+    if (playerHasGodmode(state)) {
       pushLog(state, "Reflected impact glances off your godmode.");
     } else {
       const reduced = reduceIncomingDamage(state, reflectedRaw, monster.z ?? p.z);
@@ -18383,7 +18434,7 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
     monster.blinkStrikeBonus = false;
   }
 
-  if (stateDebug(state).godmode) {
+  if (playerHasGodmode(state)) {
     pushLog(state, `The ${nm} ${verb} you, but no damage gets through.`);
     return;
   }
@@ -22563,7 +22614,7 @@ function draw(state) {
         }
         if (ak) {
           const ent = state.entities.get(ak);
-          const visualEntity = (isAuthoritativeSessionActive() && ent?.id)
+          const visualEntity = ((isAuthoritativeSessionActive() || !!ent?.remoteCharacterId) && ent?.id)
             ? resolveEntityVisualPosition(ent.id, ent.x, ent.y, nowMs)
             : { x: ent?.x ?? wx, y: ent?.y ?? wy };
           const actorDrawSx = Number(visualEntity.x ?? wx) - player.x + viewRadiusX;
@@ -25894,6 +25945,7 @@ function normalizeSharedServerCharacterRecord(entry = null, fallbackDungeonId = 
     hp,
     maxHp,
     dead: !!(raw.dead ?? snapPlayer.dead ?? hp <= 0),
+    godmode: !!(normalizedSnapshot?.player?.godmode ?? snapPlayer.godmode ?? false),
     gold: Math.max(0, Math.floor(Number(normalizedSnapshot?.player?.gold ?? snapPlayer.gold ?? 0) || 0)),
     inv: normalizeInventoryEntries(normalizedSnapshot?.player?.inv ?? snapPlayer.inv ?? [], {
       speciesId,
@@ -25965,6 +26017,7 @@ function buildSharedServerCharacterProxy(state, target = null) {
   proxyPlayer.attackAfterMove = false;
   proxyPlayer.abilityCd = Math.max(0, Math.floor(Number(snapPlayer.abilityCd ?? 0) || 0));
   proxyPlayer.dead = !!snapPlayer.dead;
+  proxyPlayer.godmode = !!snapPlayer.godmode;
   proxyPlayer.live = normalizeLiveCombatActorState(snapPlayer.live ?? proxyPlayer.live ?? null, "player");
   const snapMaxHp = Math.max(1, Math.floor(Number(snapPlayer.maxHp ?? proxyPlayer.maxHp ?? 1) || 1));
   const snapHp = Math.max(0, Math.floor(Number(snapPlayer.hp ?? proxyPlayer.hp ?? snapMaxHp) || 0));
