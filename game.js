@@ -10461,8 +10461,30 @@ async function switchCharacter(slotId, options = null) {
 function placePlayerFromCharacterSnapshot(state, snapshot, options = null) {
   if (!state?.player) return false;
   const opts = (options && typeof options === "object") ? options : {};
+  const preserveCurrentOnInvalid = opts.preserveCurrentOnInvalid === true;
+  const prior = {
+    x: Math.floor(Number(state.player.x ?? 0)),
+    y: Math.floor(Number(state.player.y ?? 0)),
+    z: Math.floor(Number(state.player.z ?? 0)),
+  };
   const pos = normalizeCharacterSnapshotPosition(snapshot?.position ?? snapshot?.character?.position ?? null);
   if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.depth)) {
+    if (preserveCurrentOnInvalid && state.world.isPassable(prior.x, prior.y, prior.z)) {
+      state.player.x = prior.x;
+      state.player.y = prior.y;
+      state.player.z = prior.z;
+      setLastLadderLanding(state, state.player);
+      ensureSurfaceLinkTile(state);
+      ensureShopState(state);
+      updateAreaRespawnTracking(state, Date.now());
+      hydrateNearby(state);
+      renderInventory(state);
+      renderEquipment(state);
+      renderEffects(state);
+      updateContextActionButton(state);
+      updateDeathOverlay(state);
+      return true;
+    }
     return placePlayerAtDungeonEntrance(state, {
       message: String(opts.entranceMessage ?? "").trim(),
       resetVision: opts.resetVision === true,
@@ -10473,6 +10495,22 @@ function placePlayerFromCharacterSnapshot(state, snapshot, options = null) {
   p.y = pos.y;
   p.z = pos.depth;
   if (!state.world.isPassable(p.x, p.y, p.z)) {
+    if (preserveCurrentOnInvalid && state.world.isPassable(prior.x, prior.y, prior.z)) {
+      p.x = prior.x;
+      p.y = prior.y;
+      p.z = prior.z;
+      setLastLadderLanding(state, p);
+      ensureSurfaceLinkTile(state);
+      ensureShopState(state);
+      updateAreaRespawnTracking(state, Date.now());
+      hydrateNearby(state);
+      renderInventory(state);
+      renderEquipment(state);
+      renderEffects(state);
+      updateContextActionButton(state);
+      updateDeathOverlay(state);
+      return true;
+    }
     return placePlayerAtDungeonEntrance(state, {
       message: String(opts.entranceMessage ?? "").trim(),
       resetVision: opts.resetVision === true,
@@ -10831,6 +10869,7 @@ function buildRunForCharacterSnapshot(snapshot, options = null) {
     placePlayerFromCharacterSnapshot(nextState, snapshot, {
       entranceMessage: "You enter the dungeon...",
       resetVision: true,
+      preserveCurrentOnInvalid: true,
     });
   }
   normalizeLoadedLiveTickState(nextState);
@@ -11029,11 +11068,24 @@ async function touchCharacterSession(reason = "interval") {
   if (!sessionId || characterSessionRuntime.touchInFlight) return false;
   characterSessionRuntime.touchInFlight = true;
   try {
+    const snapshot = game ? exportCharacterSnapshot(game) : null;
+    const position = (snapshot?.position && typeof snapshot.position === "object") ? snapshot.position : {};
+    const snapPlayer = (snapshot?.player && typeof snapshot.player === "object") ? snapshot.player : {};
+    const snapCharacter = (snapshot?.character && typeof snapshot.character === "object") ? snapshot.character : {};
     await saveApiRequest("POST", {
       action: "character_session_touch",
       session_id: sessionId,
       browser_instance_id: resolveBrowserInstanceId(),
       reason: String(reason ?? "").trim() || "interval",
+      name: String(snapCharacter?.name ?? game?.character?.name ?? "").trim(),
+      species_id: String(snapCharacter?.speciesId ?? snapPlayer?.speciesId ?? game?.player?.speciesId ?? "").trim(),
+      class_id: String(snapCharacter?.classId ?? snapPlayer?.classId ?? game?.player?.classId ?? "").trim(),
+      dungeon_instance_id: String(snapshot?.dungeonInstanceId ?? game?.sharedDungeonId ?? game?.world?.seedStr ?? "").trim(),
+      x: Number.isFinite(Number(position?.x)) ? Math.floor(Number(position.x)) : null,
+      y: Number.isFinite(Number(position?.y)) ? Math.floor(Number(position.y)) : null,
+      z: Number.isFinite(Number(position?.depth ?? position?.z)) ? Math.floor(Number(position?.depth ?? position?.z)) : null,
+      hp: Number.isFinite(Number(snapPlayer?.hp ?? game?.player?.hp)) ? Math.max(0, Math.floor(Number(snapPlayer?.hp ?? game?.player?.hp))) : null,
+      max_hp: Number.isFinite(Number(snapPlayer?.maxHp ?? game?.player?.maxHp)) ? Math.max(1, Math.floor(Number(snapPlayer?.maxHp ?? game?.player?.maxHp))) : null,
     });
     characterSessionRuntime.lastTouchAt = Date.now();
     return true;

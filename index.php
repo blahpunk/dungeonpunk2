@@ -4516,6 +4516,20 @@ if ($apiMode === 'savegames') {
       json_response(['ok' => false, 'error' => 'Missing character session metadata.'], 400);
     }
     $touched = authoritative_touch_session($sessionId, $userEmail, $browserInstanceId);
+    $characterId = normalize_character_profile_id((string) ($touched['characterId'] ?? ''));
+    if ($characterId !== '') {
+      authoritative_update_browser_character_presence($userEmail, $characterId, $browserInstanceId, [
+        'name' => trim_save_name((string) ($body['name'] ?? '')),
+        'species_id' => (string) ($body['species_id'] ?? ''),
+        'class_id' => (string) ($body['class_id'] ?? ''),
+        'dungeon_instance_id' => (string) ($body['dungeon_instance_id'] ?? ''),
+        'x' => (array_key_exists('x', $body) && is_numeric($body['x'])) ? (int) $body['x'] : null,
+        'y' => (array_key_exists('y', $body) && is_numeric($body['y'])) ? (int) $body['y'] : null,
+        'z' => (array_key_exists('z', $body) && is_numeric($body['z'])) ? (int) $body['z'] : null,
+        'hp' => (array_key_exists('hp', $body) && is_numeric($body['hp'])) ? max(0, (int) $body['hp']) : null,
+        'max_hp' => (array_key_exists('max_hp', $body) && is_numeric($body['max_hp'])) ? max(1, (int) $body['max_hp']) : null,
+      ]);
+    }
     json_response([
       'ok' => true,
       'session' => [
