@@ -2058,6 +2058,13 @@ function resolveEntityVisualPosition(entityId = "", fallbackX = 0, fallbackY = 0
   return { x, y };
 }
 
+function currentLocalVisualTickMs(state = null) {
+  if (isAuthoritativeSessionActive()) return authoritativeClientTickMs();
+  const liveTickMs = Number(state?.live?.tickMs ?? currentGlobalDungeonSpeedMs());
+  if (!Number.isFinite(liveTickMs) || liveTickMs <= 0) return currentGlobalDungeonSpeedMs();
+  return Math.max(10, Math.floor(liveTickMs));
+}
+
 function noteEntityVisualTarget(entityId = "", nextX = 0, nextY = 0, nowMs = Date.now(), tickMs = 50) {
   const id = String(entityId ?? "").trim();
   if (!id || !AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) return;
@@ -22072,11 +22079,13 @@ function draw(state) {
   renderAuthoritativeMovementStatusBadge();
   const visualPlayer = isAuthoritativeSessionActive()
     ? resolveAuthoritativeVisualPlayerPosition(state.player.x, state.player.y, nowMs)
-    : { x: Number(state.player.x ?? 0), y: Number(state.player.y ?? 0) };
-  const cameraOffsetXPx = isAuthoritativeSessionActive()
+    : (liveTickCombatEnabled(state)
+      ? resolveEntityVisualPosition("__player__", state.player.x, state.player.y, nowMs)
+      : { x: Number(state.player.x ?? 0), y: Number(state.player.y ?? 0) });
+  const cameraOffsetXPx = (isAuthoritativeSessionActive() || liveTickCombatEnabled(state))
     ? Math.round((Number(state.player.x ?? 0) - Number(visualPlayer.x ?? 0)) * TILE)
     : 0;
-  const cameraOffsetYPx = isAuthoritativeSessionActive()
+  const cameraOffsetYPx = (isAuthoritativeSessionActive() || liveTickCombatEnabled(state))
     ? Math.round((Number(state.player.y ?? 0) - Number(visualPlayer.y ?? 0)) * TILE)
     : 0;
   const applyWorldTransform = () => {
@@ -23850,6 +23859,15 @@ function normalizeLoadedLiveTickState(state) {
   if (!Number.isFinite(Number(live.lastStepAtMs ?? 0)) || Number(live.lastStepAtMs ?? 0) <= 0) {
     live.lastStepAtMs = Date.now();
   }
+  entityVisualMotionRuntimes.set("__player__", {
+    initialized: true,
+    fromX: Number(state.player?.x ?? 0),
+    fromY: Number(state.player?.y ?? 0),
+    toX: Number(state.player?.x ?? 0),
+    toY: Number(state.player?.y ?? 0),
+    startAtMs: Date.now(),
+    durationMs: 1,
+  });
   return state;
 }
 
@@ -25061,9 +25079,7 @@ function tryCommitLiveMonsterMove(state, monster = null, nextPos = null, options
   monster.z = nz;
   if (monster.id) {
     const nowMs = Date.now();
-    const tickMs = (typeof authoritativeClientTickMs === "function")
-      ? authoritativeClientTickMs()
-      : LIVE_SIM_DEFAULT_TICK_MS;
+    const tickMs = currentLocalVisualTickMs(state);
     const existingRuntime = entityVisualMotionRuntimes.get(monster.id);
     if (!existingRuntime || existingRuntime.initialized !== true) {
       entityVisualMotionRuntimes.set(monster.id, {
@@ -25415,11 +25431,30 @@ function tryStepLivePlayerMovement(state, dir = "", options = null) {
   live.stepSeq = actionSeq;
   markDisengageGraceFromStep(state, p.x, p.y, nx, ny, nz);
   if (isOpenDoorTile(tile)) state.visitedDoors?.add(keyXYZ(nx, ny, nz));
+  const prevX = p.x;
+  const prevY = p.y;
   p.x = nx;
   p.y = ny;
   p.attackAfterMove = true;
   state.lastPlayerActionKind = "move";
   recordAnalyticsMovement(ensureAnalyticsState(state), p.z, 1);
+  const playerVisualId = "__player__";
+  const nowMs = Date.now();
+  const tickMs = currentLocalVisualTickMs(state);
+  const existingPlayerVisual = entityVisualMotionRuntimes.get(playerVisualId);
+  if (!existingPlayerVisual || existingPlayerVisual.initialized !== true) {
+    entityVisualMotionRuntimes.set(playerVisualId, {
+      initialized: true,
+      fromX: Number(prevX),
+      fromY: Number(prevY),
+      toX: Number(nx),
+      toY: Number(ny),
+      startAtMs: nowMs,
+      durationMs: Math.max(18, Math.min(96, Math.round(tickMs * 0.82))),
+    });
+  } else {
+    noteEntityVisualTarget(playerVisualId, nx, ny, nowMs, tickMs);
+  }
 
   playerLive.action.currentActionType = "MOVE";
   playerLive.action.currentActionId = `move_${actionSeq}`;

@@ -2432,6 +2432,122 @@ function merge_shared_run_remote_actors(string $incomingPayload, ?array $existin
   return $encoded !== '' ? $encoded : $incomingPayload;
 }
 
+function merge_shared_run_world_state(string $incomingPayload, ?array $existingEntry): string
+{
+  $incoming = decode_save_payload_array($incomingPayload);
+  if (!is_array($incoming)) {
+    return $incomingPayload;
+  }
+  $existingPayload = is_array($existingEntry) ? trim((string) ($existingEntry['payload'] ?? '')) : '';
+  if ($existingPayload === '') {
+    return $incomingPayload;
+  }
+  $existing = decode_save_payload_array($existingPayload);
+  if (!is_array($existing)) {
+    return $incomingPayload;
+  }
+
+  $incomingDungeonId = trim((string) ($incoming['sharedDungeonId'] ?? $incoming['seed'] ?? ''));
+  $existingDungeonId = trim((string) ($existing['sharedDungeonId'] ?? $existing['seed'] ?? ''));
+  if ($incomingDungeonId === '' || $existingDungeonId === '' || !hash_equals($incomingDungeonId, $existingDungeonId)) {
+    return $incomingPayload;
+  }
+
+  $mergedRemoved = [];
+  foreach ([$existing['removed'] ?? [], $incoming['removed'] ?? []] as $removedList) {
+    foreach ((is_array($removedList) ? $removedList : []) as $id) {
+      $id = trim((string) $id);
+      if ($id !== '') {
+        $mergedRemoved[$id] = true;
+      }
+    }
+  }
+  $incoming['removed'] = array_values(array_keys($mergedRemoved));
+
+  $existingDynamicMap = [];
+  foreach ((is_array($existing['dynamic'] ?? null) ? $existing['dynamic'] : []) as $entry) {
+    if (!is_array($entry)) continue;
+    $id = trim((string) ($entry['id'] ?? ''));
+    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    $existingDynamicMap[$id] = $entry;
+  }
+  $incomingDynamicMap = [];
+  foreach ((is_array($incoming['dynamic'] ?? null) ? $incoming['dynamic'] : []) as $entry) {
+    if (!is_array($entry)) continue;
+    $id = trim((string) ($entry['id'] ?? ''));
+    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    $incomingDynamicMap[$id] = $entry;
+  }
+  foreach ($existingDynamicMap as $id => $existingEntryRow) {
+    if (!isset($incomingDynamicMap[$id])) {
+      $incomingDynamicMap[$id] = $existingEntryRow;
+      continue;
+    }
+    $incomingEntryRow = $incomingDynamicMap[$id];
+    $existingKind = strtolower(trim((string) ($existingEntryRow['kind'] ?? '')));
+    $incomingKind = strtolower(trim((string) ($incomingEntryRow['kind'] ?? '')));
+    if ($existingKind !== $incomingKind) {
+      continue;
+    }
+    if ($incomingKind === 'monster') {
+      $existingHp = (int) floor((float) ($existingEntryRow['hp'] ?? 0));
+      $incomingHp = (int) floor((float) ($incomingEntryRow['hp'] ?? 0));
+      if ($existingHp < $incomingHp) {
+        $incomingEntryRow['hp'] = $existingHp;
+        if (array_key_exists('x', $existingEntryRow)) $incomingEntryRow['x'] = $existingEntryRow['x'];
+        if (array_key_exists('y', $existingEntryRow)) $incomingEntryRow['y'] = $existingEntryRow['y'];
+        if (array_key_exists('z', $existingEntryRow)) $incomingEntryRow['z'] = $existingEntryRow['z'];
+        if (isset($existingEntryRow['live']) && is_array($existingEntryRow['live'])) {
+          $incomingEntryRow['live'] = $existingEntryRow['live'];
+        }
+      }
+      $incomingDynamicMap[$id] = $incomingEntryRow;
+    }
+  }
+  $incoming['dynamic'] = array_values($incomingDynamicMap);
+
+  $existingEntOv = [];
+  foreach ((is_array($existing['entOv'] ?? null) ? $existing['entOv'] : []) as $entry) {
+    if (!is_array($entry) || count($entry) < 2) continue;
+    $id = trim((string) ($entry[0] ?? ''));
+    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    $existingEntOv[$id] = $entry[1];
+  }
+  $incomingEntOv = [];
+  foreach ((is_array($incoming['entOv'] ?? null) ? $incoming['entOv'] : []) as $entry) {
+    if (!is_array($entry) || count($entry) < 2) continue;
+    $id = trim((string) ($entry[0] ?? ''));
+    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    $incomingEntOv[$id] = $entry[1];
+  }
+  foreach ($existingEntOv as $id => $existingOv) {
+    if (!isset($incomingEntOv[$id])) {
+      $incomingEntOv[$id] = $existingOv;
+      continue;
+    }
+    $incomingOv = $incomingEntOv[$id];
+    if (is_array($existingOv) && is_array($incomingOv)) {
+      if (array_key_exists('hp', $existingOv) && array_key_exists('hp', $incomingOv)) {
+        $incomingOv['hp'] = min((int) floor((float) $existingOv['hp']), (int) floor((float) $incomingOv['hp']));
+      }
+      if (isset($existingOv['effects']) && !isset($incomingOv['effects'])) {
+        $incomingOv['effects'] = $existingOv['effects'];
+      }
+      if (isset($existingOv['live']) && is_array($existingOv['live']) && isset($incomingOv['live']) && is_array($incomingOv['live'])) {
+        $incomingOv['live'] = array_replace($existingOv['live'], $incomingOv['live']);
+      }
+      $incomingEntOv[$id] = $incomingOv;
+    }
+  }
+  $incoming['entOv'] = [];
+  foreach ($incomingEntOv as $id => $ov) {
+    $incoming['entOv'][] = [$id, $ov];
+  }
+
+  $encoded = encode_save_payload_array($incoming);
+  return $encoded !== '' ? $encoded : $incomingPayload;
+}
+
 function decode_character_snapshot_payload_array(string $payloadB64): ?array
 {
   $decoded = base64_decode(trim($payloadB64), true);
@@ -3758,6 +3874,7 @@ if ($apiMode === 'savegames') {
     if ($characterName === '') {
       $characterName = 'Adventurer';
     }
+    $payload = merge_shared_run_world_state($payload, $sharedRun);
     $payload = merge_shared_run_remote_actors($payload, $sharedRun, $characterId);
     $sharedRun = [
       'payload' => $payload,
