@@ -2453,6 +2453,17 @@ function merge_shared_run_world_state(string $incomingPayload, ?array $existingE
     return $incomingPayload;
   }
 
+  $mergedSharedRemovedDynamic = [];
+  foreach ([$existing['sharedRemovedDynamic'] ?? [], $incoming['sharedRemovedDynamic'] ?? []] as $removedList) {
+    foreach ((is_array($removedList) ? $removedList : []) as $id) {
+      $id = trim((string) $id);
+      if ($id !== '') {
+        $mergedSharedRemovedDynamic[$id] = true;
+      }
+    }
+  }
+  $incoming['sharedRemovedDynamic'] = array_values(array_keys($mergedSharedRemovedDynamic));
+
   $mergedRemoved = [];
   foreach ([$existing['removed'] ?? [], $incoming['removed'] ?? []] as $removedList) {
     foreach ((is_array($removedList) ? $removedList : []) as $id) {
@@ -2468,14 +2479,14 @@ function merge_shared_run_world_state(string $incomingPayload, ?array $existingE
   foreach ((is_array($existing['dynamic'] ?? null) ? $existing['dynamic'] : []) as $entry) {
     if (!is_array($entry)) continue;
     $id = trim((string) ($entry['id'] ?? ''));
-    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    if ($id === '' || isset($mergedRemoved[$id]) || isset($mergedSharedRemovedDynamic[$id])) continue;
     $existingDynamicMap[$id] = $entry;
   }
   $incomingDynamicMap = [];
   foreach ((is_array($incoming['dynamic'] ?? null) ? $incoming['dynamic'] : []) as $entry) {
     if (!is_array($entry)) continue;
     $id = trim((string) ($entry['id'] ?? ''));
-    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    if ($id === '' || isset($mergedRemoved[$id]) || isset($mergedSharedRemovedDynamic[$id])) continue;
     $incomingDynamicMap[$id] = $entry;
   }
   foreach ($existingDynamicMap as $id => $existingEntryRow) {
@@ -2510,14 +2521,14 @@ function merge_shared_run_world_state(string $incomingPayload, ?array $existingE
   foreach ((is_array($existing['entOv'] ?? null) ? $existing['entOv'] : []) as $entry) {
     if (!is_array($entry) || count($entry) < 2) continue;
     $id = trim((string) ($entry[0] ?? ''));
-    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    if ($id === '' || isset($mergedRemoved[$id]) || isset($mergedSharedRemovedDynamic[$id])) continue;
     $existingEntOv[$id] = $entry[1];
   }
   $incomingEntOv = [];
   foreach ((is_array($incoming['entOv'] ?? null) ? $incoming['entOv'] : []) as $entry) {
     if (!is_array($entry) || count($entry) < 2) continue;
     $id = trim((string) ($entry[0] ?? ''));
-    if ($id === '' || isset($mergedRemoved[$id])) continue;
+    if ($id === '' || isset($mergedRemoved[$id]) || isset($mergedSharedRemovedDynamic[$id])) continue;
     $incomingEntOv[$id] = $entry[1];
   }
   foreach ($existingEntOv as $id => $existingOv) {

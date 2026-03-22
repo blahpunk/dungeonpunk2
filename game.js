@@ -10579,6 +10579,29 @@ function sharedDungeonActorEntityId(characterId = "") {
   return `remote_character:${normalizeCharacterProfileId(characterId)}`;
 }
 
+function isSharedLocalMonsterEntityId(entityId = "") {
+  const id = String(entityId ?? "").trim();
+  return id.startsWith("m|") || id.startsWith("summon|") || id.startsWith("resp_m|");
+}
+
+function ensureSharedDynamicRemovalState(state) {
+  if (!state || typeof state !== "object") return new Set();
+  if (!(state.sharedRemovedDynamicIds instanceof Set)) state.sharedRemovedDynamicIds = new Set();
+  return state.sharedRemovedDynamicIds;
+}
+
+function noteSharedDynamicEntityRemoved(state, entityId = "") {
+  const id = String(entityId ?? "").trim();
+  if (!id) return;
+  ensureSharedDynamicRemovalState(state).add(id);
+}
+
+function clearSharedDynamicEntityRemoved(state, entityId = "") {
+  const id = String(entityId ?? "").trim();
+  if (!id || !(state?.sharedRemovedDynamicIds instanceof Set)) return;
+  state.sharedRemovedDynamicIds.delete(id);
+}
+
 function sharedDungeonInstanceIdForState(state = null) {
   return String(state?.sharedDungeonId ?? state?.world?.seedStr ?? "").trim();
 }
@@ -10611,6 +10634,57 @@ function clearRemoteCharacterActors(state) {
       if (String(id ?? "").startsWith("remote_character:")) {
         state.entityOverrides.delete(id);
       }
+    }
+  }
+}
+
+function preserveLocalMonsterState(sourceState, targetState) {
+  if (!sourceState?.entities || !targetState?.entities) return;
+
+  for (const [id, ent] of Array.from(targetState.entities.entries())) {
+    if (ent?.kind === "monster" || isSharedLocalMonsterEntityId(id)) {
+      targetState.entities.delete(id);
+    }
+  }
+  if (targetState.dynamic instanceof Map) {
+    for (const [id, ent] of Array.from(targetState.dynamic.entries())) {
+      if (ent?.kind === "monster" || isSharedLocalMonsterEntityId(id)) {
+        targetState.dynamic.delete(id);
+      }
+    }
+  }
+  if (targetState.entityOverrides instanceof Map) {
+    for (const id of Array.from(targetState.entityOverrides.keys())) {
+      if (isSharedLocalMonsterEntityId(id)) {
+        targetState.entityOverrides.delete(id);
+      }
+    }
+  }
+  if (targetState.removedIds instanceof Set) {
+    for (const id of Array.from(targetState.removedIds.values())) {
+      if (isSharedLocalMonsterEntityId(id)) {
+        targetState.removedIds.delete(id);
+      }
+    }
+  }
+
+  for (const [id, ent] of sourceState.entities.entries()) {
+    if (ent?.kind !== "monster" && !isSharedLocalMonsterEntityId(id)) continue;
+    targetState.entities.set(id, ent);
+    if (sourceState.dynamic instanceof Map && sourceState.dynamic.has(id) && targetState.dynamic instanceof Map) {
+      targetState.dynamic.set(id, ent);
+    }
+  }
+  if (sourceState.entityOverrides instanceof Map && targetState.entityOverrides instanceof Map) {
+    for (const [id, ov] of sourceState.entityOverrides.entries()) {
+      if (!isSharedLocalMonsterEntityId(id)) continue;
+      targetState.entityOverrides.set(id, ov);
+    }
+  }
+  if (sourceState.removedIds instanceof Set && targetState.removedIds instanceof Set) {
+    for (const id of sourceState.removedIds.values()) {
+      if (!isSharedLocalMonsterEntityId(id)) continue;
+      targetState.removedIds.add(id);
     }
   }
 }
@@ -10802,6 +10876,9 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
         forceEntrance: sharedDungeonChanged,
       });
       if (nextState) {
+        if (playerIsInLiveCombat(game)) {
+          preserveLocalMonsterState(game, nextState);
+        }
         game = nextState;
         enforceAdminControlPolicy(game);
         updateDebugMenuUi(game);
@@ -14694,9 +14771,10 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     seen: new Set(),
     visible: new Set(),
     log: [],
-    entities: new Map(),
-    removedIds: new Set(),
-    entityOverrides: new Map(),
+      entities: new Map(),
+      removedIds: new Set(),
+      sharedRemovedDynamicIds: new Set(),
+      entityOverrides: new Map(),
     inv: [],
     dynamic: new Map(),
     turn: 0,
@@ -15198,6 +15276,7 @@ function disarmTrapAtPlayer(state) {
     state.removedIds.add(trap.id);
     state.entityOverrides.delete(trap.id);
   } else if (trap.origin === "dynamic") {
+    noteSharedDynamicEntityRemoved(state, trap.id);
     state.dynamic.delete(trap.id);
   }
   state.entities.delete(trap.id);
@@ -16941,6 +17020,7 @@ function spawnDynamicItem(state, type, amount, x, y, z) {
     createdAt: instance.createdAt,
     updatedAt: instance.updatedAt,
   };
+  clearSharedDynamicEntityRemoved(state, id);
   state.dynamic.set(id, ent);
   state.entities.set(id, ent);
 }
@@ -17093,6 +17173,7 @@ function handleMonsterDefeat(state, monster, options = null) {
     state.removedIds.add(monster.id);
     state.entityOverrides.delete(monster.id);
   } else if (monster.origin === "dynamic") {
+    noteSharedDynamicEntityRemoved(state, monster.id);
     state.dynamic.delete(monster.id);
   }
 
@@ -17450,7 +17531,10 @@ function pickup(state) {
   }
 
   if (it.origin === "base") state.removedIds.add(it.id);
-  else if (it.origin === "dynamic") state.dynamic.delete(it.id);
+  else if (it.origin === "dynamic") {
+    noteSharedDynamicEntityRemoved(state, it.id);
+    state.dynamic.delete(it.id);
+  }
 
   state.entities.delete(it.id);
 
@@ -17645,7 +17729,10 @@ function interactShrine(state) {
   }, p.z, p.x, p.y);
 
   if (it.origin === "base") state.removedIds.add(it.id);
-  else if (it.origin === "dynamic") state.dynamic.delete(it.id);
+  else if (it.origin === "dynamic") {
+    noteSharedDynamicEntityRemoved(state, it.id);
+    state.dynamic.delete(it.id);
+  }
   state.entities.delete(it.id);
 
   recalcDerivedStats(state);
@@ -23445,6 +23532,7 @@ function exportSave(state) {
   const live = ensureLiveSimulationState(state);
   const tileOv = Array.from(state.world.tileOverrides.entries());
   const removed = Array.from(state.removedIds);
+  const sharedRemovedDynamic = Array.from(ensureSharedDynamicRemovalState(state));
   const entOv = Array.from(state.entityOverrides.entries()).map(([id, ov]) => {
     const ent = state.entities.get(id);
     if (!ent) return [id, ov];
@@ -23498,6 +23586,7 @@ function exportSave(state) {
     },
     inv: state.inv,
     removed,
+    sharedRemovedDynamic,
     entOv,
     tileOv,
     seen,
@@ -26257,6 +26346,7 @@ function importSave(saveStr) {
       log: ensureArray(payload.log),
       entities: new Map(),
       removedIds: new Set(ensureArray(payload.removed)),
+      sharedRemovedDynamicIds: new Set(ensureArray(payload.sharedRemovedDynamic)),
       entityOverrides: new Map(ensureArray(payload.entOv)),
       inv: normalizeInventoryEntries(payload.inv ?? [], normalizeOpts),
       dynamic: new Map(),
