@@ -2134,36 +2134,39 @@ function active_character_states_public_payload(array $entriesById, array $activ
 
   $out = [];
   foreach ($activeByCharacterId as $characterId => $lockMeta) {
+    $presence = is_array($lockMeta['presence'] ?? null) ? $lockMeta['presence'] : [];
     $entry = $entriesById[$characterId] ?? null;
-    if (!is_array($entry)) {
-      continue;
-    }
-    $snapshot = decode_character_snapshot_payload_array((string) ($entry['payload'] ?? ''));
-    if (!is_array($snapshot)) {
-      continue;
-    }
+    $snapshot = is_array($entry)
+      ? decode_character_snapshot_payload_array((string) ($entry['payload'] ?? ''))
+      : null;
     $position = is_array($snapshot['position'] ?? null) ? $snapshot['position'] : [];
     $player = is_array($snapshot['player'] ?? null) ? $snapshot['player'] : [];
     $character = is_array($snapshot['character'] ?? null) ? $snapshot['character'] : [];
-    $x = array_key_exists('x', $position) ? (is_numeric($position['x']) ? (int) $position['x'] : null) : null;
-    $y = array_key_exists('y', $position) ? (is_numeric($position['y']) ? (int) $position['y'] : null) : null;
-    $z = array_key_exists('depth', $position)
-      ? (is_numeric($position['depth']) ? (int) $position['depth'] : null)
-      : (array_key_exists('z', $position) && is_numeric($position['z']) ? (int) $position['z'] : null);
+    $x = array_key_exists('x', $presence)
+      ? (is_numeric($presence['x']) ? (int) $presence['x'] : null)
+      : (array_key_exists('x', $position) ? (is_numeric($position['x']) ? (int) $position['x'] : null) : null);
+    $y = array_key_exists('y', $presence)
+      ? (is_numeric($presence['y']) ? (int) $presence['y'] : null)
+      : (array_key_exists('y', $position) ? (is_numeric($position['y']) ? (int) $position['y'] : null) : null);
+    $z = array_key_exists('z', $presence)
+      ? (is_numeric($presence['z']) ? (int) $presence['z'] : null)
+      : (array_key_exists('depth', $position)
+        ? (is_numeric($position['depth']) ? (int) $position['depth'] : null)
+        : (array_key_exists('z', $position) && is_numeric($position['z']) ? (int) $position['z'] : null));
     $out[] = [
       'character_id' => $characterId,
-      'name' => (string) ($entry['name'] ?? 'Adventurer'),
-      'species_id' => (string) ($character['speciesId'] ?? $player['speciesId'] ?? ''),
-      'class_id' => (string) ($character['classId'] ?? $player['classId'] ?? ''),
-      'dungeon_instance_id' => (string) ($snapshot['dungeonInstanceId'] ?? ''),
+      'name' => (string) ($presence['name'] ?? $entry['name'] ?? 'Adventurer'),
+      'species_id' => (string) ($presence['species_id'] ?? $character['speciesId'] ?? $player['speciesId'] ?? ''),
+      'class_id' => (string) ($presence['class_id'] ?? $character['classId'] ?? $player['classId'] ?? ''),
+      'dungeon_instance_id' => (string) ($presence['dungeon_instance_id'] ?? $snapshot['dungeonInstanceId'] ?? ''),
       'x' => $x,
       'y' => $y,
       'z' => $z,
-      'hp' => max(0, (int) ($player['hp'] ?? 0)),
-      'max_hp' => max(1, (int) ($player['maxHp'] ?? 1)),
+      'hp' => max(0, (int) ($presence['hp'] ?? $player['hp'] ?? 0)),
+      'max_hp' => max(1, (int) ($presence['max_hp'] ?? $player['maxHp'] ?? 1)),
       'session_id' => (string) ($lockMeta['session_id'] ?? ''),
       'browser_instance_id' => (string) ($lockMeta['browser_instance_id'] ?? ''),
-      'updated_at' => (string) ($lockMeta['updated_at'] ?? ''),
+      'updated_at' => (string) ($presence['updated_at'] ?? $lockMeta['updated_at'] ?? ''),
     ];
   }
   return $out;
@@ -3923,6 +3926,26 @@ if ($apiMode === 'savegames') {
     ];
     if (!persist_user_character_states($userEmail, $characterStates, $saveSecret)) {
       json_response(['ok' => false, 'error' => 'Could not persist character state.'], 500);
+    }
+    $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
+    if ($browserInstanceId !== '') {
+      $snapshot = decode_character_snapshot_payload_array($characterPayload);
+      if (is_array($snapshot)) {
+        $position = is_array($snapshot['position'] ?? null) ? $snapshot['position'] : [];
+        $player = is_array($snapshot['player'] ?? null) ? $snapshot['player'] : [];
+        $character = is_array($snapshot['character'] ?? null) ? $snapshot['character'] : [];
+        authoritative_update_browser_character_presence($userEmail, $characterId, $browserInstanceId, [
+          'name' => $characterName,
+          'species_id' => (string) ($character['speciesId'] ?? $player['speciesId'] ?? ''),
+          'class_id' => (string) ($character['classId'] ?? $player['classId'] ?? ''),
+          'dungeon_instance_id' => (string) ($snapshot['dungeonInstanceId'] ?? ''),
+          'x' => array_key_exists('x', $position) ? $position['x'] : null,
+          'y' => array_key_exists('y', $position) ? $position['y'] : null,
+          'z' => array_key_exists('depth', $position) ? $position['depth'] : ($position['z'] ?? null),
+          'hp' => $player['hp'] ?? 0,
+          'max_hp' => $player['maxHp'] ?? 1,
+        ]);
+      }
     }
     json_response([
       'ok' => true,

@@ -10134,6 +10134,7 @@ async function persistCharacterSnapshot(snapshot, profile = null) {
       character_id: normalizedProfile.id,
       name: normalizedProfile.name,
       payload,
+      browser_instance_id: resolveBrowserInstanceId(),
     });
     return true;
   }
@@ -10182,6 +10183,7 @@ async function syncCharacterStateIfDirty(reason = "") {
         character_id: profile.id,
         name: profile.name,
         payload,
+        browser_instance_id: resolveBrowserInstanceId(),
       });
     } else {
       try { localStorage.setItem(characterStatePayloadKey(profile.id), payload); } catch {}
@@ -12686,6 +12688,7 @@ async function importGuestCharacterFromCurrentRun(options = null) {
     character_id: profile.id,
     name: profile.name,
     payload,
+    browser_instance_id: resolveBrowserInstanceId(),
   });
 
   const importedSlotId = characterStateSlotId(profile.id);
@@ -14906,7 +14909,7 @@ function buildOccupancy(state) {
     if (e.kind === "monster") monsters.set(k, e.id);
     else if (e.kind === "item") items.set(k, e.id);
     else if (e.kind === "trap") traps.set(k, e.id);
-    else if (e.kind === "actor" && !e.remoteCharacterId) actors.set(k, e.id);
+    else if (e.kind === "actor") actors.set(k, e.id);
   }
   return { monsters, items, traps, actors };
 }
@@ -16085,7 +16088,7 @@ function drawMinimap(state) {
     }
   }
 
-  const { monsters, items } = getCachedOccupancy(state);
+  const { monsters, items, actors } = getCachedOccupancy(state);
   for (let my = 0; my < size; my++) {
     for (let mx = 0; mx < size; mx++) {
       const wx = p.x + (mx - MINI_RADIUS);
@@ -16107,6 +16110,23 @@ function drawMinimap(state) {
         if (!state.visible.has(keyXY(wx, wy))) continue;
         mctx.fillStyle = "#ff6b6b";
         mctx.fillRect(mx * MINI_SCALE, my * MINI_SCALE, MINI_SCALE, MINI_SCALE);
+      }
+
+      const ak = actors.get(keyXYZ(wx, wy, p.z));
+      if (ak) {
+        const ent = state.entities.get(ak);
+        if (!ent?.remoteCharacterId) continue;
+        if (!state.visible.has(keyXY(wx, wy))) continue;
+        const dotSize = Math.max(2, Math.floor(MINI_SCALE * 0.8));
+        const ox = Math.floor((MINI_SCALE - dotSize) / 2);
+        const oy = Math.floor((MINI_SCALE - dotSize) / 2);
+        mctx.fillStyle = "#7cf0ff";
+        mctx.fillRect(mx * MINI_SCALE + ox, my * MINI_SCALE + oy, dotSize, dotSize);
+        if (dotSize >= 3) {
+          mctx.strokeStyle = "rgba(15,50,66,0.95)";
+          mctx.lineWidth = 1;
+          mctx.strokeRect(mx * MINI_SCALE + ox + 0.5, my * MINI_SCALE + oy + 0.5, dotSize - 1, dotSize - 1);
+        }
       }
     }
   }

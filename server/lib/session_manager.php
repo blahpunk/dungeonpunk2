@@ -528,6 +528,40 @@ function authoritative_touch_session(
   ];
 }
 
+/**
+ * @param array<string, mixed> $presence
+ */
+function authoritative_update_browser_character_presence(
+  string $userEmail,
+  string $characterId,
+  string $browserInstanceId,
+  array $presence
+): bool {
+  $targetCharacterId = trim($characterId);
+  $targetBrowserId = authoritative_normalize_browser_instance_id($browserInstanceId);
+  if ($targetCharacterId === '' || $targetBrowserId === '') {
+    return false;
+  }
+  $session = authoritative_find_browser_character_session($userEmail, $targetCharacterId, $targetBrowserId);
+  if (!is_array($session)) {
+    return false;
+  }
+  $session['presence'] = [
+    'name' => trim((string) ($presence['name'] ?? '')),
+    'species_id' => trim((string) ($presence['species_id'] ?? '')),
+    'class_id' => trim((string) ($presence['class_id'] ?? '')),
+    'dungeon_instance_id' => trim((string) ($presence['dungeon_instance_id'] ?? '')),
+    'x' => array_key_exists('x', $presence) && is_numeric($presence['x']) ? (int) $presence['x'] : null,
+    'y' => array_key_exists('y', $presence) && is_numeric($presence['y']) ? (int) $presence['y'] : null,
+    'z' => array_key_exists('z', $presence) && is_numeric($presence['z']) ? (int) $presence['z'] : null,
+    'hp' => max(0, (int) ($presence['hp'] ?? 0)),
+    'max_hp' => max(1, (int) ($presence['max_hp'] ?? 1)),
+    'updated_at' => date('c'),
+  ];
+  authoritative_clear_pending_close($session);
+  return authoritative_persist_session($session);
+}
+
 function authoritative_close_session(string $sessionId, string $userEmail, bool $immediate = false, string $reason = ''): bool
 {
   $session = authoritative_load_session($sessionId, $userEmail);
@@ -564,6 +598,7 @@ function authoritative_character_lock_audit(string $userEmail): array
       'character_id' => $characterId,
       'browser_instance_id' => authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? '')),
       'updated_at' => (string) ($session['updated_at'] ?? ''),
+      'presence' => is_array($session['presence'] ?? null) ? $session['presence'] : null,
     ];
     $active[] = $entry;
     if (!isset($byCharacter[$characterId]) || !is_array($byCharacter[$characterId])) {
@@ -614,6 +649,7 @@ function authoritative_character_lock_audit_all(): array
       'character_id' => $characterId,
       'browser_instance_id' => authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? '')),
       'updated_at' => (string) ($session['updated_at'] ?? ''),
+      'presence' => is_array($session['presence'] ?? null) ? $session['presence'] : null,
     ];
     $active[] = $entry;
     if (!isset($byCharacter[$characterId]) || !is_array($byCharacter[$characterId])) {
