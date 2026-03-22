@@ -160,6 +160,10 @@ export function createHeadlessBrowserEnv(options = {}) {
     innerWidth: 1280,
     innerHeight: 720,
     devicePixelRatio: 1,
+    setTimeout: globalThis.setTimeout?.bind(globalThis) ?? setTimeout,
+    clearTimeout: globalThis.clearTimeout?.bind(globalThis) ?? clearTimeout,
+    setInterval: globalThis.setInterval?.bind(globalThis) ?? setInterval,
+    clearInterval: globalThis.clearInterval?.bind(globalThis) ?? clearInterval,
     addEventListener() {},
     removeEventListener() {},
     matchMedia,
@@ -168,6 +172,11 @@ export function createHeadlessBrowserEnv(options = {}) {
   };
   globalThis.navigator = { userAgent: "dungeonpunk-headless" };
   globalThis.localStorage = {
+    getItem() { return null; },
+    setItem() {},
+    removeItem() {},
+  };
+  globalThis.sessionStorage = {
     getItem() { return null; },
     setItem() {},
     removeItem() {},

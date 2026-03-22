@@ -232,7 +232,49 @@ function authoritative_worker_daemon_start(): bool
     fclose($probe);
     return true;
   }
-  return false;
+  if (!function_exists('shell_exec')) {
+    return false;
+  }
+  $lockPath = authoritative_worker_start_lock_path();
+  $lockHandle = @fopen($lockPath, 'c+');
+  if (!is_resource($lockHandle)) {
+    return false;
+  }
+  try {
+    if (!@flock($lockHandle, LOCK_EX)) {
+      return false;
+    }
+    $probe = authoritative_worker_socket_connect(0.05);
+    if (is_resource($probe)) {
+      fclose($probe);
+      return true;
+    }
+    $socketPath = authoritative_worker_socket_path();
+    if (is_string($socketPath) && $socketPath !== '' && file_exists($socketPath)) {
+      @unlink($socketPath);
+    }
+    $currentVersion = authoritative_worker_code_version();
+    $storedVersion = authoritative_worker_stored_version();
+    $pids = authoritative_worker_daemon_pids();
+    if (count($pids) > 1 || ($storedVersion !== '' && $currentVersion !== '' && $storedVersion !== $currentVersion)) {
+      authoritative_worker_kill_daemons();
+    }
+    @shell_exec(authoritative_worker_daemon_command());
+    $deadline = microtime(true) + 2.5;
+    do {
+      usleep(50000);
+      $probe = authoritative_worker_socket_connect(0.05);
+      if (is_resource($probe)) {
+        fclose($probe);
+        authoritative_worker_store_version($currentVersion);
+        return true;
+      }
+    } while (microtime(true) < $deadline);
+    return false;
+  } finally {
+    @flock($lockHandle, LOCK_UN);
+    @fclose($lockHandle);
+  }
 }
 
 /**
@@ -245,7 +287,9 @@ function authoritative_worker_call_via_daemon(array $input): ?array
   }
 
   $operation = trim((string) ($input['operation'] ?? ''));
-  $timeoutSeconds = $operation === 'poll_movement' ? 35.0 : 1.5;
+  $timeoutSeconds = $operation === 'poll_movement'
+    ? 35.0
+    : ($operation === 'shared_dungeon_step' ? 4.0 : 1.5);
   $stream = authoritative_worker_socket_connect($timeoutSeconds);
   if (!is_resource($stream)) {
     return null;
@@ -454,5 +498,23 @@ function authoritative_worker_poll_movement(
     'worldPayload' => $worldPayload,
     'timeoutMs' => max(100, min(30000, $timeoutMs)),
     'minResponseMs' => max(0, min(1000, $minResponseMs)),
+  ]);
+}
+
+/**
+ * @param array<int, array<string, mixed>> $characterEntries
+ * @param array<string, mixed> $options
+ * @return array<string, mixed>
+ */
+function authoritative_worker_shared_dungeon_step(
+  string $sharedPayload,
+  array $characterEntries = [],
+  array $options = []
+): array {
+  return authoritative_worker_call([
+    'operation' => 'shared_dungeon_step',
+    'sharedPayload' => trim($sharedPayload),
+    'characterEntries' => array_values($characterEntries),
+    'options' => $options,
   ]);
 }

@@ -170,9 +170,9 @@ const BROWSER_INSTANCE_ID_CLAIM_STALE_MS = 45000;
 const BROWSER_INSTANCE_ID_CLAIM_REFRESH_MS = 10000;
 const CHARACTER_STATE_SLOT_PREFIX = "charstate:";
 const LOCAL_CHARACTER_STATE_PREFIX = "infinite_dungeon_character_state_v1:";
-const CHARACTER_SYNC_DEBOUNCE_MS = 120;
-const SHARED_DUNGEON_SYNC_INTERVAL_MS = 120;
-const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 35;
+const CHARACTER_SYNC_DEBOUNCE_MS = 300;
+const SHARED_DUNGEON_SYNC_INTERVAL_MS = 1000;
+const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 220;
 const XP_SCALE = 100;
 const COMBAT_SCALE = 100;
 const POTION_HEAL_PCT = 0.35;
@@ -4996,6 +4996,7 @@ function setDebugFlag(state, key, enabled) {
   if (key === "freeShopping") pushLog(state, `Free shopping ${next ? "enabled" : "disabled"}.`);
   if (key === "ghost") pushLog(state, `Ghost ${next ? "enabled" : "disabled"}.`);
   if (key === "lockpick") pushLog(state, `Lockpick ${next ? "enabled" : "disabled"}.`);
+  markSaveDirty(state, `debug-${String(key ?? "flag")}`);
   saveNow(state);
 }
 
@@ -9956,6 +9957,7 @@ function exportCharacterSnapshot(state) {
       xp: Math.max(0, Math.floor(p.xp ?? 0)),
       hp: Math.max(0, Math.floor(p.hp ?? 0)),
       maxHp: Math.max(1, Math.floor(p.maxHp ?? 1)),
+      dead: !!p.dead,
       gold: Math.max(0, Math.floor(p.gold ?? 0)),
       inv: normalizeInventoryEntries(src.inv ?? [], {
         speciesId: profile.speciesId,
@@ -9963,6 +9965,7 @@ function exportCharacterSnapshot(state) {
         ownerId: profile.id,
       }),
       equip: normalizeEquip(p.equip ?? {}, { speciesId: profile.speciesId, classId: profile.classId }),
+      effects: ensureArray(p.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean),
       classId: normalizeCharacterClassId(p.classId ?? profile.classId, profile.speciesId),
       speciesId: normalizeCharacterSpeciesId(p.speciesId ?? profile.speciesId),
     },
@@ -10012,6 +10015,7 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
         xp: Math.max(0, Math.floor(decoded?.player?.xp ?? 0)),
         hp: Math.max(0, Math.floor(decoded?.player?.hp ?? 0)),
         maxHp: Math.max(1, Math.floor(decoded?.player?.maxHp ?? 1)),
+        dead: !!decoded?.player?.dead,
         gold: Math.max(0, Math.floor(decoded?.player?.gold ?? 0)),
         inv: normalizeInventoryEntries(decoded?.player?.inv ?? [], {
           speciesId,
@@ -10022,6 +10026,7 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
           speciesId,
           classId,
         }),
+        effects: ensureArray(decoded?.player?.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean),
         classId,
         speciesId,
       },
@@ -10085,6 +10090,7 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
       xp: Math.max(0, Math.floor(decoded?.player?.xp ?? 0)),
       hp: Math.max(0, Math.floor(decoded?.player?.hp ?? 0)),
       maxHp: Math.max(1, Math.floor(decoded?.player?.maxHp ?? 1)),
+      dead: !!decoded?.player?.dead,
       gold: Math.max(0, Math.floor(decoded?.player?.gold ?? 0)),
       inv: normalizeInventoryEntries(decoded?.player?.inv ?? [], {
         speciesId,
@@ -10095,6 +10101,7 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
         speciesId,
         classId,
       }),
+      effects: ensureArray(decoded?.player?.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean),
       classId,
       speciesId,
     },
@@ -10114,6 +10121,7 @@ function buildCharacterSnapshotFromCarryover(profile, carryover = null) {
       xp: Math.max(0, Math.floor(carryover?.xp ?? 0)),
       hp: maxHp,
       maxHp,
+      dead: false,
       gold: Math.max(0, Math.floor(carryover?.gold ?? 0)),
       inv: normalizeInventoryEntries(carryover?.inv ?? [], {
         speciesId: normalizedProfile.speciesId,
@@ -10124,6 +10132,7 @@ function buildCharacterSnapshotFromCarryover(profile, carryover = null) {
         speciesId: normalizedProfile.speciesId,
         classId: normalizedProfile.classId,
       }),
+      effects: ensureArray(carryover?.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean),
       classId: normalizedProfile.classId,
       speciesId: normalizedProfile.speciesId,
     },
@@ -10235,7 +10244,7 @@ function applyCharacterSnapshot(state, snapshot) {
   p.xp = Math.max(0, Math.floor(snapPlayer.xp ?? p.xp ?? 0));
   p.gold = Math.max(0, Math.floor(snapPlayer.gold ?? p.gold ?? 0));
   p.equip = normalizeEquip(snapPlayer.equip ?? p.equip ?? {}, { speciesId: profile.speciesId, classId: profile.classId });
-  p.effects = [];
+  p.effects = ensureArray(snapPlayer.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean);
   p.classId = normalizeCharacterClassId(snapPlayer.classId ?? profile.classId, profile.speciesId);
   p.speciesId = normalizeCharacterSpeciesId(snapPlayer.speciesId ?? profile.speciesId);
   p.combatFirstStrikeReady = true;
@@ -10243,7 +10252,7 @@ function applyCharacterSnapshot(state, snapshot) {
   p.overclockUntilMs = 0;
   p.attackAfterMove = false;
   p.abilityCd = 0;
-  p.dead = false;
+  p.dead = !!snapPlayer.dead;
   p.live = normalizeLiveCombatActorState(null, "player");
   state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
     speciesId: profile.speciesId,
@@ -10638,6 +10647,31 @@ function clearRemoteCharacterActors(state) {
   }
 }
 
+function stripSharedDungeonMonsterState(state) {
+  if (!state) return;
+  if (state.entities instanceof Map) {
+    for (const [id, ent] of Array.from(state.entities.entries())) {
+      if (ent?.kind === "monster" || isSharedLocalMonsterEntityId(id)) {
+        state.entities.delete(id);
+      }
+    }
+  }
+  if (state.dynamic instanceof Map) {
+    for (const [id, ent] of Array.from(state.dynamic.entries())) {
+      if (ent?.kind === "monster" || isSharedLocalMonsterEntityId(id)) {
+        state.dynamic.delete(id);
+      }
+    }
+  }
+  if (state.entityOverrides instanceof Map) {
+    for (const [id] of Array.from(state.entityOverrides.entries())) {
+      if (isSharedLocalMonsterEntityId(id)) {
+        state.entityOverrides.delete(id);
+      }
+    }
+  }
+}
+
 function preserveLocalMonsterState(sourceState, targetState) {
   if (!sourceState?.entities || !targetState?.entities) return;
 
@@ -10803,7 +10837,9 @@ function scheduleSharedDungeonPush(reason = "state-change") {
 async function fetchSharedDungeonStateFromServer() {
   if (!canUseSharedDungeonSync()) return null;
   const browserInstanceId = resolveBrowserInstanceId();
-  return saveApiRequest("GET", null, `shared_run=1&browser_instance_id=${encodeURIComponent(browserInstanceId)}`);
+  const currentCharacterId = activeSharedDungeonCharacterId();
+  const currentCharacterQuery = currentCharacterId ? `&current_character_id=${encodeURIComponent(currentCharacterId)}` : "";
+  return saveApiRequest("GET", null, `shared_run=1&browser_instance_id=${encodeURIComponent(browserInstanceId)}${currentCharacterQuery}`);
 }
 
 async function persistSharedDungeonStateToServer(state, reason = "sync", options = null) {
@@ -10816,12 +10852,13 @@ async function persistSharedDungeonStateToServer(state, reason = "sync", options
     action: opts.adminReset === true ? "admin_universal_new_dungeon" : "shared_run_sync",
     payload,
     character_id: normalizeCharacterProfileId(profile?.id ?? ""),
+    current_character_id: activeSharedDungeonCharacterId(),
     character_name: String(profile?.name ?? DEFAULT_CHARACTER_NAME),
     reason: String(reason ?? "").trim() || "sync",
   });
   sharedDungeonRuntime.lastPushAt = Date.now();
   sharedDungeonRuntime.lastSeenUpdatedAt = String(data?.shared_run?.updated_at ?? sharedDungeonRuntime.lastSeenUpdatedAt);
-  return true;
+  return data && typeof data === "object" ? data : false;
 }
 
 function restartSharedDungeonSyncLoop() {
@@ -10848,24 +10885,38 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
   if (!currentCharacterId) return false;
   sharedDungeonRuntime.syncing = true;
   try {
+    let sharedData = null;
     if (opts.forcePush === true || (saveRuntime.dirty && (Date.now() - sharedDungeonRuntime.lastPushAt) >= SHARED_DUNGEON_PUSH_DEBOUNCE_MS)) {
-      await persistSharedDungeonStateToServer(game, reason);
+      sharedData = await persistSharedDungeonStateToServer(game, reason);
     }
     if (opts.skipPull === true) return true;
-    const sharedData = await fetchSharedDungeonStateFromServer();
+    if (!sharedData || typeof sharedData !== "object" || !sharedData?.shared_run) {
+      sharedData = await fetchSharedDungeonStateFromServer();
+    }
     const updatedAt = String(sharedData?.shared_run?.updated_at ?? "").trim();
     sharedDungeonRuntime.lastPullAt = Date.now();
     if (updatedAt) sharedDungeonRuntime.lastSeenUpdatedAt = updatedAt;
     const sharedPayload = String(sharedData?.shared_run?.payload ?? "").trim();
+    const currentCharacterPayload = decodeCharacterSnapshotPayload(String(sharedData?.current_character_payload ?? "").trim());
     const sharedPullSafeWhileDirty = !!(saveRuntime.lastDirtyAt > 0 && saveRuntime.lastDirtyAt <= sharedDungeonRuntime.lastPushAt);
+    const blockSharedApplyForCombat = playerIsInLiveCombat(game) && opts.forceApply !== true;
     if (
       sharedPayload &&
       updatedAt &&
       sharedPayload !== exportSharedDungeonPayload(game) &&
       (!saveRuntime.dirty || sharedPullSafeWhileDirty || opts.forceApply === true) &&
-      updatedAt !== sharedDungeonRuntime.lastAppliedUpdatedAt
+      updatedAt !== sharedDungeonRuntime.lastAppliedUpdatedAt &&
+      !blockSharedApplyForCombat
     ) {
+      const wasDebugMenuOpen = !!debugMenuEl?.classList.contains("show");
+      const priorDebugFlags = normalizeDebugFlags(game?.debug);
       let snapshot = exportCharacterSnapshot(game);
+      if (currentCharacterPayload) {
+        snapshot = {
+          ...currentCharacterPayload,
+          position: snapshot?.position ?? currentCharacterPayload?.position ?? null,
+        };
+      }
       if (!snapshot) {
         snapshot = await resolveLoadableCharacterSnapshot(currentCharacterId);
       }
@@ -10876,13 +10927,13 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
         forceEntrance: sharedDungeonChanged,
       });
       if (nextState) {
-        if (playerIsInLiveCombat(game)) {
-          preserveLocalMonsterState(game, nextState);
-        }
         game = nextState;
+        if (canUseAdminControls()) {
+          game.debug = { ...priorDebugFlags };
+        }
         enforceAdminControlPolicy(game);
         updateDebugMenuUi(game);
-        setDebugMenuOpen(false);
+        if (wasDebugMenuOpen && canUseAdminControls()) setDebugMenuOpen(true);
         updateContextActionButton(game);
         updateDeathOverlay(game);
         refreshSaveNameFromLive(true);
@@ -10895,6 +10946,25 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
         sharedDungeonRuntime.lastAppliedUpdatedAt = updatedAt;
         sharedDungeonRuntime.lastAppliedCharacterId = currentCharacterId;
       }
+    }
+    if (
+      currentCharacterPayload
+      && normalizeCharacterProfileId(currentCharacterPayload?.character?.id ?? currentCharacterId) === currentCharacterId
+      && game
+    ) {
+      const prevPos = {
+        x: Math.floor(Number(game?.player?.x ?? 0)),
+        y: Math.floor(Number(game?.player?.y ?? 0)),
+        z: Math.floor(Number(game?.player?.z ?? 0)),
+      };
+      applyCharacterSnapshot(game, currentCharacterPayload);
+      game.player.x = prevPos.x;
+      game.player.y = prevPos.y;
+      game.player.z = prevPos.z;
+      hydrateNearby(game);
+      computeVisibility(game);
+      updateContextActionButton(game);
+      updateDeathOverlay(game);
     }
     syncRemoteCharacterActors(game, sharedData);
     return true;
@@ -22184,10 +22254,15 @@ function draw(state) {
   const canSimulateLocally = canMutateGameplayStateLocally();
   if (canSimulateLocally) {
     if (!isAuthoritativeSessionActive() && liveTickCombatEnabled(state)) {
-      advanceLiveSimulationToWallClock(state, {
+      const liveEventsBefore = Array.isArray(state?.live?.events) ? state.live.events.length : 0;
+      const liveAdvance = advanceLiveSimulationToWallClock(state, {
         nowMs,
         maxTicks: Math.max(1, LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS),
       });
+      const liveEventsAfter = Array.isArray(state?.live?.events) ? state.live.events.length : 0;
+      if ((liveAdvance?.advancedTicks ?? 0) > 0 && liveEventsAfter > liveEventsBefore) {
+        markSaveDirty(state, "live-autotick");
+      }
     }
     touchCharacterProgress(state);
     updateAreaRespawnSystem(state, nowMs);
@@ -25150,6 +25225,8 @@ function tryCommitLiveMonsterMove(state, monster = null, nextPos = null, options
   const occ = buildOccupancy(state);
   const occMonsterId = occ.monsters.get(keyXYZ(nx, ny, nz));
   if (occMonsterId && occMonsterId !== monster.id) return false;
+  const occActorId = occ.actors.get(keyXYZ(nx, ny, nz));
+  if (occActorId && occActorId !== sharedDungeonActorEntityId(normalizeCharacterProfileId(state?.character?.id ?? ""))) return false;
   const occItemId = occ.items.get(keyXYZ(nx, ny, nz));
   if (occItemId && state.entities?.get?.(occItemId)?.type === "shopkeeper") return false;
 
@@ -25597,6 +25674,7 @@ function advanceLiveSimulationOnState(state, options = null) {
   const stepCount = Math.max(1, Math.floor(Number(opts.ticks ?? 1) || 1));
   const oneShotMoveDir = normalizeCardinalDirection(opts.playerMoveDir ?? "");
   const clearMoveIntent = opts.clearMoveIntent !== false;
+  const useServerSharedMonsterSync = !HEADLESS_RUNTIME && canUseSharedDungeonSync();
   let advancedTicks = 0;
   let movedCount = 0;
   let blockedReason = "";
@@ -25640,7 +25718,9 @@ function advanceLiveSimulationOnState(state, options = null) {
     }
 
     advanceLiveTrapTimingOnTick(state, { currentTick: live.tick });
-    advanceLiveMonstersCombatOnTick(state, { currentTick: live.tick });
+    if (!useServerSharedMonsterSync) {
+      advanceLiveMonstersCombatOnTick(state, { currentTick: live.tick });
+    }
     if (state.player.dead) break;
 
     const activeDir = normalizeCardinalDirection(ensureLiveActorState(state.player, "player").intent.moveDir ?? "");
@@ -25652,7 +25732,9 @@ function advanceLiveSimulationOnState(state, options = null) {
         blockedReason = stepResult.reason;
       }
     }
-    advanceLiveMonstersMovementOnTick(state, { currentTick: live.tick });
+    if (!useServerSharedMonsterSync) {
+      advanceLiveMonstersMovementOnTick(state, { currentTick: live.tick });
+    }
     if (state.player.dead) break;
     advanceLivePlayerCombatOnTick(state, { currentTick: live.tick });
     applyLiveLegacyTurnCadenceTick(state, live.tick);
@@ -25755,6 +25837,406 @@ function advanceLiveSimulationToWallClock(state, options = null) {
       appliedTicks: Math.max(0, Math.floor(Number(stepped?.advancedTicks ?? dueTicks) || dueTicks)),
       clamped,
     },
+  };
+}
+
+function normalizeSharedServerCharacterRecord(entry = null, fallbackDungeonId = "") {
+  const raw = (entry && typeof entry === "object") ? entry : {};
+  const characterId = normalizeCharacterProfileId(raw.characterId ?? raw.character_id ?? "");
+  const payload = String(raw.payload ?? "").trim();
+  const decoded = payload ? decodeCharacterSnapshotPayload(payload) : null;
+  const snapshot = (decoded && typeof decoded === "object") ? decoded : null;
+  const profile = normalizeCharacterProfile(
+    snapshot?.character ?? {
+      id: characterId,
+      name: raw.name ?? DEFAULT_CHARACTER_NAME,
+      classId: raw.class_id ?? snapshot?.player?.classId ?? DEFAULT_CHARACTER_CLASS_ID,
+      speciesId: raw.species_id ?? snapshot?.player?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID,
+    }
+  );
+  const speciesId = normalizeCharacterSpeciesId(raw.species_id ?? snapshot?.player?.speciesId ?? profile.speciesId);
+  const classId = normalizeCharacterClassId(raw.class_id ?? snapshot?.player?.classId ?? profile.classId, speciesId);
+  const position = normalizeCharacterSnapshotPosition({
+    x: raw.x ?? snapshot?.position?.x ?? null,
+    y: raw.y ?? snapshot?.position?.y ?? null,
+    depth: raw.z ?? raw.depth ?? snapshot?.position?.depth ?? snapshot?.position?.z ?? null,
+  });
+  const dungeonInstanceId = String(raw.dungeon_instance_id ?? snapshot?.dungeonInstanceId ?? fallbackDungeonId ?? "").trim();
+  const snapPlayer = (snapshot?.player && typeof snapshot.player === "object") ? snapshot.player : {};
+  const hp = Math.max(0, Math.floor(Number(raw.hp ?? snapPlayer.hp ?? 0) || 0));
+  const maxHp = Math.max(1, Math.floor(Number(raw.max_hp ?? snapPlayer.maxHp ?? 1) || 1));
+  const effects = ensureArray(snapPlayer.effects).map((effect) => (effect && typeof effect === "object" ? { ...effect } : null)).filter(Boolean);
+  const normalizedSnapshot = snapshot ?? buildCharacterSnapshotFromCarryover(profile, {
+    character: profile,
+    level: Math.max(1, Math.floor(Number(snapPlayer.level ?? 1) || 1)),
+    xp: Math.max(0, Math.floor(Number(snapPlayer.xp ?? 0) || 0)),
+    gold: Math.max(0, Math.floor(Number(snapPlayer.gold ?? 0) || 0)),
+    inv: normalizeInventoryEntries(snapPlayer.inv ?? [], {
+      speciesId,
+      classId,
+      ownerId: profile.id,
+    }),
+    equip: normalizeEquip(snapPlayer.equip ?? {}, { speciesId, classId }),
+    maxHp,
+    effects,
+  });
+  normalizedSnapshot.character = profile;
+  normalizedSnapshot.dungeonInstanceId = dungeonInstanceId;
+  normalizedSnapshot.position = {
+    x: position.x,
+    y: position.y,
+    depth: position.depth,
+  };
+  normalizedSnapshot.player = {
+    ...(normalizedSnapshot.player && typeof normalizedSnapshot.player === "object" ? normalizedSnapshot.player : {}),
+    level: Math.max(1, Math.floor(Number(normalizedSnapshot?.player?.level ?? snapPlayer.level ?? 1) || 1)),
+    xp: Math.max(0, Math.floor(Number(normalizedSnapshot?.player?.xp ?? snapPlayer.xp ?? 0) || 0)),
+    hp,
+    maxHp,
+    dead: !!(raw.dead ?? snapPlayer.dead ?? hp <= 0),
+    gold: Math.max(0, Math.floor(Number(normalizedSnapshot?.player?.gold ?? snapPlayer.gold ?? 0) || 0)),
+    inv: normalizeInventoryEntries(normalizedSnapshot?.player?.inv ?? snapPlayer.inv ?? [], {
+      speciesId,
+      classId,
+      ownerId: profile.id,
+    }),
+    equip: normalizeEquip(normalizedSnapshot?.player?.equip ?? snapPlayer.equip ?? {}, {
+      speciesId,
+      classId,
+    }),
+    effects,
+    classId,
+    speciesId,
+  };
+  return {
+    characterId: profile.id || characterId,
+    userKey: String(raw.user_key ?? raw.userKey ?? "").trim(),
+    name: String(raw.name ?? profile.name ?? DEFAULT_CHARACTER_NAME),
+    dungeonInstanceId,
+    x: position.x,
+    y: position.y,
+    z: position.depth,
+    hp,
+    maxHp,
+    dead: !!normalizedSnapshot.player.dead,
+    snapshot: normalizedSnapshot,
+    proxy: null,
+    updatedAt: String(raw.updated_at ?? "").trim(),
+  };
+}
+
+function buildSharedServerCharacterProxy(state, target = null) {
+  if (!state || !target || !target.snapshot) return null;
+  const snapshot = target.snapshot;
+  const profile = normalizeCharacterProfile(snapshot.character ?? null);
+  const snapPlayer = (snapshot.player && typeof snapshot.player === "object") ? snapshot.player : {};
+  const speciesId = normalizeCharacterSpeciesId(snapPlayer.speciesId ?? profile.speciesId);
+  const classId = normalizeCharacterClassId(snapPlayer.classId ?? profile.classId, speciesId);
+  const proxyPlayer = {
+    ...((state.player && typeof state.player === "object") ? state.player : {}),
+  };
+  const proxyInv = normalizeInventoryEntries(snapPlayer.inv ?? [], {
+    speciesId,
+    classId,
+    ownerId: profile.id,
+  });
+  const proxyState = {
+    ...state,
+    player: proxyPlayer,
+    character: profile,
+    inv: proxyInv,
+  };
+  proxyPlayer.x = Number.isFinite(Number(target.x)) ? Math.floor(Number(target.x)) : Math.floor(Number(proxyPlayer.x ?? 0));
+  proxyPlayer.y = Number.isFinite(Number(target.y)) ? Math.floor(Number(target.y)) : Math.floor(Number(proxyPlayer.y ?? 0));
+  proxyPlayer.z = Number.isFinite(Number(target.z)) ? Math.floor(Number(target.z)) : Math.floor(Number(proxyPlayer.z ?? 0));
+  proxyPlayer.level = Math.max(1, Math.floor(Number(snapPlayer.level ?? proxyPlayer.level ?? 1) || 1));
+  proxyPlayer.xp = Math.max(0, Math.floor(Number(snapPlayer.xp ?? proxyPlayer.xp ?? 0) || 0));
+  proxyPlayer.gold = Math.max(0, Math.floor(Number(snapPlayer.gold ?? proxyPlayer.gold ?? 0) || 0));
+  proxyPlayer.equip = normalizeEquip(snapPlayer.equip ?? proxyPlayer.equip ?? {}, {
+    speciesId,
+    classId,
+  });
+  proxyPlayer.effects = ensureArray(snapPlayer.effects).map((effect) => (effect && typeof effect === "object" ? { ...effect } : null)).filter(Boolean);
+  proxyPlayer.classId = classId;
+  proxyPlayer.speciesId = speciesId;
+  proxyPlayer.combatFirstStrikeReady = snapPlayer.combatFirstStrikeReady !== false;
+  proxyPlayer.slipbladeBonusReady = !!snapPlayer.slipbladeBonusReady;
+  proxyPlayer.overclockUntilMs = Math.max(0, Math.floor(Number(snapPlayer.overclockUntilMs ?? 0) || 0));
+  proxyPlayer.attackAfterMove = false;
+  proxyPlayer.abilityCd = Math.max(0, Math.floor(Number(snapPlayer.abilityCd ?? 0) || 0));
+  proxyPlayer.dead = !!snapPlayer.dead;
+  proxyPlayer.live = normalizeLiveCombatActorState(snapPlayer.live ?? proxyPlayer.live ?? null, "player");
+  const snapMaxHp = Math.max(1, Math.floor(Number(snapPlayer.maxHp ?? proxyPlayer.maxHp ?? 1) || 1));
+  const snapHp = Math.max(0, Math.floor(Number(snapPlayer.hp ?? proxyPlayer.hp ?? snapMaxHp) || 0));
+  const hpRatio = clamp(snapHp / snapMaxHp, 0, 1);
+  recalcDerivedStats(proxyState);
+  proxyPlayer.hp = clamp(Math.round((proxyPlayer.maxHp ?? 1) * hpRatio), 0, proxyPlayer.maxHp ?? 1);
+  proxyPlayer.energy = proxyPlayer.energyMax;
+  return {
+    player: proxyPlayer,
+    inv: proxyInv,
+    character: profile,
+  };
+}
+
+function syncSharedServerCharacterActors(state, characterRecords = []) {
+  if (!state?.entities) return;
+  clearRemoteCharacterActors(state);
+  const dungeonId = sharedDungeonInstanceIdForState(state);
+  for (const target of Array.isArray(characterRecords) ? characterRecords : []) {
+    if (!target || !target.characterId) continue;
+    if (!Number.isFinite(Number(target.x)) || !Number.isFinite(Number(target.y)) || !Number.isFinite(Number(target.z))) continue;
+    if (dungeonId && target.dungeonInstanceId && target.dungeonInstanceId !== dungeonId) continue;
+    const actorId = sharedDungeonActorEntityId(target.characterId);
+    const display = resolveCharacterSpriteDisplay(
+      target.snapshot?.player?.speciesId ?? target.snapshot?.character?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID,
+      target.snapshot?.player?.classId ?? target.snapshot?.character?.classId ?? DEFAULT_CHARACTER_CLASS_ID
+    );
+    const actor = {
+      id: actorId,
+      kind: "actor",
+      type: "hero_actor",
+      spriteId: display.spriteId || "hero",
+      x: Math.floor(Number(target.x)),
+      y: Math.floor(Number(target.y)),
+      z: Math.floor(Number(target.z)),
+      ai: "none",
+      remoteCharacterId: target.characterId,
+      remoteCharacterName: String(target.name ?? target.snapshot?.character?.name ?? "Adventurer"),
+      hp: Math.max(0, Math.floor(Number(target.hp ?? target.snapshot?.player?.hp ?? 0) || 0)),
+      maxHp: Math.max(1, Math.floor(Number(target.maxHp ?? target.snapshot?.player?.maxHp ?? 1) || 1)),
+      live: normalizeLiveCombatActorState(target.snapshot?.player?.live ?? null, "actor"),
+      sharedServerPresenceOnly: true,
+    };
+    state.entities.set(actorId, actor);
+    if (state.dynamic instanceof Map) state.dynamic.set(actorId, actor);
+    if (state.entityOverrides instanceof Map) state.entityOverrides.delete(actorId);
+  }
+}
+
+function chooseSharedServerMonsterTarget(state, monster = null, characterRecords = [], options = null) {
+  if (!state?.world || !monster || monster.kind !== "monster") return null;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  const candidates = [];
+  for (const target of Array.isArray(characterRecords) ? characterRecords : []) {
+    if (!target || target.dead) continue;
+    if (!Number.isFinite(Number(target.x)) || !Number.isFinite(Number(target.y)) || !Number.isFinite(Number(target.z))) continue;
+    if (Math.floor(Number(target.z)) !== Math.floor(Number(monster.z ?? target.z))) continue;
+    const dist = Math.abs(Math.floor(Number(monster.x ?? 0)) - Math.floor(Number(target.x))) + Math.abs(Math.floor(Number(monster.y ?? 0)) - Math.floor(Number(target.y)));
+    const hasLos = hasLineOfSight(state.world, Math.floor(Number(target.z)), monster.x, monster.y, Math.floor(Number(target.x)), Math.floor(Number(target.y)));
+    const currentTarget = String(monsterLive.combat.combatTargetId ?? "").trim() === String(target.characterId ?? "").trim();
+    const engaged = currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0));
+    const hpPct = Math.max(0, Math.min(1, Number(target.hp ?? 0) / Math.max(1, Number(target.maxHp ?? 1))));
+    candidates.push({
+      target,
+      currentTarget,
+      engaged,
+      hasLos,
+      dist,
+      hpPct,
+    });
+  }
+  candidates.sort((a, b) => {
+    if (a.currentTarget !== b.currentTarget) return a.currentTarget ? -1 : 1;
+    if (a.hasLos !== b.hasLos) return a.hasLos ? -1 : 1;
+    if (a.engaged !== b.engaged) return a.engaged ? -1 : 1;
+    if (a.dist !== b.dist) return a.dist - b.dist;
+    if (a.hpPct !== b.hpPct) return a.hpPct - b.hpPct;
+    return String(a.target?.characterId ?? "").localeCompare(String(b.target?.characterId ?? ""));
+  });
+  return candidates[0]?.target ?? null;
+}
+
+function withSharedServerCharacterContext(state, target = null, fn = null) {
+  if (!state || !target || typeof fn !== "function") return null;
+  if (!target.proxy) target.proxy = buildSharedServerCharacterProxy(state, target);
+  if (!target.proxy?.player) return null;
+  const prevPlayer = state.player;
+  const prevInv = state.inv;
+  const prevCharacter = state.character;
+  state.player = target.proxy.player;
+  state.inv = target.proxy.inv;
+  state.character = target.proxy.character;
+  try {
+    return fn();
+  } finally {
+    target.x = Math.floor(Number(state.player?.x ?? target.x ?? 0));
+    target.y = Math.floor(Number(state.player?.y ?? target.y ?? 0));
+    target.z = Math.floor(Number(state.player?.z ?? target.z ?? 0));
+    target.hp = Math.max(0, Math.floor(Number(state.player?.hp ?? target.hp ?? 0) || 0));
+    target.maxHp = Math.max(1, Math.floor(Number(state.player?.maxHp ?? target.maxHp ?? 1) || 1));
+    target.dead = !!state.player?.dead || target.hp <= 0;
+    state.player = prevPlayer;
+    state.inv = prevInv;
+    state.character = prevCharacter;
+  }
+}
+
+function exportSharedServerCharacterSnapshot(target = null) {
+  if (!target?.proxy?.player || !target?.proxy?.character) return null;
+  const snapshot = exportCharacterSnapshot({
+    player: target.proxy.player,
+    inv: target.proxy.inv ?? [],
+    character: target.proxy.character,
+    sharedDungeonId: target.dungeonInstanceId,
+    world: { seedStr: target.dungeonInstanceId || "shared" },
+  });
+  snapshot.dungeonInstanceId = String(target.dungeonInstanceId ?? "").trim();
+  snapshot.position = {
+    x: Math.floor(Number(target.proxy.player.x ?? target.x ?? 0)),
+    y: Math.floor(Number(target.proxy.player.y ?? target.y ?? 0)),
+    depth: Math.floor(Number(target.proxy.player.z ?? target.z ?? 0)),
+  };
+  snapshot.player.dead = !!target.proxy.player.dead;
+  snapshot.player.effects = ensureArray(target.proxy.player.effects).map((effect) => (effect && typeof effect === "object" ? { ...effect } : null)).filter(Boolean);
+  snapshot.player.hp = Math.max(0, Math.floor(Number(target.proxy.player.hp ?? 0) || 0));
+  snapshot.player.maxHp = Math.max(1, Math.floor(Number(target.proxy.player.maxHp ?? 1) || 1));
+  return snapshot;
+}
+
+function advanceSharedServerDungeonOnState(state, characterEntries = [], options = null) {
+  if (!state || typeof state !== "object") {
+    return { ok: false, advancedTicks: 0, characters: [] };
+  }
+  const opts = (options && typeof options === "object") ? options : {};
+  const live = ensureLiveSimulationState(state);
+  live.tickMs = normalizeLocalDungeonTickMs(opts.tickMs ?? live.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS, LIVE_SIM_DEFAULT_TICK_MS);
+  const nowMs = Math.max(0, Math.floor(Number(opts.nowMs ?? Date.now()) || Date.now()));
+  const tickMs = Math.max(10, Math.floor(Number(live.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS));
+  const lastStepAtMs = Math.max(0, Math.min(nowMs, Math.floor(Number(live.lastStepAtMs ?? 0) || 0)));
+  const elapsedMs = Math.max(0, nowMs - lastStepAtMs);
+  const dueTicksRaw = Math.max(0, Math.floor(elapsedMs / tickMs));
+  const maxTicks = Math.max(1, Math.min(24, Math.floor(Number(opts.maxTicks ?? 12) || 12)));
+  const dueTicks = Math.max(0, Math.min(maxTicks, dueTicksRaw));
+  const dungeonId = sharedDungeonInstanceIdForState(state);
+  const targets = (Array.isArray(characterEntries) ? characterEntries : [])
+    .map((entry) => normalizeSharedServerCharacterRecord(entry, dungeonId))
+    .filter((entry) => entry?.characterId)
+    .filter((entry) => !dungeonId || !entry.dungeonInstanceId || entry.dungeonInstanceId === dungeonId)
+    .filter((entry) => Number.isFinite(Number(entry.x)) && Number.isFinite(Number(entry.y)) && Number.isFinite(Number(entry.z)));
+  for (const target of targets) {
+    target.proxy = buildSharedServerCharacterProxy(state, target);
+  }
+  syncSharedServerCharacterActors(state, targets);
+  if (dueTicks <= 0) {
+    live.lastStepAtMs = nowMs;
+    return { ok: true, advancedTicks: 0, characters: targets };
+  }
+  for (let i = 0; i < dueTicks; i += 1) {
+    live.tick = Math.max(0, Math.floor(Number(live.tick ?? 0) || 0)) + 1;
+    for (const entity of state.entities?.values?.() ?? []) {
+      if (!entity || typeof entity !== "object") continue;
+      if (entity.kind === "actor" && entity.remoteCharacterId) continue;
+      if (entity.kind !== "monster" && entity.kind !== "trap") continue;
+      tickDownLiveCooldownsForActor(entity, entity.kind);
+      const actorLive = ensureLiveActorState(entity, entity.kind);
+      if (
+        actorLive.action.actionState === "recovery"
+        && live.tick >= Math.max(0, Math.floor(Number(actorLive.action.actionRecoveryEndTick ?? 0) || 0))
+      ) {
+        actorLive.action.actionState = "idle";
+        actorLive.action.currentActionType = "";
+        actorLive.action.currentActionId = "";
+        actorLive.action.targetId = "";
+        actorLive.action.targetPos = null;
+      }
+    }
+    for (const target of targets) {
+      if (!target.proxy?.player) continue;
+      tickDownLiveCooldownsForActor(target.proxy.player, "player");
+      const actorLive = ensureLiveActorState(target.proxy.player, "player");
+      if (
+        actorLive.action.actionState === "recovery"
+        && live.tick >= Math.max(0, Math.floor(Number(actorLive.action.actionRecoveryEndTick ?? 0) || 0))
+      ) {
+        actorLive.action.actionState = "idle";
+        actorLive.action.currentActionType = "";
+        actorLive.action.currentActionId = "";
+        actorLive.action.targetId = "";
+        actorLive.action.targetPos = null;
+      }
+    }
+    advanceLiveTrapTimingOnTick(state, { currentTick: live.tick });
+    syncSharedServerCharacterActors(state, targets);
+    for (const monster of Array.from(state.entities?.values?.() ?? [])) {
+      if (!monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) continue;
+      const target = chooseSharedServerMonsterTarget(state, monster, targets, { currentTick: live.tick });
+      if (!target) continue;
+      withSharedServerCharacterContext(state, target, () => {
+        const spec = monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
+        const monsterLive = ensureLiveActorState(monster, "monster");
+        if (monsterLive.action.currentActionType === "ABILITY" && monsterLive.action.actionState === "windup" && live.tick >= monsterLive.action.actionResolveTick) {
+          resolveLiveMonsterAbilityAction(state, monster, spec, { currentTick: live.tick });
+          return;
+        }
+        if (monsterLive.action.currentActionType === "ATTACK" && monsterLive.action.actionState === "windup" && live.tick >= monsterLive.action.actionResolveTick) {
+          resolveLiveMonsterBasicAttack(state, monster, spec, { currentTick: live.tick });
+          return;
+        }
+        if (monsterLive.action.actionState !== "idle") return;
+        const abilityDescriptor = chooseLiveMonsterAbilityAction(state, monster, spec, { currentTick: live.tick });
+        if (abilityDescriptor && startLiveMonsterAbilityAction(state, monster, spec, abilityDescriptor, { currentTick: live.tick })) {
+          return;
+        }
+        if (monsterCanHitPlayerNow(state, monster, spec).canHit) {
+          startLiveMonsterBasicAttack(state, monster, spec, { currentTick: live.tick });
+        }
+      });
+    }
+    syncSharedServerCharacterActors(state, targets);
+    for (const monster of Array.from(state.entities?.values?.() ?? [])) {
+      if (!monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) continue;
+      const target = chooseSharedServerMonsterTarget(state, monster, targets, { currentTick: live.tick });
+      if (!target) continue;
+      withSharedServerCharacterContext(state, target, () => {
+        advanceSingleLiveMonsterMovement(state, monster, { currentTick: live.tick });
+      });
+    }
+    if ((live.tick % LIVE_SIM_TICKS_PER_LEGACY_TURN) === 0) {
+      state.turn = Math.max(0, Math.floor(Number(state.turn ?? 0) || 0)) + 1;
+    }
+  }
+  live.lastStepAtMs = nowMs;
+  syncSharedServerCharacterActors(state, targets);
+  return {
+    ok: true,
+    advancedTicks: dueTicks,
+    characters: targets,
+  };
+}
+
+function headlessAdvanceSharedDungeonState(sharedPayload = "", characterEntries = [], options = null) {
+  const payload = String(sharedPayload ?? "").trim();
+  const state = payload ? importSave(payload) : null;
+  if (!state) return null;
+  normalizeLoadedLiveTickState(state);
+  const advanced = advanceSharedServerDungeonOnState(state, characterEntries, options);
+  clearRemoteCharacterActors(state);
+  const characters = (Array.isArray(advanced?.characters) ? advanced.characters : [])
+    .map((target) => {
+      const snapshot = exportSharedServerCharacterSnapshot(target);
+      if (!snapshot || !target?.characterId) return null;
+      return {
+        characterId: target.characterId,
+        userKey: String(target.userKey ?? "").trim(),
+        payload: encodeCharacterSnapshotPayload(snapshot),
+        dungeonInstanceId: String(snapshot.dungeonInstanceId ?? "").trim(),
+        x: Number.isFinite(Number(snapshot?.position?.x)) ? Math.floor(Number(snapshot.position.x)) : null,
+        y: Number.isFinite(Number(snapshot?.position?.y)) ? Math.floor(Number(snapshot.position.y)) : null,
+        z: Number.isFinite(Number(snapshot?.position?.depth)) ? Math.floor(Number(snapshot.position.depth)) : null,
+        hp: Math.max(0, Math.floor(Number(snapshot?.player?.hp ?? 0) || 0)),
+        maxHp: Math.max(1, Math.floor(Number(snapshot?.player?.maxHp ?? 1) || 1)),
+        dead: !!snapshot?.player?.dead,
+      };
+    })
+    .filter(Boolean);
+  return {
+    payload: exportSave(state),
+    characters,
+    advancedTicks: Math.max(0, Math.floor(Number(advanced?.advancedTicks ?? 0) || 0)),
+    tickMs: Math.max(10, Math.floor(Number(state?.live?.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS)),
   };
 }
 
@@ -28453,6 +28935,7 @@ export {
   executeAuthoritativeCommandOnState,
   exportCharacterSnapshot,
   exportSave,
+  headlessAdvanceSharedDungeonState,
   applyHeadlessMonsterEditorPayload,
   headlessBootstrapState,
   headlessExecuteCommandOnState,

@@ -447,6 +447,16 @@ async function handleOperation(raw = "") {
     return { ok: true, snapshot };
   }
 
+  if (operation === "shared_dungeon_step") {
+    const result = engine.headlessAdvanceSharedDungeonState(
+      String(input.sharedPayload ?? input.worldPayload ?? ""),
+      Array.isArray(input.characterEntries) ? input.characterEntries : [],
+      input.options ?? {}
+    );
+    if (!result) return fail("Could not advance shared dungeon state.");
+    return { ok: true, result };
+  }
+
   if (operation === "command") {
     const opStartMs = Date.now();
     const worldPayload = String(input.worldPayload ?? "");
