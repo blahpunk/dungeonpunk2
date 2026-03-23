@@ -1371,6 +1371,46 @@ function safe_file_token(string $value): string
   return hash('sha256', strtolower(trim($value)));
 }
 
+function shared_savegames_guest_identity(): string
+{
+  $guestSessionId = trim((string) session_id());
+  if ($guestSessionId === '') {
+    $sessionCookieName = session_name();
+    if ($sessionCookieName !== '') {
+      $guestSessionId = trim((string) ($_COOKIE[$sessionCookieName] ?? ''));
+    }
+  }
+  if ($guestSessionId === '') {
+    $guestSessionId = 'stateless:' . substr(hash('sha256', implode('|', [
+      (string) ($_SERVER['REMOTE_ADDR'] ?? ''),
+      (string) ($_SERVER['HTTP_USER_AGENT'] ?? ''),
+    ])), 0, 48);
+  }
+  return '__guest__:' . substr(hash('sha256', $guestSessionId), 0, 48);
+}
+
+function savegames_shared_guest_action_allowed(string $method, array $query, ?array $body): bool
+{
+  if ($method === 'GET') {
+    if (!empty($query['shared_run'])) {
+      return true;
+    }
+    $characterId = normalize_character_profile_id((string) ($query['character'] ?? ''));
+    return $characterId !== '';
+  }
+  if ($method !== 'POST' || !is_array($body)) {
+    return false;
+  }
+  $action = trim((string) ($body['action'] ?? ''));
+  return in_array($action, [
+    'shared_run_sync',
+    'character_session_open',
+    'character_session_touch',
+    'character_session_close',
+    'character_sync',
+  ], true);
+}
+
 function user_save_file_path(string $email): string
 {
   return save_storage_root() . DIRECTORY_SEPARATOR . safe_file_token($email) . '.json';
@@ -4205,24 +4245,28 @@ if ($apiMode === 'savegames') {
   if ($method === 'POST' && !app_rate_limit('api_savegames_post', 90, 60)) {
     json_response(['ok' => false, 'error' => 'Too many save writes. Please retry shortly.'], 429);
   }
-  if ($user === null || $userEmail === '') {
+  $requestBody = $method === 'POST' ? request_json_body() : null;
+  $guestSharedAccess = ($user === null || $userEmail === '')
+    && savegames_shared_guest_action_allowed($method, $_GET, $requestBody);
+  if (($user === null || $userEmail === '') && !$guestSharedAccess) {
     json_response(['ok' => false, 'error' => 'Please log in to manage save games.'], 401);
   }
+  $savegamesActorEmail = $userEmail !== '' ? $userEmail : shared_savegames_guest_identity();
 
   $saveSecret = save_signing_secret();
   if ($saveSecret === '') {
     json_response(['ok' => false, 'error' => 'Server save signing key is not configured.'], 500);
   }
 
-  $entries = load_user_saves($userEmail, $saveSecret);
-  $characterStates = load_user_character_states($userEmail, $saveSecret);
-  $itemAuthorityStates = load_user_item_authority_states($userEmail, $saveSecret);
-  $sharedRun = load_user_shared_run($userEmail, $saveSecret);
+  $entries = load_user_saves($savegamesActorEmail, $saveSecret);
+  $characterStates = load_user_character_states($savegamesActorEmail, $saveSecret);
+  $itemAuthorityStates = load_user_item_authority_states($savegamesActorEmail, $saveSecret);
+  $sharedRun = load_user_shared_run($savegamesActorEmail, $saveSecret);
   $runtimeSettings = shared_runtime_settings_load();
 
   if ($method === 'GET') {
     $browserInstanceIdQuery = authoritative_normalize_browser_instance_id((string) ($_GET['browser_instance_id'] ?? ''));
-    $characterLockAudit = authoritative_character_lock_audit($userEmail);
+    $characterLockAudit = authoritative_character_lock_audit($savegamesActorEmail);
     $sharedRunRequested = !empty($_GET['shared_run']);
     $currentCharacterIdQuery = normalize_character_profile_id((string) ($_GET['current_character_id'] ?? ''));
     $itemCharacterIdQuery = normalize_character_profile_id((string) ($_GET['item_character'] ?? ''));
@@ -4268,14 +4312,14 @@ if ($apiMode === 'savegames') {
     }
 
     if ($sharedRunRequested) {
-      $sharedLocked = with_global_shared_run_lock(function () use ($userEmail, $saveSecret, $runtimeSettings, $currentCharacterIdQuery, $characterLockAudit) {
-        $lockedSharedRun = load_user_shared_run($userEmail, $saveSecret);
+      $sharedLocked = with_global_shared_run_lock(function () use ($savegamesActorEmail, $saveSecret, $runtimeSettings, $currentCharacterIdQuery, $characterLockAudit) {
+        $lockedSharedRun = load_user_shared_run($savegamesActorEmail, $saveSecret);
         $sharedAdvanced = advance_and_persist_shared_run($lockedSharedRun, $saveSecret, $runtimeSettings);
         $nextSharedRun = $sharedAdvanced['shared_run'];
         if (empty($sharedAdvanced['character_persist_ok'])) {
           json_response(['ok' => false, 'error' => 'Could not persist shared character state.'], 500);
         }
-        if (!empty($sharedAdvanced['changed']) && is_array($nextSharedRun) && !persist_user_shared_run($userEmail, $nextSharedRun, $saveSecret)) {
+        if (!empty($sharedAdvanced['changed']) && is_array($nextSharedRun) && !persist_user_shared_run($savegamesActorEmail, $nextSharedRun, $saveSecret)) {
           json_response(['ok' => false, 'error' => 'Could not persist shared dungeon state.'], 500);
         }
         $globalLockAuditInner = function_exists('authoritative_character_lock_audit_all')
@@ -4340,7 +4384,7 @@ if ($apiMode === 'savegames') {
     json_response(['ok' => false, 'error' => 'CSRF validation failed.'], 403);
   }
 
-  $body = request_json_body();
+  $body = $requestBody;
   if ($body === null) {
     json_response(['ok' => false, 'error' => 'Invalid JSON body.'], 400);
   }
@@ -4376,8 +4420,8 @@ if ($apiMode === 'savegames') {
     if ($characterName === '') {
       $characterName = 'Adventurer';
     }
-    $locked = with_global_shared_run_lock(function () use ($payload, $userEmail, $saveSecret, $characterId, $characterName, $runtimeSettings, $currentCharacterId) {
-      $lockedSharedRun = load_user_shared_run($userEmail, $saveSecret);
+    $locked = with_global_shared_run_lock(function () use ($payload, $savegamesActorEmail, $saveSecret, $characterId, $characterName, $runtimeSettings, $currentCharacterId) {
+      $lockedSharedRun = load_user_shared_run($savegamesActorEmail, $saveSecret);
       $nextPayload = merge_shared_run_world_state($payload, $lockedSharedRun);
       $nextPayload = merge_shared_run_remote_actors($nextPayload, $lockedSharedRun, $characterId);
       $lockedSharedRun = [
@@ -4392,7 +4436,7 @@ if ($apiMode === 'savegames') {
         json_response(['ok' => false, 'error' => 'Could not persist shared character state.'], 500);
       }
       $finalSharedRun = $sharedAdvanced['shared_run'];
-      if (!persist_user_shared_run($userEmail, $finalSharedRun, $saveSecret)) {
+      if (!persist_user_shared_run($savegamesActorEmail, $finalSharedRun, $saveSecret)) {
         json_response(['ok' => false, 'error' => 'Could not persist shared dungeon state.'], 500);
       }
       $globalCharacterStatesInner = is_array($sharedAdvanced['grouped']['by_id'] ?? null)
@@ -4403,7 +4447,7 @@ if ($apiMode === 'savegames') {
         : null;
       $globalLockAuditInner = function_exists('authoritative_character_lock_audit_all')
         ? authoritative_character_lock_audit_all()
-        : authoritative_character_lock_audit($userEmail);
+        : authoritative_character_lock_audit($savegamesActorEmail);
       return [
         'shared_run' => $finalSharedRun,
         'global_character_states' => $globalCharacterStatesInner,
@@ -4420,7 +4464,7 @@ if ($apiMode === 'savegames') {
       : null;
     $globalLockAudit = is_array($locked['global_lock_audit'] ?? null)
       ? $locked['global_lock_audit']
-      : (function_exists('authoritative_character_lock_audit_all') ? authoritative_character_lock_audit_all() : authoritative_character_lock_audit($userEmail));
+      : (function_exists('authoritative_character_lock_audit_all') ? authoritative_character_lock_audit_all() : authoritative_character_lock_audit($savegamesActorEmail));
     json_response([
       'ok' => true,
       'shared_run' => shared_run_public_payload($sharedRun),
@@ -4452,7 +4496,7 @@ if ($apiMode === 'savegames') {
     if ($characterName === '') {
       $characterName = 'Adventurer';
     }
-    $sharedRun = with_global_shared_run_lock(function () use ($payload, $userEmail, $saveSecret, $characterId, $characterName, $dungeonInstanceId) {
+    $sharedRun = with_global_shared_run_lock(function () use ($payload, $savegamesActorEmail, $saveSecret, $characterId, $characterName, $dungeonInstanceId) {
       $nextSharedRun = [
         'payload' => $payload,
         'updated_at' => date('c'),
@@ -4460,7 +4504,7 @@ if ($apiMode === 'savegames') {
         'character_name' => $characterName,
         'sig' => '',
       ];
-      if (!persist_user_shared_run($userEmail, $nextSharedRun, $saveSecret)) {
+      if (!persist_user_shared_run($savegamesActorEmail, $nextSharedRun, $saveSecret)) {
         json_response(['ok' => false, 'error' => 'Could not persist shared dungeon state.'], 500);
       }
       if (!reset_all_character_positions_for_new_dungeon($dungeonInstanceId, $saveSecret)) {
@@ -4481,9 +4525,9 @@ if ($apiMode === 'savegames') {
     if ($characterId === '' || $browserInstanceId === '') {
       json_response(['ok' => false, 'error' => 'Missing character session metadata.'], 400);
     }
-    $existing = authoritative_find_browser_character_session($userEmail, $characterId, $browserInstanceId);
+    $existing = authoritative_find_browser_character_session($savegamesActorEmail, $characterId, $browserInstanceId);
     if (is_array($existing)) {
-      $touched = authoritative_touch_session((string) ($existing['session_id'] ?? ''), $userEmail, $browserInstanceId);
+      $touched = authoritative_touch_session((string) ($existing['session_id'] ?? ''), $savegamesActorEmail, $browserInstanceId);
       json_response([
         'ok' => true,
         'session' => [
@@ -4494,8 +4538,8 @@ if ($apiMode === 'savegames') {
         ],
       ]);
     }
-    authoritative_close_browser_sessions($userEmail, $browserInstanceId);
-    $conflict = authoritative_find_character_session_conflict($userEmail, $characterId, $browserInstanceId);
+    authoritative_close_browser_sessions($savegamesActorEmail, $browserInstanceId);
+    $conflict = authoritative_find_character_session_conflict($savegamesActorEmail, $characterId, $browserInstanceId);
     if (is_array($conflict)) {
       json_response([
         'ok' => false,
@@ -4508,7 +4552,7 @@ if ($apiMode === 'savegames') {
         ],
       ], 409);
     }
-    $session = authoritative_create_session($userEmail, $characterId, 0, $browserInstanceId);
+    $session = authoritative_create_session($savegamesActorEmail, $characterId, 0, $browserInstanceId);
     if (!authoritative_persist_session($session)) {
       json_response(['ok' => false, 'error' => 'Could not persist character session.'], 500);
     }
@@ -4528,10 +4572,10 @@ if ($apiMode === 'savegames') {
     if ($sessionId === '' || $browserInstanceId === '') {
       json_response(['ok' => false, 'error' => 'Missing character session metadata.'], 400);
     }
-    $touched = authoritative_touch_session($sessionId, $userEmail, $browserInstanceId);
+    $touched = authoritative_touch_session($sessionId, $savegamesActorEmail, $browserInstanceId);
     $characterId = normalize_character_profile_id((string) ($touched['characterId'] ?? ''));
     if ($characterId !== '') {
-      authoritative_update_browser_character_presence($userEmail, $characterId, $browserInstanceId, [
+      authoritative_update_browser_character_presence($savegamesActorEmail, $characterId, $browserInstanceId, [
         'name' => trim_save_name((string) ($body['name'] ?? '')),
         'species_id' => (string) ($body['species_id'] ?? ''),
         'class_id' => (string) ($body['class_id'] ?? ''),
@@ -4556,7 +4600,7 @@ if ($apiMode === 'savegames') {
     if ($sessionId === '') {
       json_response(['ok' => false, 'error' => 'Missing character session id.'], 400);
     }
-    authoritative_close_session($sessionId, $userEmail, true, 'character-session-close');
+    authoritative_close_session($sessionId, $savegamesActorEmail, true, 'character-session-close');
     json_response(['ok' => true]);
   }
   if ($action === 'character_sync') {
@@ -4598,7 +4642,7 @@ if ($apiMode === 'savegames') {
       'updated_at' => $updatedAt,
       'sig' => '',
     ];
-    if (!persist_user_character_states($userEmail, $characterStates, $saveSecret)) {
+    if (!persist_user_character_states($savegamesActorEmail, $characterStates, $saveSecret)) {
       json_response(['ok' => false, 'error' => 'Could not persist character state.'], 500);
     }
     $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
@@ -4608,7 +4652,7 @@ if ($apiMode === 'savegames') {
         $position = is_array($snapshot['position'] ?? null) ? $snapshot['position'] : [];
         $player = is_array($snapshot['player'] ?? null) ? $snapshot['player'] : [];
         $character = is_array($snapshot['character'] ?? null) ? $snapshot['character'] : [];
-        authoritative_update_browser_character_presence($userEmail, $characterId, $browserInstanceId, [
+        authoritative_update_browser_character_presence($savegamesActorEmail, $characterId, $browserInstanceId, [
           'name' => $characterName,
           'species_id' => (string) ($character['speciesId'] ?? $player['speciesId'] ?? ''),
           'class_id' => (string) ($character['classId'] ?? $player['classId'] ?? ''),
@@ -8226,7 +8270,9 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
     <header>
       <div class="title">DungeonPunk!</div>
       <a id="btnHome" class="headerAuthLink" href="https://blahpunk.com/">Home</a>
+      <?php if ($isAdminUser): ?>
       <button id="btnNew">New Dungeon</button>
+      <?php endif; ?>
       <?php if ($isAdminUser): ?>
         <button id="btnFog">Toggle fog</button>
       <?php endif; ?>

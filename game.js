@@ -164,6 +164,7 @@ const DOOR_MUTATION_LOCK_COLOR_IDS = Object.freeze([
 
 const SAVE_KEY = "infinite_dungeon_roguelike_save_v8";
 const SAVE_LOGIN_HANDOFF_KEY = "dungeon25_save_after_login_handoff_v1";
+const SAVE_LOGIN_HANDOFF_PAYLOAD_KEY = "dungeon25_save_after_login_handoff_payload_v1";
 const SAVE_AUTH_STATE_KEY = "infinite_dungeon_save_auth_state_v1";
 const BROWSER_INSTANCE_ID_CLAIM_PREFIX = "d25_browser_instance_claim:";
 const BROWSER_INSTANCE_ID_CLAIM_STALE_MS = 45000;
@@ -9343,10 +9344,26 @@ function normalizeCharacterProfile(profile = null) {
   return { id, name, classId, speciesId, stats, unspentStatPoints, deepestDepth, isDead, createdAt, updatedAt };
 }
 
+function stateHasChosenCharacter(state) {
+  return !!normalizeCharacterProfileId(state?.character?.id ?? "");
+}
+
+function stateRequiresCharacterSelection(state) {
+  return !!(state?.characterSelectionRequired === true || !stateHasChosenCharacter(state));
+}
+
 function ensureCharacterState(state) {
   if (!state || typeof state !== "object") return null;
+  if (state.characterSelectionRequired === true && !stateHasChosenCharacter(state)) {
+    if (state.player && typeof state.player === "object") {
+      state.player.classId = normalizeCharacterClassId(state.player.classId ?? DEFAULT_CHARACTER_CLASS_ID);
+      state.player.speciesId = normalizeCharacterSpeciesId(state.player.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID);
+    }
+    return null;
+  }
   const existing = normalizeCharacterProfile(state.character ?? null);
   state.character = existing;
+  state.characterSelectionRequired = false;
   if (state.player && typeof state.player === "object") {
     state.player.classId = existing.classId;
     state.player.speciesId = existing.speciesId;
@@ -9500,6 +9517,15 @@ function openCharacterSwitchConfirm(currentSlot = null, targetSlot = null) {
 
 function buildGuestCharacterCardMarkup(state) {
   const run = state && typeof state === "object" ? state : game;
+  if (stateRequiresCharacterSelection(run)) {
+    return (
+      `<div class="charSlotVisual"><div class="charSlotSpriteFallback">?</div></div>` +
+      `<div class="charSlotInfo">` +
+        `<div class="charSlotTitle">No Guest Character Selected</div>` +
+        `<div class="charSlotMeta">Choose or create a guest character before importing it into an account.</div>` +
+      `</div>`
+    );
+  }
   const profile = ensureCharacterState(run);
   const classLabel = characterClassDef(profile?.classId ?? "").name;
   const speciesLabel = characterSpeciesDef(profile?.speciesId ?? "").name;
@@ -9742,8 +9768,12 @@ function refreshSaveNameFromLive(force = false) {
 
 function prepareGuestLoginHandoff(state = null) {
   const run = state ?? game;
-  if (run && !isQuickSwitchCharacterActive(run)) {
-    try { localStorage.setItem(SAVE_KEY, exportSave(run)); } catch {}
+  if (run && !isQuickSwitchCharacterActive(run) && !stateRequiresCharacterSelection(run)) {
+    try { localStorage.setItem(SAVE_LOGIN_HANDOFF_PAYLOAD_KEY, exportSave(run)); } catch {}
+  }
+  if (run && stateRequiresCharacterSelection(run)) {
+    clearGuestLoginHandoff();
+    return;
   }
   try {
     localStorage.setItem(SAVE_LOGIN_HANDOFF_KEY, String(Date.now()));
@@ -9827,6 +9857,27 @@ function removeLocalSlot(slotId) {
   return true;
 }
 
+function clearLegacyLocalSlotMigrationSlots() {
+  const idx = readLocalSlotIndex();
+  const slots = Array.isArray(idx?.slots) ? idx.slots : [];
+  const legacyIds = slots
+    .map((slot) => normalizeCharacterSlotId(slot?.id ?? ""))
+    .filter((id) => id.startsWith("legacy_"));
+  if (!legacyIds.length) return false;
+  for (const id of legacyIds) {
+    localSlotStore.removePayload(id);
+  }
+  const nextSlots = slots.filter((slot) => !legacyIds.includes(normalizeCharacterSlotId(slot?.id ?? "")));
+  const currentActiveId = normalizeCharacterSlotId(idx?.activeId ?? "");
+  const nextActive = nextSlots.some((slot) => normalizeCharacterSlotId(slot?.id ?? "") === currentActiveId)
+    ? currentActiveId
+    : (normalizeCharacterSlotId(nextSlots[0]?.id ?? "") || "");
+  writeLocalSlotIndex({ activeId: nextActive, slots: nextSlots });
+  try { localStorage.removeItem(LOCAL_SLOT_BACKUP_MIGRATED_KEY); } catch {}
+  characterUi.activeSaveId = nextActive;
+  return true;
+}
+
 function setActiveCharacterSlotId(slotId) {
   const id = normalizeCharacterSlotId(slotId ?? "");
   if (isAuthenticatedUser) {
@@ -9848,6 +9899,9 @@ function getActiveCharacterSlotId() {
 
 function ensureLocalSlotMigration() {
   if (isAuthenticatedUser) return;
+  let authStateMarker = "";
+  try { authStateMarker = String(localStorage.getItem(SAVE_AUTH_STATE_KEY) ?? "").trim().toLowerCase(); } catch {}
+  if (authStateMarker) return;
   let idx = readLocalSlotIndex();
   if (idx.slots.length > 0) {
     if (!idx.activeId) {
@@ -9879,11 +9933,13 @@ function ensureLocalSlotMigration() {
 
 async function fetchCharacterSlotsFromLocal() {
   ensureLocalSlotMigration();
-  const idx = readLocalSlotIndex();
+  let idx = readLocalSlotIndex();
   const out = [];
+  const validSlotIds = [];
   for (const slotMeta of idx.slots) {
     const payload = readLocalSlotPayload(slotMeta.id);
     const loaded = payload ? importSave(payload) : null;
+    if (loaded && stateRequiresCharacterSelection(loaded)) continue;
     const profile = normalizeCharacterProfile(
       loaded?.character ?? { id: `slot_${slotMeta.id}`, name: slotMeta.name }
     );
@@ -9902,8 +9958,16 @@ async function fetchCharacterSlotsFromLocal() {
       latestSaveId: slotMeta.id,
       hasDungeonPosition: true,
     });
+    validSlotIds.push(String(slotMeta.id ?? ""));
   }
   out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  if (validSlotIds.length !== idx.slots.length) {
+    const nextSlots = (idx.slots ?? []).filter((slot) => validSlotIds.includes(String(slot?.id ?? "")));
+    const nextActive = nextSlots.some((slot) => String(slot?.id ?? "") === String(idx.activeId ?? ""))
+      ? String(idx.activeId ?? "")
+      : String(nextSlots[0]?.id ?? "");
+    idx = writeLocalSlotIndex({ activeId: nextActive, slots: nextSlots });
+  }
   if (!isAuthenticatedUser) characterUi.activeSaveId = idx.activeId || out[0]?.id || "";
   return out;
 }
@@ -10063,7 +10127,7 @@ function decodeCharacterSnapshotPayload(payloadB64 = "") {
 }
 
 async function resolveCharacterSnapshotFromServerState(characterId = "") {
-  if (!isAuthenticatedUser) return null;
+  if (!canUseSharedDungeonSync()) return null;
   const id = String(characterId ?? "").trim();
   if (!id) return null;
   try {
@@ -10213,18 +10277,35 @@ async function persistCharacterSnapshot(snapshot, profile = null) {
   if (!normalizedProfile?.id) return false;
   const payload = encodeCharacterSnapshotPayload(snapshot);
   if (!payload) return false;
-  if (isAuthenticatedUser) {
-    await saveApiRequest("POST", {
-      action: "character_sync",
-      character_id: normalizedProfile.id,
-      name: normalizedProfile.name,
-      payload,
-      browser_instance_id: resolveBrowserInstanceId(),
-    });
-    return true;
-  }
   try {
     localStorage.setItem(characterStatePayloadKey(normalizedProfile.id), payload);
+  } catch {
+    // Keep going; server sync is the canonical shared-dungeon path.
+  }
+  if (!canUseSharedDungeonSync()) return true;
+  await saveApiRequest("POST", {
+    action: "character_sync",
+    character_id: normalizedProfile.id,
+    name: normalizedProfile.name,
+    payload,
+    browser_instance_id: resolveBrowserInstanceId(),
+  });
+  return true;
+}
+
+function shouldSyncCharacterStateToServer(profile = null) {
+  if (!canUseSharedDungeonSync()) return false;
+  const normalizedProfile = normalizeCharacterProfile(profile ?? null);
+  if (!normalizedProfile?.id) return false;
+  if (!isAuthenticatedUser) return true;
+  const activeProfileId = normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId());
+  const profileId = normalizeCharacterProfileId(normalizedProfile.id);
+  return !!(activeProfileId && profileId && activeProfileId === profileId);
+}
+
+function persistCharacterSnapshotLocally(profileId = "", payload = "") {
+  try {
+    localStorage.setItem(characterStatePayloadKey(profileId), payload);
     return true;
   } catch {
     return false;
@@ -10232,6 +10313,15 @@ async function persistCharacterSnapshot(snapshot, profile = null) {
 }
 
 async function syncCharacterStateIfDirty(reason = "") {
+  if (stateRequiresCharacterSelection(game)) {
+    characterSyncRuntime.dirty = false;
+    characterSyncRuntime.reason = "";
+    if (characterSyncRuntime.timer) {
+      clearTimeout(characterSyncRuntime.timer);
+      characterSyncRuntime.timer = 0;
+    }
+    return true;
+  }
   if (isAuthoritativeModeEnabled()) {
     characterSyncRuntime.dirty = false;
     characterSyncRuntime.reason = "";
@@ -10258,11 +10348,8 @@ async function syncCharacterStateIfDirty(reason = "") {
     const snapshot = exportCharacterSnapshot(game);
     const payload = encodeCharacterSnapshotPayload(snapshot);
     if (!payload) return false;
-    if (isAuthenticatedUser) {
-      const activeProfileId = normalizeCharacterProfileIdFromSlotId(getActiveCharacterSlotId());
-      const profileId = normalizeCharacterProfileId(profile.id);
-      // Avoid creating implicit server-side characters before the user chooses/imports one.
-      if (!activeProfileId || !profileId || activeProfileId !== profileId) return false;
+    persistCharacterSnapshotLocally(profile.id, payload);
+    if (shouldSyncCharacterStateToServer(profile)) {
       await saveApiRequest("POST", {
         action: "character_sync",
         character_id: profile.id,
@@ -10270,8 +10357,6 @@ async function syncCharacterStateIfDirty(reason = "") {
         payload,
         browser_instance_id: resolveBrowserInstanceId(),
       });
-    } else {
-      try { localStorage.setItem(characterStatePayloadKey(profile.id), payload); } catch {}
     }
     characterSyncRuntime.dirty = false;
     characterSyncRuntime.reason = "";
@@ -10286,6 +10371,7 @@ async function syncCharacterStateIfDirty(reason = "") {
 
 function markCharacterStateDirty(state, reason = "") {
   if (!state) return;
+  if (stateRequiresCharacterSelection(state)) return;
   if (isAuthoritativeModeEnabled()) return;
   if (isQuickSwitchCharacterActive(state)) return;
   characterSyncRuntime.dirty = true;
@@ -10307,6 +10393,7 @@ function applyCharacterSnapshot(state, snapshot) {
   const snapPlayer = snapshot.player ?? {};
   const profile = normalizeCharacterProfile(snapshot.character ?? null);
   state.character = profile;
+  state.characterSelectionRequired = false;
   clearQuickSwitchCharacterState(state);
 
   p.level = Math.max(1, Math.floor(snapPlayer.level ?? p.level ?? 1));
@@ -10355,12 +10442,17 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
   const silent = opts.silent === true;
   const providedCharacterId = normalizeCharacterProfileId(opts.characterId ?? "");
   const currentId = String(getActiveCharacterSlotId() ?? "");
+  const currentGameCharacterId = normalizeCharacterProfileId(game?.character?.id ?? "");
+  const requestedCharacterId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
   const slotMeta = opts.slotMeta && typeof opts.slotMeta === "object" ? opts.slotMeta : null;
   // In Quick Switch mode we must still reload even if slot id matches,
   // otherwise the temporary test class cannot be reverted.
   if (
     currentId &&
     currentId === id &&
+    requestedCharacterId &&
+    currentGameCharacterId &&
+    requestedCharacterId === currentGameCharacterId &&
     !isQuickSwitchCharacterActive(game) &&
     (!isAuthoritativeModeEnabled() || isAuthoritativeSessionActive())
   ) return true;
@@ -10392,7 +10484,7 @@ async function loadRunFromCharacterSlot(slotId, options = null) {
     }
   }
 
-  if (isAuthenticatedUser) {
+  if (canUseSharedDungeonSync()) {
     const characterOnlyId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
     if (!characterOnlyId) return false;
     const opened = await openCharacterSession(characterOnlyId);
@@ -10506,6 +10598,9 @@ async function switchCharacter(slotId, options = null) {
     }
     return switched;
   }
+  if (canUseSharedDungeonSync()) {
+    return loadRunFromCharacterSlot(slotId, options);
+  }
   return swapCharacterFromSlotIntoCurrentRun(slotId, options);
 }
 
@@ -10586,11 +10681,16 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId, options = null) {
   const opts = (options && typeof options === "object") ? options : {};
   const providedCharacterId = normalizeCharacterProfileId(opts.characterId ?? "");
   const currentId = String(getActiveCharacterSlotId() ?? "");
+  const currentGameCharacterId = normalizeCharacterProfileId(game?.character?.id ?? "");
+  const requestedCharacterId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
   // In Quick Switch mode we must still reload even if slot id matches,
   // otherwise the temporary test class cannot be reverted.
   if (
     currentId &&
     currentId === id &&
+    requestedCharacterId &&
+    currentGameCharacterId &&
+    requestedCharacterId === currentGameCharacterId &&
     !isQuickSwitchCharacterActive(game) &&
     (!isAuthoritativeModeEnabled() || isAuthoritativeSessionActive())
   ) return true;
@@ -10603,7 +10703,7 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId, options = null) {
 
   let loaded = null;
   let loadedCharacterId = "";
-  if (isAuthenticatedUser) {
+  if (canUseSharedDungeonSync()) {
     const characterOnlyId = providedCharacterId || normalizeCharacterProfileIdFromSlotId(id);
     if (characterOnlyId) {
       loadedCharacterId = characterOnlyId;
@@ -10634,7 +10734,7 @@ async function swapCharacterFromSlotIntoCurrentRun(slotId, options = null) {
   placePlayerFromCharacterSnapshot(game, snapshot, {
     entranceMessage: "You enter the dungeon...",
   });
-  if (isAuthenticatedUser) {
+  if (canUseSharedDungeonSync()) {
     const nextSlotId = characterStateSlotId(loadedCharacterId);
     setActiveCharacterSlotId(nextSlotId || id);
   } else {
@@ -10685,7 +10785,7 @@ async function saveApiRequest(method = "GET", body = null, query = "") {
 }
 
 function canUseSharedDungeonSync() {
-  return !!(isAuthenticatedUser && !isAuthoritativeModeEnabled());
+  return !isAuthoritativeModeEnabled();
 }
 
 function activeSharedDungeonCharacterId() {
@@ -10837,8 +10937,15 @@ function syncRemoteCharacterActors(state, sharedData = null) {
   const activeLocks = Array.isArray(sharedData?.active_character_locks) ? sharedData.active_character_locks : [];
   const activeStates = Array.isArray(sharedData?.active_character_states) ? sharedData.active_character_states : [];
   const currentCharacterId = activeSharedDungeonCharacterId();
+  const currentBrowserInstanceId = String(resolveBrowserInstanceId() ?? "").trim().toLowerCase();
   const activeCharacterIds = new Set(
     activeLocks
+      .map((entry) => normalizeCharacterProfileId(entry?.character_id ?? ""))
+      .filter(Boolean)
+  );
+  const sameBrowserCharacterIds = new Set(
+    activeLocks
+      .filter((entry) => String(entry?.browser_instance_id ?? "").trim().toLowerCase() === currentBrowserInstanceId)
       .map((entry) => normalizeCharacterProfileId(entry?.character_id ?? ""))
       .filter(Boolean)
   );
@@ -10847,7 +10954,12 @@ function syncRemoteCharacterActors(state, sharedData = null) {
     const remoteId = normalizeCharacterProfileId(ent.remoteCharacterId);
     const lastSeenAt = Number(remoteCharacterVisibilityRuntime.lastSeenAtByCharacterId.get(remoteId) ?? 0) || 0;
     const missingTooLong = (nowMs - lastSeenAt) > REMOTE_CHARACTER_STALE_GRACE_MS;
-    if (!remoteId || remoteId === currentCharacterId || (!activeCharacterIds.has(remoteId) && missingTooLong)) {
+    if (
+      !remoteId
+      || remoteId === currentCharacterId
+      || sameBrowserCharacterIds.has(remoteId)
+      || (!activeCharacterIds.has(remoteId) && missingTooLong)
+    ) {
       state.entities.delete(id);
       if (state.dynamic instanceof Map) state.dynamic.delete(id);
       if (state.entityOverrides instanceof Map) state.entityOverrides.delete(id);
@@ -10855,10 +10967,14 @@ function syncRemoteCharacterActors(state, sharedData = null) {
     }
   }
   removeSharedDungeonActorForCharacter(state, currentCharacterId);
+  for (const remoteId of sameBrowserCharacterIds.values()) {
+    removeSharedDungeonActorForCharacter(state, remoteId);
+    remoteCharacterVisibilityRuntime.lastSeenAtByCharacterId.delete(remoteId);
+  }
   const currentDungeonId = sharedDungeonInstanceIdForState(state);
   for (const entry of activeStates) {
     const remoteId = normalizeCharacterProfileId(entry?.character_id ?? "");
-    if (!remoteId || remoteId === currentCharacterId || !activeCharacterIds.has(remoteId)) continue;
+    if (!remoteId || remoteId === currentCharacterId || sameBrowserCharacterIds.has(remoteId) || !activeCharacterIds.has(remoteId)) continue;
     const dungeonId = String(entry?.dungeon_instance_id ?? "").trim();
     if (currentDungeonId && dungeonId && dungeonId !== currentDungeonId) continue;
     const x = Math.floor(Number(entry?.x ?? NaN));
@@ -10904,11 +11020,14 @@ function buildRunForCharacterSnapshot(snapshot, options = null) {
     nextState = makeNewGame(randomSeedString(), { carryover: buildCarryoverFromCharacterSnapshot(snapshot) });
   }
   if (!nextState) return null;
+  clearRemoteCharacterActors(nextState);
   const snapshotDungeonId = String(snapshot?.dungeonInstanceId ?? "").trim();
   const stateDungeonId = sharedDungeonInstanceIdForState(nextState);
   const shouldForceEntrance = opts.forceEntrance === true || (!!stateDungeonId && !!snapshotDungeonId && snapshotDungeonId !== stateDungeonId);
   if (!applyCharacterSnapshot(nextState, snapshot)) return null;
+  nextState.characterSelectionRequired = false;
   nextState.sharedDungeonId = stateDungeonId || snapshotDungeonId || sharedDungeonInstanceIdForState(nextState);
+  clearRemoteCharacterActors(nextState);
   removeSharedDungeonActorForCharacter(nextState, normalizeCharacterProfileId(snapshot?.character?.id ?? ""));
   nextState.log = [];
   if (shouldForceEntrance) {
@@ -11129,7 +11248,7 @@ function clearCharacterSessionRuntime() {
 }
 
 async function touchCharacterSession(reason = "interval") {
-  if (!isAuthenticatedUser) return false;
+  if (!canUseSharedDungeonSync()) return false;
   const sessionId = String(characterSessionRuntime.sessionId ?? "").trim();
   if (!sessionId || characterSessionRuntime.touchInFlight) return false;
   characterSessionRuntime.touchInFlight = true;
@@ -11164,16 +11283,32 @@ async function touchCharacterSession(reason = "interval") {
 
 function restartCharacterSessionTouchLoop() {
   stopCharacterSessionTouchLoop();
-  if (!isAuthenticatedUser || !String(characterSessionRuntime.sessionId ?? "").trim()) return;
+  if (!canUseSharedDungeonSync() || !String(characterSessionRuntime.sessionId ?? "").trim()) return;
   characterSessionRuntime.touchTimer = setInterval(() => {
     void touchCharacterSession("interval");
   }, CHARACTER_SESSION_TOUCH_INTERVAL_MS);
 }
 
 async function openCharacterSession(characterId = "") {
-  if (!isAuthenticatedUser) return true;
+  if (!canUseSharedDungeonSync()) return true;
   const normalizedCharacterId = normalizeCharacterProfileId(characterId);
   if (!normalizedCharacterId) return false;
+  const priorSessionId = String(characterSessionRuntime.sessionId ?? "").trim();
+  const priorCharacterId = normalizeCharacterProfileId(characterSessionRuntime.characterId ?? "");
+  if (priorSessionId && priorCharacterId && priorCharacterId !== normalizedCharacterId) {
+    stopCharacterSessionTouchLoop();
+    characterSessionRuntime.touchInFlight = false;
+    characterSessionRuntime.lastTouchAt = 0;
+    try {
+      await saveApiRequest("POST", {
+        action: "character_session_close",
+        session_id: priorSessionId,
+        reason: "switch-character",
+      });
+    } catch {}
+    characterSessionRuntime.sessionId = "";
+    characterSessionRuntime.characterId = "";
+  }
   const data = await saveApiRequest("POST", {
     action: "character_session_open",
     character_id: normalizedCharacterId,
@@ -11189,7 +11324,7 @@ async function openCharacterSession(characterId = "") {
 async function closeCharacterSession(reason = "close") {
   const sessionId = String(characterSessionRuntime.sessionId ?? "").trim();
   clearCharacterSessionRuntime();
-  if (!isAuthenticatedUser || !sessionId) return false;
+  if (!canUseSharedDungeonSync() || !sessionId) return false;
   try {
     const payload = {
       action: "character_session_close",
@@ -11688,7 +11823,7 @@ function chooseNewerCharacterSaveEntry(current = null, candidate = null) {
 }
 
 async function resolveLatestCharacterSnapshotFromServer(characterId = "") {
-  if (!isAuthenticatedUser) return null;
+  if (!canUseSharedDungeonSync()) return null;
   const targetId = String(characterId ?? "").trim();
   if (!targetId) return null;
   return resolveCharacterSnapshotFromServerState(targetId);
@@ -11723,7 +11858,7 @@ async function resolveLatestCharacterSnapshotFromLocal(characterId = "") {
 }
 
 async function resolveLatestCharacterSnapshot(characterId = "") {
-  if (isAuthenticatedUser) return resolveLatestCharacterSnapshotFromServer(characterId);
+  if (canUseSharedDungeonSync()) return resolveLatestCharacterSnapshotFromServer(characterId);
   return resolveLatestCharacterSnapshotFromLocal(characterId);
 }
 
@@ -12439,6 +12574,15 @@ async function handleCharacterOverlayPrimary() {
     const activeExists = !!(activeId && characterUi.slots.some((slot) => slot.id === activeId));
     characterUi.selectedSaveId = activeExists ? activeId : (characterUi.slots[0]?.id || "");
     if (!activeExists && characterUi.selectedSaveId) setActiveCharacterSlotId(characterUi.selectedSaveId);
+    if (characterUi.selectedSaveId) {
+      const slotMeta = characterUi.slots.find((slot) => slot.id === characterUi.selectedSaveId) ?? null;
+      await loadRunFromCharacterSlot(characterUi.selectedSaveId, {
+        forceEntrance: false,
+        characterId: profile.id,
+        slotMeta,
+        silent: true,
+      });
+    }
   } else {
     characterUi.slots = [];
     characterUi.selectedSaveId = "";
@@ -12815,6 +12959,20 @@ function clearPendingSaveAfterLoginHandoff() {
   try { localStorage.removeItem(SAVE_LOGIN_HANDOFF_KEY); } catch {}
 }
 
+function readPendingSaveAfterLoginHandoffPayload() {
+  if (!isAuthenticatedUser) return "";
+  try {
+    return String(localStorage.getItem(SAVE_LOGIN_HANDOFF_PAYLOAD_KEY) ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function clearGuestLoginHandoff() {
+  clearPendingSaveAfterLoginHandoff();
+  try { localStorage.removeItem(SAVE_LOGIN_HANDOFF_PAYLOAD_KEY); } catch {}
+}
+
 function saveNameLooksLikeAutosave(name = "") {
   return String(name ?? "").trim().toLowerCase().startsWith("autosave");
 }
@@ -12973,10 +13131,12 @@ async function loadLatestAutosaveForRespawn() {
 }
 
 async function importGuestCharacterFromCurrentRun(options = null) {
-  if (!isAuthenticatedUser || !game) return false;
+  if (!isAuthenticatedUser) return false;
   const opts = (options && typeof options === "object") ? options : {};
-  const snapshot = exportCharacterSnapshot(game);
-  const profile = normalizeCharacterProfile(snapshot?.character ?? game.character ?? null);
+  const sourceState = opts.sourceState ?? game;
+  if (!sourceState) return false;
+  const snapshot = exportCharacterSnapshot(sourceState);
+  const profile = normalizeCharacterProfile(snapshot?.character ?? sourceState.character ?? null);
   snapshot.character = profile;
   const payload = encodeCharacterSnapshotPayload(snapshot);
   if (!payload) return false;
@@ -12999,6 +13159,9 @@ async function importGuestCharacterFromCurrentRun(options = null) {
   }
 
   const importedExists = !!(importedSlotId && characterUi.slots.some((slot) => slot.id === importedSlotId));
+  const importedSlotMeta = importedExists
+    ? (characterUi.slots.find((slot) => slot.id === importedSlotId) ?? null)
+    : null;
   characterUi.selectedSaveId = importedExists
     ? importedSlotId
     : (characterUi.slots[0]?.id || importedSlotId || "");
@@ -13011,9 +13174,18 @@ async function importGuestCharacterFromCurrentRun(options = null) {
     requiresCharacterCreation = false;
   }
   setCharacterOverlayStatus("");
-  clearPendingSaveAfterLoginHandoff();
-  markCharacterStateDirty(game, "import-guest-character");
-  void syncCharacterStateIfDirty("import-guest-character");
+  clearGuestLoginHandoff();
+  if (importedExists && importedSlotMeta) {
+    await loadRunFromCharacterSlot(importedSlotId, {
+      forceEntrance: false,
+      characterId: profile.id,
+      slotMeta: importedSlotMeta,
+      silent: true,
+    });
+  } else {
+    markCharacterStateDirty(game, "import-guest-character");
+    void syncCharacterStateIfDirty("import-guest-character");
+  }
   if (opts.closeOverlay !== false && isCharacterOverlayOpen()) {
     setCharacterOverlayOpen(false);
   } else if (isCharacterOverlayOpen()) {
@@ -13025,11 +13197,42 @@ async function importGuestCharacterFromCurrentRun(options = null) {
 async function maybeHandlePostLoginGuestImport() {
   if (!isAuthenticatedUser || !game) return;
   if (!hasPendingSaveAfterLoginHandoff()) return;
-  const shouldImport = await openGuestLoginImportOverlay(game);
-  clearPendingSaveAfterLoginHandoff();
+  const handoffPayload = readPendingSaveAfterLoginHandoffPayload();
+  const handoffState = handoffPayload ? importSave(handoffPayload) : null;
+  if (!handoffState || stateRequiresCharacterSelection(handoffState)) {
+    clearGuestLoginHandoff();
+    return;
+  }
+  const handoffCharacterId = normalizeCharacterProfileId(handoffState?.character?.id ?? "");
+  let accountSlots = [];
+  try {
+    accountSlots = ensureCharacterSlotsList(await fetchCharacterSlotsFromServer());
+  } catch {
+    accountSlots = [];
+  }
+  if (handoffCharacterId) {
+    const existingSlot = accountSlots.find((slot) => normalizeCharacterProfileId(slot?.profile?.id ?? "") === handoffCharacterId) ?? null;
+    if (existingSlot?.id) {
+      clearGuestLoginHandoff();
+      setActiveCharacterSlotId(existingSlot.id);
+      const loaded = await loadRunFromCharacterSlot(existingSlot.id, {
+        forceEntrance: false,
+        characterId: handoffCharacterId,
+        slotMeta: existingSlot,
+      });
+      if (loaded) {
+        requiresCharacterCreation = false;
+        setCharacterOverlayStatus("");
+        if (isCharacterOverlayOpen()) setCharacterOverlayOpen(false);
+      }
+      return;
+    }
+  }
+  const shouldImport = await openGuestLoginImportOverlay(handoffState);
+  clearGuestLoginHandoff();
   try {
     if (shouldImport) {
-      const imported = await importGuestCharacterFromCurrentRun({ closeOverlay: true });
+      const imported = await importGuestCharacterFromCurrentRun({ closeOverlay: true, sourceState: handoffState });
       if (imported) {
         pushLog(game, "Guest character imported. Use Choose Character to switch between your account characters.");
       } else {
@@ -14944,8 +15147,10 @@ function createCharacterRunFromCurrentDungeon(baseState, snapshot) {
 
 function makeNewGame(seedStr = randomSeedString(), options = null) {
   const world = new World(seedStr);
-  const carryover = (options && typeof options === "object") ? options.carryover ?? null : null;
-  const characterProfile = normalizeCharacterProfile(carryover?.character ?? null);
+  const opts = (options && typeof options === "object") ? options : {};
+  const carryover = opts.carryover ?? null;
+  const requireCharacterSelection = opts.requireCharacterSelection === true && !carryover?.character;
+  const characterProfile = requireCharacterSelection ? null : normalizeCharacterProfile(carryover?.character ?? null);
 
   const player = {
     x: 0, y: 0, z: 0,
@@ -14972,8 +15177,8 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     gold: 0,
     equip: { weapon: null, head: null, chest: null, legs: null },
     effects: [],
-    classId: characterProfile.classId,
-    speciesId: characterProfile.speciesId,
+    classId: normalizeCharacterClassId(characterProfile?.classId ?? DEFAULT_CHARACTER_CLASS_ID),
+    speciesId: normalizeCharacterSpeciesId(characterProfile?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID),
     live: normalizeLiveCombatActorState(null, "player"),
   };
 
@@ -14982,6 +15187,7 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
     sharedDungeonId: String(seedStr ?? randomSeedString()),
     player,
     character: characterProfile,
+    characterSelectionRequired: requireCharacterSelection,
     seen: new Set(),
     visible: new Set(),
     log: [],
@@ -15013,17 +15219,17 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
   if (carryover) {
     player.level = Math.max(1, Math.floor(carryover.level ?? player.level));
     player.xp = Math.max(0, Math.floor(carryover.xp ?? player.xp));
-    player.maxHp = Math.max(1, Math.floor(carryover.maxHp ?? maxHpForLevel(player.level, characterProfile)));
+    player.maxHp = Math.max(1, Math.floor(carryover.maxHp ?? maxHpForLevel(player.level, characterProfile ?? normalizeCharacterProfile(null))));
     player.hp = player.maxHp;
     player.gold = Math.max(0, Math.floor(carryover.gold ?? 0));
     player.equip = normalizeEquip(carryover.equip ?? player.equip, {
-      speciesId: characterProfile.speciesId,
-      classId: characterProfile.classId,
+      speciesId: characterProfile?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID,
+      classId: characterProfile?.classId ?? DEFAULT_CHARACTER_CLASS_ID,
     });
     state.inv = normalizeInventoryEntries(carryover.inv ?? [], {
-      speciesId: characterProfile.speciesId,
-      classId: characterProfile.classId,
-      ownerId: characterProfile.id,
+      speciesId: characterProfile?.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID,
+      classId: characterProfile?.classId ?? DEFAULT_CHARACTER_CLASS_ID,
+      ownerId: characterProfile?.id ?? "",
     });
   }
 
@@ -15037,12 +15243,12 @@ function makeNewGame(seedStr = randomSeedString(), options = null) {
   ensureSurfaceLinkTile(state);
   ensureShopState(state);
 
-  ensureCharacterState(state);
+  if (!requireCharacterSelection) ensureCharacterState(state);
   recalcDerivedStats(state);
   ensureLiveSimulationState(state);
   state.analytics = initializeAnalyticsForState(state, null, "new-game");
   if (carryover) pushLog(state, "A fresh dungeon forms around your enduring character.");
-  else pushLog(state, "You enter the dungeon...");
+  else if (!requireCharacterSelection) pushLog(state, "You enter the dungeon...");
   hydrateNearby(state);
   updateAreaRespawnTracking(state, Date.now());
   maybeGrantExplorationXP(state);
@@ -22403,6 +22609,12 @@ async function openSpriteEditorOverlay() {
 
 function draw(state) {
   if (!state || !state.world || !state.player) return;
+  if (stateRequiresCharacterSelection(state)) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    renderAuthoritativeMovementStatusBadge();
+    return;
+  }
   const frameStartMs = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const nowMs = Date.now();
   renderAuthoritativeMovementStatusBadge();
@@ -27427,7 +27639,12 @@ function onKeyUp(e) {
 
 function saveNow(state) {
   if (!state || isQuickSwitchCharacterActive(state)) return;
-  const payload = (isAuthenticatedUser && canUseSharedDungeonSync())
+  if (stateRequiresCharacterSelection(state)) {
+    clearCurrentRunResumeSnapshot();
+    clearSaveDirty();
+    return;
+  }
+  const payload = canUseSharedDungeonSync()
     ? (exportSharedDungeonPayload(state) || exportSave(state))
     : exportSave(state);
   writeCurrentRunResumeSnapshot(payload);
@@ -27437,7 +27654,8 @@ function saveNow(state) {
 
 function saveResumeSnapshot(state) {
   if (!state || isQuickSwitchCharacterActive(state)) return;
-  const payload = (isAuthenticatedUser && canUseSharedDungeonSync())
+  if (stateRequiresCharacterSelection(state)) return;
+  const payload = canUseSharedDungeonSync()
     ? (exportSharedDungeonPayload(state) || exportSave(state))
     : exportSave(state);
   writeCurrentRunResumeSnapshot(payload);
@@ -27449,7 +27667,7 @@ function loadSaveOrNew() {
   if (isAuthoritativeModeEnabled()) {
     try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    const g = makeNewGame();
+    const g = makeNewGame(randomSeedString(), { requireCharacterSelection: true });
     enforceAdminControlPolicy(g);
     return g;
   }
@@ -27468,7 +27686,7 @@ function loadSaveOrNew() {
         }
       }
     } catch {}
-    const g = makeNewGame();
+    const g = makeNewGame(randomSeedString(), { requireCharacterSelection: true });
     normalizeLoadedLiveTickState(g);
     enforceAdminControlPolicy(g);
     return g;
@@ -27477,6 +27695,7 @@ function loadSaveOrNew() {
     const prevAuthState = String(localStorage.getItem(SAVE_AUTH_STATE_KEY) ?? "");
     if (authState === "guest" && prevAuthState !== "guest") {
       clearCurrentRunResumeSnapshot();
+      clearLegacyLocalSlotMigrationSlots();
     }
   } catch {}
   try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
@@ -27496,7 +27715,7 @@ function loadSaveOrNew() {
 
   // Avoid leaking transformed state to any future direct canvas operations.
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  const g = makeNewGame();
+  const g = makeNewGame(randomSeedString(), { requireCharacterSelection: true });
   normalizeLoadedLiveTickState(g);
   enforceAdminControlPolicy(g);
   return g;
@@ -28153,7 +28372,7 @@ function headlessBootstrapState(options = null) {
   const snapshot = characterPayload ? decodeCharacterSnapshotPayload(characterPayload) : null;
   if (!state) {
     if (snapshot) state = makeNewGame(randomSeedString(), { carryover: buildCarryoverFromCharacterSnapshot(snapshot) });
-    else state = makeNewGame();
+    else state = makeNewGame(randomSeedString(), { requireCharacterSelection: true });
   }
   if (!state) return null;
 
@@ -28862,7 +29081,7 @@ if (!HEADLESS_RUNTIME) {
       game = null;
     }
     if (!game || !game.player || !game.world) {
-      game = makeNewGame();
+      game = makeNewGame(randomSeedString(), { requireCharacterSelection: true });
     }
     if (enforceAdminControlPolicy(game)) saveNow(game);
     spriteEditorUi.objects = buildSpriteObjectCatalog();
@@ -29059,7 +29278,7 @@ if (!HEADLESS_RUNTIME) {
       } catch (err) {
         showFatal(err);
         try {
-          game = makeNewGame();
+          game = makeNewGame(randomSeedString(), { requireCharacterSelection: true });
           updateDebugMenuUi(game);
           updateContextActionButton(game);
           updateDeathOverlay(game);
