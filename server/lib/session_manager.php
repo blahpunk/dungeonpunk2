@@ -503,7 +503,8 @@ function authoritative_close_browser_sessions(
 function authoritative_touch_session(
   string $sessionId,
   string $userEmail,
-  string $browserInstanceId = ''
+  string $browserInstanceId = '',
+  array $presence = []
 ): array {
   $session = authoritative_load_session($sessionId, $userEmail);
   if ($session === null) {
@@ -517,6 +518,20 @@ function authoritative_touch_session(
   if ($sessionBrowserId === '' && $incomingBrowserId !== '') {
     $session['browser_instance_id'] = $incomingBrowserId;
   }
+  if ($presence) {
+    $session['presence'] = [
+      'name' => trim((string) ($presence['name'] ?? '')),
+      'species_id' => trim((string) ($presence['species_id'] ?? '')),
+      'class_id' => trim((string) ($presence['class_id'] ?? '')),
+      'dungeon_instance_id' => trim((string) ($presence['dungeon_instance_id'] ?? '')),
+      'x' => array_key_exists('x', $presence) && is_numeric($presence['x']) ? (int) $presence['x'] : null,
+      'y' => array_key_exists('y', $presence) && is_numeric($presence['y']) ? (int) $presence['y'] : null,
+      'z' => array_key_exists('z', $presence) && is_numeric($presence['z']) ? (int) $presence['z'] : null,
+      'hp' => max(0, (int) ($presence['hp'] ?? 0)),
+      'max_hp' => max(1, (int) ($presence['max_hp'] ?? 1)),
+      'updated_at' => date('c'),
+    ];
+  }
   authoritative_clear_pending_close($session);
   if (!authoritative_persist_session($session)) {
     throw new RuntimeException('Could not refresh authoritative session.');
@@ -524,6 +539,7 @@ function authoritative_touch_session(
   return [
     'ok' => true,
     'sessionId' => authoritative_normalize_session_id((string) ($session['session_id'] ?? '')),
+    'characterId' => trim((string) ($session['character_id'] ?? '')),
     'updatedAt' => date('c'),
   ];
 }

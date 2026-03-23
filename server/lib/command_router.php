@@ -41,6 +41,7 @@ function authoritative_persist_canonical_snapshot(
   $nextRecord = [
     'payload' => $payload,
     'active_character_id' => $characterId,
+    'character_name' => $characterName,
     'server_revision' => max(0, (int) ($session['server_revision'] ?? ($runRecord['server_revision'] ?? 0))),
   ];
   if (!authoritative_persist_run_record($userEmail, $nextRecord)) {
@@ -172,7 +173,7 @@ function authoritative_open_session_for_character(
     if (is_array($existingSession)) {
       $existingSessionId = authoritative_normalize_session_id((string) ($existingSession['session_id'] ?? ''));
       if ($existingSessionId !== '') {
-        $loaded = authoritative_load_session_snapshot($userEmail, $existingSessionId);
+        $loaded = authoritative_load_session_snapshot($userEmail, $saveSecret, $existingSessionId);
         $session = $loaded['session'];
         $snapshot = $loaded['snapshot'];
         authoritative_clear_pending_close($session);
@@ -277,24 +278,24 @@ function authoritative_load_session_run_context(
  */
 function authoritative_load_session_snapshot(
   string $userEmail,
+  string $saveSecret,
   string $sessionId
 ): array {
   $context = authoritative_load_session_run_context($userEmail, $sessionId);
   $session = $context['session'];
   $runRecord = $context['run_record'];
-  $snapshotResponse = null;
-  try {
-    $snapshotResponse = authoritative_worker_snapshot('', $sessionId);
-  } catch (RuntimeException $err) {
-    $snapshotResponse = null;
-  }
-  if (!is_array($snapshotResponse)) {
-    $worldPayload = trim((string) ($runRecord['payload'] ?? ''));
-    if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
-      $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
-    }
-    $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionId);
-  }
+  $bootstrapContext = authoritative_bootstrap_context(
+    $userEmail,
+    $saveSecret,
+    normalize_character_profile_id((string) ($session['character_id'] ?? ''))
+  );
+  $snapshotResponse = authoritative_worker_bootstrap(
+    (string) ($bootstrapContext['world_payload'] ?? $runRecord['payload'] ?? ''),
+    (string) ($bootstrapContext['character_payload'] ?? ''),
+    [
+      'session_id' => $sessionId,
+    ]
+  );
   $snapshot = is_array($snapshotResponse['snapshot'] ?? null) ? $snapshotResponse['snapshot'] : null;
   if (!is_array($snapshot)) {
     throw new RuntimeException('Could not build authoritative snapshot.');
@@ -318,7 +319,7 @@ function authoritative_switch_session_character(
   array $options = []
 ): array {
   authoritative_release_php_session_lock();
-  $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
+  $loaded = authoritative_load_session_snapshot($userEmail, $saveSecret, $sessionId);
   $session = $loaded['session'];
   $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
   $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
@@ -393,7 +394,7 @@ function authoritative_start_new_dungeon(
   array $options = []
 ): array {
   authoritative_release_php_session_lock();
-  $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
+  $loaded = authoritative_load_session_snapshot($userEmail, $saveSecret, $sessionId);
   $session = $loaded['session'];
   $runRecord = $loaded['run_record'];
   $snapshot = $loaded['snapshot'];
@@ -453,17 +454,10 @@ function authoritative_handle_command(
   $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
   $sessionBrowserInstanceId = authoritative_normalize_browser_instance_id((string) ($session['browser_instance_id'] ?? ''));
 
-  $snapshotFromCanonicalPayload = function (array $runRecordInput) use ($sessionIdNorm): array {
-    $worldPayload = trim((string) ($runRecordInput['payload'] ?? ''));
-    if ($worldPayload !== '' && function_exists('authoritative_shop_bind_payload_to_shared')) {
-      $worldPayload = authoritative_shop_bind_payload_to_shared($worldPayload);
-    }
-    $snapshotResponse = authoritative_worker_snapshot($worldPayload, $sessionIdNorm);
-    $snapshot = is_array($snapshotResponse['snapshot'] ?? null) ? $snapshotResponse['snapshot'] : null;
-    if (!is_array($snapshot)) {
-      throw new RuntimeException('Could not build authoritative snapshot.');
-    }
-    return $snapshot;
+  $snapshotFromCanonicalPayload = function (array $runRecordInput) use ($userEmail, $saveSecret, $sessionIdNorm): array {
+    unset($runRecordInput);
+    $loadedSnapshot = authoritative_load_session_snapshot($userEmail, $saveSecret, $sessionIdNorm);
+    return $loadedSnapshot['snapshot'];
   };
   if ($sessionCharacterId !== '') {
     $conflict = authoritative_find_character_session_conflict(
@@ -530,9 +524,7 @@ function authoritative_handle_command(
       }
       $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
       $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
-      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord, [
-        'persist_character_state' => false,
-      ]);
+      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord);
     }
     if (!authoritative_persist_session($session)) {
       throw new RuntimeException('Could not persist authoritative command session.');
@@ -627,20 +619,12 @@ function authoritative_poll_movement(
   int $minResponseMs = 8
 ): array {
   authoritative_release_php_session_lock();
-  $loaded = authoritative_load_session_context($userEmail, $sessionId);
+  $loaded = authoritative_load_session_run_context($userEmail, $sessionId);
   $session = $loaded['session'];
+  $runRecord = $loaded['run_record'];
   $sessionIdNorm = authoritative_normalize_session_id((string) ($session['session_id'] ?? ''));
-
-  try {
-    $result = authoritative_worker_poll_movement('', $sessionIdNorm, $timeoutMs, $minResponseMs);
-  } catch (RuntimeException $err) {
-    $runRecord = authoritative_load_run_record($userEmail);
-    if (!is_array($runRecord) || trim((string) ($runRecord['payload'] ?? '')) === '') {
-      throw $err;
-    }
-    $worldPayload = authoritative_bind_run_payload_for_worker((string) ($runRecord['payload'] ?? ''));
-    $result = authoritative_worker_poll_movement($worldPayload, $sessionIdNorm, $timeoutMs, $minResponseMs);
-  }
+  $worldPayload = authoritative_bind_run_payload_for_worker((string) ($runRecord['payload'] ?? ''));
+  $result = authoritative_worker_poll_movement($worldPayload, $sessionIdNorm, $timeoutMs, $minResponseMs);
   $resultTick = is_array($result['tick'] ?? null) ? $result['tick'] : null;
   $resultPerf = is_array($result['perf'] ?? null) ? $result['perf'] : null;
   $resultIntent = is_array($result['intent'] ?? null) ? $result['intent'] : null;
@@ -667,23 +651,11 @@ function authoritative_poll_movement(
   if ($moved) {
     $session['server_revision'] = max(0, (int) ($session['server_revision'] ?? 0)) + 1;
     $session['character_id'] = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));
-    $persistCanonicalState = authoritative_should_persist_canonical_snapshot_checkpoint($session, $snapshot);
-    $persistCharacterState = authoritative_should_persist_character_snapshot_checkpoint($session, $snapshot);
-    if ($persistCanonicalState) {
-      authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
-        'persist_character_state' => $persistCharacterState,
-      ]);
-      authoritative_update_canonical_snapshot_checkpoint($session, $snapshot);
-    }
-    if ($persistCharacterState) {
-      if (!$persistCanonicalState) {
-        authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, [], [
-          'persist_character_state' => true,
-        ]);
-        authoritative_update_canonical_snapshot_checkpoint($session, $snapshot);
-      }
-      authoritative_update_character_snapshot_checkpoint($session, $snapshot);
-    }
+    authoritative_persist_canonical_snapshot($userEmail, $saveSecret, $session, $snapshot, $runRecord, [
+      'persist_character_state' => true,
+    ]);
+    authoritative_update_canonical_snapshot_checkpoint($session, $snapshot);
+    authoritative_update_character_snapshot_checkpoint($session, $snapshot);
     if (!authoritative_persist_session($session)) {
       throw new RuntimeException('Could not persist authoritative movement session.');
     }
@@ -801,7 +773,7 @@ function authoritative_manual_save_current_run(
   bool $autosave = false
 ): array {
   authoritative_release_php_session_lock();
-  $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
+  $loaded = authoritative_load_session_snapshot($userEmail, $saveSecret, $sessionId);
   $session = $loaded['session'];
   $snapshot = $loaded['snapshot'];
   $characterId = normalize_character_profile_id((string) ($snapshot['character']['id'] ?? ($session['character_id'] ?? '')));

@@ -4034,6 +4034,9 @@ if ($apiMode === 'authoritative') {
       ]));
     }
     if ($action === 'new_dungeon') {
+      if (!$isAdminUser) {
+        json_response(['ok' => false, 'error' => 'Admin access required.'], 403);
+      }
       $sessionId = trim((string) ($body['session_id'] ?? ''));
       if ($sessionId === '') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
@@ -4085,7 +4088,17 @@ if ($apiMode === 'authoritative') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
       }
       $browserInstanceId = authoritative_normalize_browser_instance_id((string) ($body['browser_instance_id'] ?? ''));
-      json_response(authoritative_touch_session($sessionId, $userEmail, $browserInstanceId));
+      json_response(authoritative_touch_session($sessionId, $userEmail, $browserInstanceId, [
+        'name' => trim_save_name((string) ($body['name'] ?? '')),
+        'species_id' => (string) ($body['species_id'] ?? ''),
+        'class_id' => (string) ($body['class_id'] ?? ''),
+        'dungeon_instance_id' => (string) ($body['dungeon_instance_id'] ?? ''),
+        'x' => (array_key_exists('x', $body) && is_numeric($body['x'])) ? (int) $body['x'] : null,
+        'y' => (array_key_exists('y', $body) && is_numeric($body['y'])) ? (int) $body['y'] : null,
+        'z' => (array_key_exists('z', $body) && is_numeric($body['z'])) ? (int) $body['z'] : null,
+        'hp' => (array_key_exists('hp', $body) && is_numeric($body['hp'])) ? max(0, (int) $body['hp']) : null,
+        'max_hp' => (array_key_exists('max_hp', $body) && is_numeric($body['max_hp'])) ? max(1, (int) $body['max_hp']) : null,
+      ]));
     }
     if ($action === 'session_lock_audit') {
       $sessionId = trim((string) ($body['session_id'] ?? ''));
@@ -4119,7 +4132,7 @@ if ($apiMode === 'authoritative') {
       if ($sessionId === '') {
         json_response(['ok' => false, 'error' => 'Missing session id.'], 400);
       }
-      $loaded = authoritative_load_session_snapshot($userEmail, $sessionId);
+      $loaded = authoritative_load_session_snapshot($userEmail, $saveSecret, $sessionId);
       json_response(authoritative_build_snapshot_response($loaded['session'], $loaded['snapshot'], [
         'message' => 'Authoritative session resynced.',
       ]));

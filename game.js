@@ -171,8 +171,8 @@ const BROWSER_INSTANCE_ID_CLAIM_REFRESH_MS = 10000;
 const CHARACTER_STATE_SLOT_PREFIX = "charstate:";
 const LOCAL_CHARACTER_STATE_PREFIX = "infinite_dungeon_character_state_v1:";
 const CHARACTER_SYNC_DEBOUNCE_MS = 300;
-const SHARED_DUNGEON_SYNC_INTERVAL_MS = 1000;
-const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 220;
+const SHARED_DUNGEON_SYNC_INTERVAL_MS = 650;
+const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 300;
 const REMOTE_CHARACTER_STALE_GRACE_MS = 5000;
 const XP_SCALE = 100;
 const COMBAT_SCALE = 100;
@@ -1916,7 +1916,7 @@ const authoritativeSessionRuntime = {
 const AUTHORITATIVE_MOVEMENT_POLL_TIMEOUT_MS = 25000;
 const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MS = 35;
 const AUTHORITATIVE_MOVEMENT_POLL_RETRY_MAX_MS = 2000;
-const AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS = 2;
+const AUTHORITATIVE_MOVEMENT_POLL_MIN_RESPONSE_MS = 8;
 const AUTHORITATIVE_MOVEMENT_STREAM_CLIENT_ENABLED = true;
 const AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED = false;
 const authoritativeMovementChannelRuntime = {
@@ -2066,6 +2066,40 @@ function currentLocalVisualTickMs(state = null) {
   return Math.max(10, Math.floor(liveTickMs));
 }
 
+function visualInterpolationDurationMs(distanceTiles = 1, tickMs = 50) {
+  const dist = Math.max(0, Number(distanceTiles) || 0);
+  const stepMs = Math.max(10, Math.floor(Number(tickMs) || 50));
+  const scale = dist <= 1
+    ? 0.82
+    : Math.min(24, 0.75 + (dist * 1.05));
+  return Math.max(18, Math.min(900, Math.round(stepMs * scale)));
+}
+
+function syncEntityVisualTargetsFromState(state = null, options = null) {
+  if (!AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) return;
+  const entities = state?.entities;
+  if (!(entities instanceof Map)) return;
+  const opts = (options && typeof options === "object") ? options : {};
+  const nowMs = Number.isFinite(Number(opts.nowMs)) ? Number(opts.nowMs) : Date.now();
+  const tickMs = currentLocalVisualTickMs(state);
+  const keepIds = new Set(["__player__"]);
+  for (const ent of entities.values()) {
+    if (!ent || typeof ent !== "object") continue;
+    if (ent.kind !== "monster" && ent.kind !== "actor") continue;
+    const id = String(ent.id ?? "").trim();
+    if (!id) continue;
+    const x = Number(ent.x);
+    const y = Number(ent.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    keepIds.add(id);
+    noteEntityVisualTarget(id, Math.floor(x), Math.floor(y), nowMs, tickMs);
+  }
+  if (opts.prune === false) return;
+  for (const id of entityVisualMotionRuntimes.keys()) {
+    if (!keepIds.has(id)) entityVisualMotionRuntimes.delete(id);
+  }
+}
+
 function noteEntityVisualTarget(entityId = "", nextX = 0, nextY = 0, nowMs = Date.now(), tickMs = 50) {
   const id = String(entityId ?? "").trim();
   if (!id || !AUTHORITATIVE_VISUAL_INTERPOLATION_ENABLED) return;
@@ -2092,7 +2126,7 @@ function noteEntityVisualTarget(entityId = "", nextX = 0, nextY = 0, nowMs = Dat
   existing.toX = nx;
   existing.toY = ny;
   existing.startAtMs = Number(nowMs) || Date.now();
-  existing.durationMs = Math.max(18, Math.min(96, Math.round(Number(tickMs) * (dist > 1 ? 0.95 : 0.82))));
+  existing.durationMs = visualInterpolationDurationMs(dist, tickMs);
   existing.initialized = true;
   entityVisualMotionRuntimes.set(id, existing);
 }
@@ -2129,7 +2163,7 @@ function noteAuthoritativeVisualPlayerTarget(nextX = 0, nextY = 0, previousX = n
   authoritativeVisualMotionRuntime.toY = ny;
   authoritativeVisualMotionRuntime.startAtMs = nowMs;
   const targetTickMs = isAuthoritativeSessionActive() ? authoritativeClientTickMs() : 50;
-  authoritativeVisualMotionRuntime.durationMs = Math.max(20, Math.min(96, Math.round(targetTickMs * (dist > 1 ? 0.95 : 0.86))));
+  authoritativeVisualMotionRuntime.durationMs = visualInterpolationDurationMs(dist, targetTickMs);
 }
 
 function browserInstanceClaimKey(id = "") {
@@ -3644,6 +3678,7 @@ function activateLoadedGameState(nextGame, reason = "load", options = null) {
   } else {
     resetAuthoritativeVisualMotion(Number(game.player.x ?? 0), Number(game.player.y ?? 0));
   }
+  syncEntityVisualTargetsFromState(game);
   computeVisibility(game);
   hydrateNearby(game);
   enforceAdminControlPolicy(game);
@@ -4140,7 +4175,22 @@ async function touchAuthoritativeSession(reason = "interval") {
   }
   authoritativeSessionRuntime.touchInFlight = true;
   try {
-    await authoritativeApi.touchSession({ sessionId });
+    const snapshot = game ? exportCharacterSnapshot(game) : null;
+    const position = (snapshot?.position && typeof snapshot.position === "object") ? snapshot.position : {};
+    const snapPlayer = (snapshot?.player && typeof snapshot.player === "object") ? snapshot.player : {};
+    const snapCharacter = (snapshot?.character && typeof snapshot.character === "object") ? snapshot.character : {};
+    await authoritativeApi.touchSession({
+      sessionId,
+      name: String(snapCharacter?.name ?? ""),
+      speciesId: String(snapCharacter?.speciesId ?? snapPlayer?.speciesId ?? ""),
+      classId: String(snapCharacter?.classId ?? snapPlayer?.classId ?? ""),
+      dungeonInstanceId: String(snapshot?.dungeonInstanceId ?? game?.sharedDungeonId ?? game?.world?.seedStr ?? "").trim(),
+      x: Number.isFinite(Number(position?.x)) ? Math.floor(Number(position.x)) : null,
+      y: Number.isFinite(Number(position?.y)) ? Math.floor(Number(position.y)) : null,
+      z: Number.isFinite(Number(position?.depth ?? position?.z)) ? Math.floor(Number(position.depth ?? position.z)) : null,
+      hp: Number.isFinite(Number(snapPlayer?.hp)) ? Math.max(0, Math.floor(Number(snapPlayer.hp))) : null,
+      maxHp: Number.isFinite(Number(snapPlayer?.maxHp)) ? Math.max(1, Math.floor(Number(snapPlayer.maxHp))) : null,
+    });
     authoritativeSessionRuntime.lastTouchAt = Date.now();
     return true;
   } catch {
@@ -4443,6 +4493,7 @@ const characterSyncRuntime = {
   syncing: false,
   lastSyncAt: 0,
 };
+let lastLocalLiveCommandAt = 0;
 const sharedDungeonRuntime = {
   timer: 0,
   syncing: false,
@@ -10863,12 +10914,12 @@ function buildRunForCharacterSnapshot(snapshot, options = null) {
   if (shouldForceEntrance) {
     placePlayerAtDungeonEntrance(nextState, {
       message: "You enter the dungeon...",
-      resetVision: true,
+      resetVision: false,
     });
   } else {
     placePlayerFromCharacterSnapshot(nextState, snapshot, {
       entranceMessage: "You enter the dungeon...",
-      resetVision: true,
+      resetVision: false,
       preserveCurrentOnInvalid: true,
     });
   }
@@ -10932,6 +10983,7 @@ function restartSharedDungeonSyncLoop() {
   }
   if (!canUseSharedDungeonSync()) return;
   sharedDungeonRuntime.timer = setInterval(() => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     void syncSharedDungeonState("interval");
   }, SHARED_DUNGEON_SYNC_INTERVAL_MS);
 }
@@ -10944,9 +10996,20 @@ function stopSharedDungeonSyncLoop() {
 
 async function syncSharedDungeonState(reason = "sync", options = null) {
   if (!canUseSharedDungeonSync() || !game || sharedDungeonRuntime.syncing) return false;
+  if (
+    String(reason ?? "").trim().toLowerCase() === "interval"
+    && typeof document !== "undefined"
+    && document.visibilityState === "hidden"
+  ) {
+    return false;
+  }
   const opts = (options && typeof options === "object") ? options : {};
   const currentCharacterId = activeSharedDungeonCharacterId();
   if (!currentCharacterId) return false;
+  const blockSharedApplyForRecentLocalInput = !!(
+    opts.forceApply !== true
+    && (Date.now() - Math.max(0, Number(lastLocalLiveCommandAt) || 0)) < 700
+  );
   sharedDungeonRuntime.syncing = true;
   try {
     let sharedData = null;
@@ -10970,7 +11033,8 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
       sharedPayload !== exportSharedDungeonPayload(game) &&
       (!saveRuntime.dirty || sharedPullSafeWhileDirty || opts.forceApply === true) &&
       updatedAt !== sharedDungeonRuntime.lastAppliedUpdatedAt &&
-      !blockSharedApplyForCombat
+      !blockSharedApplyForCombat &&
+      !blockSharedApplyForRecentLocalInput
     ) {
       const wasDebugMenuOpen = !!debugMenuEl?.classList.contains("show");
       const priorDebugFlags = normalizeDebugFlags(game?.debug);
@@ -10998,6 +11062,7 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
       });
       if (nextState) {
         game = nextState;
+        syncEntityVisualTargetsFromState(game);
         if (canUseAdminControls()) {
           game.debug = { ...priorDebugFlags };
         }
@@ -11031,6 +11096,7 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
       game.player.x = prevPos.x;
       game.player.y = prevPos.y;
       game.player.z = prevPos.z;
+      syncEntityVisualTargetsFromState(game);
       hydrateNearby(game);
       computeVisibility(game);
       updateContextActionButton(game);
@@ -12710,14 +12776,9 @@ function hasPendingSaveAfterLoginHandoff() {
 }
 
 function currentRunResumeStorage() {
-  if (!(isAuthenticatedUser && !hasPendingSaveAfterLoginHandoff())) {
-    return localStorage;
-  }
-  try {
-    return sessionStorage;
-  } catch {
-    return localStorage;
-  }
+  // Keep resume snapshots durable across tab/window closes so fog-of-war
+  // reveal history survives returning to the game.
+  return localStorage;
 }
 
 function readCurrentRunResumeSnapshot() {
@@ -14876,7 +14937,7 @@ function createCharacterRunFromCurrentDungeon(baseState, snapshot) {
   cloned.log = [];
   placePlayerAtDungeonEntrance(cloned, {
     message: "You enter the dungeon...",
-    resetVision: true,
+    resetVision: false,
   });
   return cloned;
 }
@@ -16359,6 +16420,7 @@ function drawMinimap(state) {
 
       const ik = items.get(keyXYZ(wx, wy, p.z));
       if (ik) {
+        if (!state.visible.has(keyXY(wx, wy))) continue;
         const ent = state.entities.get(ik);
         mctx.fillStyle =
           ent?.type === "shrine" ? "#b8f2e6" :
@@ -16418,6 +16480,7 @@ function drawMinimap(state) {
       const wx = p.x + (mx - MINI_RADIUS);
       const wy = p.y + (my - MINI_RADIUS);
       if (!state.seen.has(keyXYZ(wx, wy, p.z))) continue;
+      if (!state.visible.has(keyXY(wx, wy))) continue;
       const t = state.world.getTile(wx, wy, p.z);
       if (!tileIsLocked(t)) continue;
       const markerColor = tileGlyph(t)?.c ?? "#ffd966";
@@ -23076,6 +23139,7 @@ function runLocalLiveTickCommand(state, command = null, options = null) {
     ...(options && typeof options === "object" ? options : {}),
   });
   if (!result || typeof result !== "object") return false;
+  if (result.ok === true) lastLocalLiveCommandAt = Date.now();
   renderInventory(state);
   renderEquipment(state);
   renderEffects(state);
@@ -25364,7 +25428,10 @@ function tryCommitLiveMonsterMove(state, monster = null, nextPos = null, options
         toX: Number(nx),
         toY: Number(ny),
         startAtMs: nowMs,
-        durationMs: Math.max(18, Math.round(tickMs * 0.82)),
+        durationMs: visualInterpolationDurationMs(
+          Math.abs(Number(nx) - Number(prevX)) + Math.abs(Number(ny) - Number(prevY)),
+          tickMs
+        ),
       });
     } else {
       noteEntityVisualTarget(monster.id, nx, ny, nowMs, tickMs);
@@ -25725,7 +25792,10 @@ function tryStepLivePlayerMovement(state, dir = "", options = null) {
       toX: Number(nx),
       toY: Number(ny),
       startAtMs: nowMs,
-      durationMs: Math.max(18, Math.min(96, Math.round(tickMs * 0.82))),
+      durationMs: visualInterpolationDurationMs(
+        Math.abs(Number(nx) - Number(prevX)) + Math.abs(Number(ny) - Number(prevY)),
+        tickMs
+      ),
     });
   } else {
     noteEntityVisualTarget(playerVisualId, nx, ny, nowMs, tickMs);
@@ -27768,7 +27838,10 @@ function applyAuthoritativeHotDeltaToState(state, rawDelta = null) {
         toX: Number(entry.x),
         toY: Number(entry.y),
         startAtMs: nowMs,
-        durationMs: Math.max(18, Math.round(tickMs * 0.82)),
+        durationMs: visualInterpolationDurationMs(
+          Math.abs(Number(entry.x) - Number(prev.x ?? entry.x)) + Math.abs(Number(entry.y) - Number(prev.y ?? entry.y)),
+          tickMs
+        ),
       });
     }
   }
@@ -28087,12 +28160,12 @@ function headlessBootstrapState(options = null) {
   if (snapshot) {
     applyCharacterSnapshot(state, snapshot);
     if (forceEntrance) {
-      placePlayerAtDungeonEntrance(state, { resetVision: true });
+      placePlayerAtDungeonEntrance(state, { resetVision: false });
     } else {
-      placePlayerFromCharacterSnapshot(state, snapshot, { resetVision: true });
+      placePlayerFromCharacterSnapshot(state, snapshot, { resetVision: false });
     }
   } else if (forceEntrance) {
-    placePlayerAtDungeonEntrance(state, { resetVision: true });
+    placePlayerAtDungeonEntrance(state, { resetVision: false });
   }
 
   coerceLiveTickCombatState(state, liveTickCombat);
@@ -28107,9 +28180,9 @@ function headlessSwitchCharacterPayload(worldPayload = "", characterPayload = ""
   coerceLiveTickCombatState(state, parseLiveTickCombatFlagValue(opts.liveTickCombat));
   applyCharacterSnapshot(state, snapshot);
   if (opts.forceEntrance === true) {
-    placePlayerAtDungeonEntrance(state, { resetVision: true });
+    placePlayerAtDungeonEntrance(state, { resetVision: false });
   } else {
-    placePlayerFromCharacterSnapshot(state, snapshot, { resetVision: true });
+    placePlayerFromCharacterSnapshot(state, snapshot, { resetVision: false });
   }
   return buildHeadlessStateSnapshot(state);
 }

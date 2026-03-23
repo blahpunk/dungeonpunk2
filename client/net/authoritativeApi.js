@@ -141,10 +141,30 @@ export function createAuthoritativeApi(options = {}) {
         min_response_ms: Math.max(0, Math.floor(Number(minResponseMs) || 0)),
       }, { signal });
     },
-    touchSession({ sessionId = "" } = {}) {
+    touchSession({
+      sessionId = "",
+      name = "",
+      speciesId = "",
+      classId = "",
+      dungeonInstanceId = "",
+      x = null,
+      y = null,
+      z = null,
+      hp = null,
+      maxHp = null,
+    } = {}) {
       return request({
         action: "touch_session",
         session_id: sessionId,
+        name: name || undefined,
+        species_id: speciesId || undefined,
+        class_id: classId || undefined,
+        dungeon_instance_id: dungeonInstanceId || undefined,
+        x: Number.isFinite(Number(x)) ? Math.floor(Number(x)) : undefined,
+        y: Number.isFinite(Number(y)) ? Math.floor(Number(y)) : undefined,
+        z: Number.isFinite(Number(z)) ? Math.floor(Number(z)) : undefined,
+        hp: Number.isFinite(Number(hp)) ? Math.max(0, Math.floor(Number(hp))) : undefined,
+        max_hp: Number.isFinite(Number(maxHp)) ? Math.max(1, Math.floor(Number(maxHp))) : undefined,
       }, { keepalive: true });
     },
     sessionLockAudit({ sessionId = "" } = {}) {

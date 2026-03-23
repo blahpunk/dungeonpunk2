@@ -8,7 +8,7 @@ function authoritative_run_storage_dir(): string
 
 function authoritative_run_file_path(string $userEmail): string
 {
-  return authoritative_run_storage_dir() . DIRECTORY_SEPARATOR . authoritative_user_storage_key($userEmail) . '.json';
+  return authoritative_run_storage_dir() . DIRECTORY_SEPARATOR . 'global.shared-canonical.json';
 }
 
 function authoritative_load_run_record(string $userEmail): ?array
@@ -19,7 +19,9 @@ function authoritative_load_run_record(string $userEmail): ?array
     return null;
   }
   $record['payload'] = trim((string) ($record['payload'] ?? ''));
-  $record['active_character_id'] = trim((string) ($record['active_character_id'] ?? ''));
+  $record['active_character_id'] = trim((string) ($record['active_character_id'] ?? $record['character_id'] ?? ''));
+  $record['character_id'] = $record['active_character_id'];
+  $record['character_name'] = trim((string) ($record['character_name'] ?? 'Adventurer'));
   $record['server_revision'] = max(0, (int) ($record['server_revision'] ?? 0));
   return $record['payload'] !== '' ? $record : null;
 }
@@ -31,10 +33,17 @@ function authoritative_persist_run_record(string $userEmail, array $record): boo
     return false;
   }
   $existing = authoritative_load_run_record($userEmail);
+  $characterId = trim((string) ($record['active_character_id'] ?? $record['character_id'] ?? ''));
+  $characterName = trim((string) ($record['character_name'] ?? $existing['character_name'] ?? 'Adventurer'));
+  if ($characterName === '') {
+    $characterName = 'Adventurer';
+  }
   $nowIso = date('c');
   $next = [
     'payload' => $payload,
-    'active_character_id' => trim((string) ($record['active_character_id'] ?? '')),
+    'active_character_id' => $characterId,
+    'character_id' => $characterId,
+    'character_name' => $characterName,
     'server_revision' => max(0, (int) ($record['server_revision'] ?? ($existing['server_revision'] ?? 0))),
     'created_at' => (string) ($existing['created_at'] ?? $nowIso),
     'updated_at' => $nowIso,

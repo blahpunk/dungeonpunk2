@@ -24,7 +24,7 @@ const MONSTER_EDITOR_CONFIG_PATHS = [
   path.join(PROJECT_ROOT, "src", "content", "monsters.seed.json"),
 ].filter(Boolean);
 let appliedMonsterConfigRaw = "";
-const AUTHORITATIVE_TICK_MS = 12;
+const AUTHORITATIVE_TICK_MS = 100;
 
 function normalizeSessionId(value = "") {
   const id = String(value ?? "").trim();
