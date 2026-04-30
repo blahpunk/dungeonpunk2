@@ -227,10 +227,21 @@ function authoritative_worker_daemon_start(): bool
   if (!authoritative_worker_runtime_dir_ready()) {
     return false;
   }
+  $currentVersion = authoritative_worker_code_version();
+  $storedVersion = authoritative_worker_stored_version();
+  $versionMismatch = (
+    $storedVersion !== ''
+    && $currentVersion !== ''
+    && $storedVersion !== $currentVersion
+  );
   $probe = authoritative_worker_socket_connect(0.05);
   if (is_resource($probe)) {
+    $pidCount = function_exists('shell_exec') ? count(authoritative_worker_daemon_pids()) : 0;
+    if (!$versionMismatch && $pidCount <= 1) {
+      fclose($probe);
+      return true;
+    }
     fclose($probe);
-    return true;
   }
   if (!function_exists('shell_exec')) {
     return false;
@@ -244,18 +255,27 @@ function authoritative_worker_daemon_start(): bool
     if (!@flock($lockHandle, LOCK_EX)) {
       return false;
     }
+    $currentVersion = authoritative_worker_code_version();
+    $storedVersion = authoritative_worker_stored_version();
+    $versionMismatch = (
+      $storedVersion !== ''
+      && $currentVersion !== ''
+      && $storedVersion !== $currentVersion
+    );
+    $pids = authoritative_worker_daemon_pids();
     $probe = authoritative_worker_socket_connect(0.05);
     if (is_resource($probe)) {
+      $healthyPidCount = count($pids);
+      if (!$versionMismatch && $healthyPidCount <= 1) {
+        fclose($probe);
+        return true;
+      }
       fclose($probe);
-      return true;
     }
     $socketPath = authoritative_worker_socket_path();
     if (is_string($socketPath) && $socketPath !== '' && file_exists($socketPath)) {
       @unlink($socketPath);
     }
-    $currentVersion = authoritative_worker_code_version();
-    $storedVersion = authoritative_worker_stored_version();
-    $pids = authoritative_worker_daemon_pids();
     if (count($pids) > 1 || ($storedVersion !== '' && $currentVersion !== '' && $storedVersion !== $currentVersion)) {
       authoritative_worker_kill_daemons();
     }

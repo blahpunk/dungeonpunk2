@@ -3,7 +3,7 @@ import {
   LOCAL_SLOT_MAX,
   createLocalSlotStore,
 } from "./client/save/saveManager.js?v=20260315a";
-import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260321e";
+import { createAuthoritativeApi } from "./client/net/authoritativeApi.js?v=20260325a";
 import {
   abilityCommand,
   attackCommand,
@@ -172,9 +172,11 @@ const BROWSER_INSTANCE_ID_CLAIM_REFRESH_MS = 10000;
 const CHARACTER_STATE_SLOT_PREFIX = "charstate:";
 const LOCAL_CHARACTER_STATE_PREFIX = "infinite_dungeon_character_state_v1:";
 const CHARACTER_SYNC_DEBOUNCE_MS = 300;
-const SHARED_DUNGEON_SYNC_INTERVAL_MS = 650;
-const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 300;
-const REMOTE_CHARACTER_STALE_GRACE_MS = 5000;
+const SHARED_DUNGEON_SYNC_INTERVAL_MS = 140;
+const SHARED_DUNGEON_PUSH_DEBOUNCE_MS = 140;
+const REMOTE_CHARACTER_STALE_GRACE_MS = 30000;
+const SAVE_API_TIMEOUT_MS = 12000;
+const STARTUP_CHARACTER_RESUME_TIMEOUT_MS = 5000;
 const XP_SCALE = 100;
 const COMBAT_SCALE = 100;
 const POTION_HEAL_PCT = 0.35;
@@ -2332,8 +2334,16 @@ function movementStreamStatusText() {
   if (!isAuthoritativeSessionActive()) return "";
   const streamHealthy = isAuthoritativeMovementStreamAvailable();
   const tickMs = authoritativeClientTickMs();
-  if (streamHealthy) return `Realtime movement: LIVE stream | ${tickMs}ms auth tick | authoritative interpolation`;
+  const transportMode = String(authoritativeApi?.transportMode ?? "php").trim().toLowerCase();
+  const requestedMode = String(authoritativeApi?.requestedTransportMode ?? transportMode).trim().toLowerCase();
+  if (streamHealthy) {
+    const label = transportMode === "realtime" ? "Realtime movement" : "Authoritative movement";
+    return `${label}: LIVE stream | ${tickMs}ms auth tick | authoritative interpolation`;
+  }
   const reason = String(authoritativeMovementChannelRuntime.disableReason ?? "").trim() || "stream unavailable";
+  if (requestedMode === "realtime" && transportMode !== "realtime") {
+    return `Realtime movement: COMPAT fallback | PHP authoritative transport | ${reason}`;
+  }
   if (AUTHORITATIVE_MOVEMENT_COMPAT_FALLBACK_ENABLED) {
     return `Realtime movement: DEGRADED compatibility mode | ${reason}`;
   }
@@ -4258,10 +4268,12 @@ function requestLifecycleAuthoritativeClose(reason = "lifecycle-close") {
   clearAuthoritativeRateLimitTimer();
   stopAuthoritativeSessionTouchLoop();
   stopAuthoritativeMovementPollLoop();
-  void authoritativeApi.closeSession({
+  void Promise.resolve(authoritativeApi.closeSession({
     sessionId,
     reason: String(reason ?? "").trim() || "lifecycle-close",
     bestEffort: true,
+  })).finally(() => {
+    try { authoritativeApi.disconnect?.(); } catch {}
   });
   return true;
 }
@@ -4415,6 +4427,7 @@ let guestNewCharacterResolver = null;
 let guestLoginImportResolver = null;
 let newDungeonResetPending = false;
 let bootLoadedFromLocalSave = false;
+let authenticatedFreshLoginBoot = false;
 let requiresCharacterCreation = false;
 const saveMenuUi = { open: false, mode: "load", saves: [], loading: false };
 const characterUi = {
@@ -4504,6 +4517,11 @@ const sharedDungeonRuntime = {
   lastAppliedUpdatedAt: "",
   lastAppliedCharacterId: "",
   lastError: "",
+  localVitalsDirty: false,
+  lastServerHp: null,
+  lastServerMaxHp: null,
+  lastServerDead: false,
+  lastServerEffects: [],
 };
 const remoteCharacterVisibilityRuntime = {
   lastSeenAtByCharacterId: new Map(),
@@ -10076,6 +10094,10 @@ function exportCharacterSnapshot(state) {
   const profile = normalizeCharacterProfile(src.character ?? null);
   return {
     character: profile,
+    combat: {
+      lastEventMs: Number.isFinite(Number(src?.combat?.lastEventMs)) ? Math.max(0, Math.floor(Number(src.combat.lastEventMs))) : 0,
+      regenAnchorMs: Number.isFinite(Number(src?.combat?.regenAnchorMs)) ? Math.max(0, Math.floor(Number(src.combat.regenAnchorMs))) : 0,
+    },
     dungeonInstanceId: String(src.sharedDungeonId ?? src.world?.seedStr ?? "").trim(),
     position: {
       x: Number.isFinite(Number(p.x)) ? Math.floor(Number(p.x)) : null,
@@ -10139,6 +10161,10 @@ async function resolveCharacterSnapshotFromServerState(characterId = "") {
     const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
     return {
       character: profile,
+      combat: {
+        lastEventMs: Number.isFinite(Number(decoded?.combat?.lastEventMs)) ? Math.max(0, Math.floor(Number(decoded.combat.lastEventMs))) : 0,
+        regenAnchorMs: Number.isFinite(Number(decoded?.combat?.regenAnchorMs)) ? Math.max(0, Math.floor(Number(decoded.combat.regenAnchorMs))) : 0,
+      },
       dungeonInstanceId: String(decoded?.dungeonInstanceId ?? "").trim(),
       position: normalizeCharacterSnapshotPosition(decoded?.position ?? decoded?.character?.position ?? null),
       player: {
@@ -10215,6 +10241,10 @@ function resolveCharacterSnapshotFromLocalState(characterId = "") {
   const classId = normalizeCharacterClassId(decoded?.player?.classId ?? profile.classId, speciesId);
   return {
     character: profile,
+    combat: {
+      lastEventMs: Number.isFinite(Number(decoded?.combat?.lastEventMs)) ? Math.max(0, Math.floor(Number(decoded.combat.lastEventMs))) : 0,
+      regenAnchorMs: Number.isFinite(Number(decoded?.combat?.regenAnchorMs)) ? Math.max(0, Math.floor(Number(decoded.combat.regenAnchorMs))) : 0,
+    },
     dungeonInstanceId: String(decoded?.dungeonInstanceId ?? "").trim(),
     position: normalizeCharacterSnapshotPosition(decoded?.position ?? decoded?.character?.position ?? null),
     player: {
@@ -10247,6 +10277,10 @@ function buildCharacterSnapshotFromCarryover(profile, carryover = null) {
   const maxHp = Math.max(1, Math.floor(carryover?.maxHp ?? maxHpForLevel(level, normalizedProfile)));
   return {
     character: normalizedProfile,
+    combat: {
+      lastEventMs: 0,
+      regenAnchorMs: Date.now(),
+    },
     dungeonInstanceId: String(carryover?.dungeonInstanceId ?? "").trim(),
     position: { x: null, y: null, depth: null },
     player: {
@@ -10349,7 +10383,11 @@ async function syncCharacterStateIfDirty(reason = "") {
     const payload = encodeCharacterSnapshotPayload(snapshot);
     if (!payload) return false;
     persistCharacterSnapshotLocally(profile.id, payload);
-    if (shouldSyncCharacterStateToServer(profile)) {
+    const hasActiveSharedCharacterSession = !!(
+      canUseSharedDungeonSync()
+      && String(characterSessionRuntime.sessionId ?? "").trim()
+    );
+    if (!hasActiveSharedCharacterSession && shouldSyncCharacterStateToServer(profile)) {
       await saveApiRequest("POST", {
         action: "character_sync",
         character_id: profile.id,
@@ -10411,6 +10449,13 @@ function applyCharacterSnapshot(state, snapshot) {
   p.dead = !!snapPlayer.dead;
   p.godmode = !!snapPlayer.godmode;
   p.live = normalizeLiveCombatActorState(null, "player");
+  state.combat = {
+    lastEventMs: Number.isFinite(Number(snapshot?.combat?.lastEventMs)) ? Math.max(0, Math.floor(Number(snapshot.combat.lastEventMs))) : 0,
+    regenAnchorMs: Number.isFinite(Number(snapshot?.combat?.regenAnchorMs))
+      ? Math.max(0, Math.floor(Number(snapshot.combat.regenAnchorMs)))
+      : Date.now(),
+    hudTargets: {},
+  };
   state.inv = normalizeInventoryEntries(snapPlayer.inv ?? state.inv ?? [], {
     speciesId: profile.speciesId,
     classId: profile.classId,
@@ -10419,10 +10464,9 @@ function applyCharacterSnapshot(state, snapshot) {
 
   const snapMaxHp = Math.max(1, Math.floor(snapPlayer.maxHp ?? p.maxHp ?? 1));
   const snapHp = Math.max(0, Math.floor(snapPlayer.hp ?? p.hp ?? snapMaxHp));
-  const hpRatio = clamp(snapHp / snapMaxHp, 0, 1);
   recalcDerivedStats(state);
   ensureLiveSimulationState(state);
-  p.hp = clamp(Math.round((p.maxHp ?? 1) * hpRatio), 0, p.maxHp ?? 1);
+  p.hp = clamp(snapHp, 0, p.maxHp ?? 1);
   p.energy = p.energyMax;
   touchCharacterProgress(state);
   renderInventory(state);
@@ -10431,6 +10475,34 @@ function applyCharacterSnapshot(state, snapshot) {
   renderLog(state);
   updateContextActionButton(state);
   updateDeathOverlay(state);
+  return true;
+}
+
+function applyCharacterVitalsSnapshot(state, snapshot) {
+  if (!state || !snapshot || !state.player) return false;
+  const snapshotCharacterId = normalizeCharacterProfileId(snapshot?.character?.id ?? "");
+  const activeCharacterId = normalizeCharacterProfileId(state?.character?.id ?? "");
+  if (!snapshotCharacterId || !activeCharacterId || snapshotCharacterId !== activeCharacterId) return false;
+  const snapPlayer = (snapshot.player && typeof snapshot.player === "object") ? snapshot.player : null;
+  if (!snapPlayer) return false;
+  const p = state.player;
+  const snapMaxHp = Math.max(1, Math.floor(Number(snapPlayer.maxHp ?? p.maxHp ?? 1) || 1));
+  const snapHp = Math.max(0, Math.floor(Number(snapPlayer.hp ?? p.hp ?? snapMaxHp) || 0));
+  const localMaxHp = Math.max(1, Math.floor(Number(p.maxHp ?? snapMaxHp) || snapMaxHp));
+  p.hp = clamp(snapHp, 0, localMaxHp);
+  p.dead = !!snapPlayer.dead || p.hp <= 0;
+  if (Array.isArray(snapPlayer.effects)) {
+    p.effects = ensureArray(snapPlayer.effects)
+      .map((entry) => (entry && typeof entry === "object" ? { ...entry } : null))
+      .filter(Boolean);
+  }
+  sharedDungeonRuntime.lastServerHp = Math.max(0, Math.floor(Number(snapPlayer.hp ?? p.hp ?? 0) || 0));
+  sharedDungeonRuntime.lastServerMaxHp = Math.max(1, Math.floor(Number(snapPlayer.maxHp ?? p.maxHp ?? 1) || 1));
+  sharedDungeonRuntime.lastServerDead = !!snapPlayer.dead;
+  sharedDungeonRuntime.lastServerEffects = ensureArray(snapPlayer.effects)
+    .map((entry) => (entry && typeof entry === "object" ? { ...entry } : null))
+    .filter(Boolean);
+  sharedDungeonRuntime.localVitalsDirty = false;
   return true;
 }
 
@@ -10755,7 +10827,30 @@ async function switchToCharacterSlot(slotId, options = null) {
   return switchCharacter(slotId, options);
 }
 
-async function saveApiRequest(method = "GET", body = null, query = "") {
+function createTimeoutError(message = "Request timed out.") {
+  const err = new Error(message);
+  err.code = "REQUEST_TIMEOUT";
+  return err;
+}
+
+async function withPromiseTimeout(promise, timeoutMs = 0, timeoutMessage = "Request timed out.") {
+  const ms = Math.max(0, Math.floor(Number(timeoutMs) || 0));
+  if (ms <= 0) return promise;
+  let timeoutId = 0;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(createTimeoutError(timeoutMessage));
+    }, ms);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+async function saveApiRequest(method = "GET", body = null, query = "", options = null) {
+  const opts = (options && typeof options === "object") ? options : {};
   const q = query ? `&${query}` : "";
   const url = `./index.php?api=savegames${q}`;
   const headers = {
@@ -10764,24 +10859,45 @@ async function saveApiRequest(method = "GET", body = null, query = "") {
     Pragma: "no-cache",
   };
   const init = { method, credentials: "same-origin", headers, cache: "no-store" };
+  const timeoutMs = Math.max(0, Math.floor(Number(opts.timeoutMs ?? SAVE_API_TIMEOUT_MS) || 0));
+  let abortController = null;
+  let abortTimer = 0;
+  if (typeof AbortController === "function" && timeoutMs > 0) {
+    abortController = new AbortController();
+    init.signal = abortController.signal;
+    abortTimer = setTimeout(() => {
+      try {
+        abortController.abort();
+      } catch {}
+    }, timeoutMs);
+  }
   if (body !== null) {
     headers["Content-Type"] = "application/json";
     headers["X-CSRF-Token"] = saveApiCsrfToken;
     init.body = JSON.stringify(body);
   }
-  const resp = await fetch(url, init);
-  let data = null;
-  try { data = await resp.json(); } catch {}
-  if (!resp.ok || !data?.ok) {
-    const msg = data?.error ?? `Request failed (${resp.status})`;
-    const err = new Error(msg);
-    err.response = { ...(data && typeof data === "object" ? data : {}), status_code: resp.status };
+  try {
+    const resp = await fetch(url, init);
+    let data = null;
+    try { data = await resp.json(); } catch {}
+    if (!resp.ok || !data?.ok) {
+      const msg = data?.error ?? `Request failed (${resp.status})`;
+      const err = new Error(msg);
+      err.response = { ...(data && typeof data === "object" ? data : {}), status_code: resp.status };
+      throw err;
+    }
+    if (data && typeof data === "object" && data.runtime_settings) {
+      applyRuntimeSettingsPayload(data.runtime_settings);
+    }
+    return data;
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw createTimeoutError("The server took too long to respond.");
+    }
     throw err;
+  } finally {
+    if (abortTimer) clearTimeout(abortTimer);
   }
-  if (data && typeof data === "object" && data.runtime_settings) {
-    applyRuntimeSettingsPayload(data.runtime_settings);
-  }
-  return data;
 }
 
 function canUseSharedDungeonSync() {
@@ -11082,11 +11198,27 @@ async function persistSharedDungeonStateToServer(state, reason = "sync", options
   const payload = exportSharedDungeonPayload(state);
   if (!payload) return false;
   const profile = ensureCharacterState(state);
+  const currentCharacterSnapshot = exportCharacterSnapshot(state);
+  if (
+    currentCharacterSnapshot?.player
+    && !sharedDungeonRuntime.localVitalsDirty
+    && Number.isFinite(Number(sharedDungeonRuntime.lastServerHp))
+    && Number.isFinite(Number(sharedDungeonRuntime.lastServerMaxHp))
+  ) {
+    currentCharacterSnapshot.player.hp = Math.max(0, Math.floor(Number(sharedDungeonRuntime.lastServerHp) || 0));
+    currentCharacterSnapshot.player.maxHp = Math.max(1, Math.floor(Number(sharedDungeonRuntime.lastServerMaxHp) || 1));
+    currentCharacterSnapshot.player.dead = !!sharedDungeonRuntime.lastServerDead;
+    currentCharacterSnapshot.player.effects = ensureArray(sharedDungeonRuntime.lastServerEffects)
+      .map((entry) => (entry && typeof entry === "object" ? { ...entry } : null))
+      .filter(Boolean);
+  }
+  const currentCharacterPayload = currentCharacterSnapshot ? encodeCharacterSnapshotPayload(currentCharacterSnapshot) : "";
   const data = await saveApiRequest("POST", {
     action: opts.adminReset === true ? "admin_universal_new_dungeon" : "shared_run_sync",
     payload,
     character_id: normalizeCharacterProfileId(profile?.id ?? ""),
     current_character_id: activeSharedDungeonCharacterId(),
+    current_character_payload: currentCharacterPayload,
     character_name: String(profile?.name ?? DEFAULT_CHARACTER_NAME),
     reason: String(reason ?? "").trim() || "sync",
   });
@@ -11127,12 +11259,12 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
   if (!currentCharacterId) return false;
   const blockSharedApplyForRecentLocalInput = !!(
     opts.forceApply !== true
-    && (Date.now() - Math.max(0, Number(lastLocalLiveCommandAt) || 0)) < 700
+    && (Date.now() - Math.max(0, Number(lastLocalLiveCommandAt) || 0)) < 90
   );
   sharedDungeonRuntime.syncing = true;
   try {
     let sharedData = null;
-    if (opts.forcePush === true || (saveRuntime.dirty && (Date.now() - sharedDungeonRuntime.lastPushAt) >= SHARED_DUNGEON_PUSH_DEBOUNCE_MS)) {
+    if (opts.forcePush === true) {
       sharedData = await persistSharedDungeonStateToServer(game, reason);
     }
     if (opts.skipPull === true) return true;
@@ -11158,14 +11290,8 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
       const wasDebugMenuOpen = !!debugMenuEl?.classList.contains("show");
       const priorDebugFlags = normalizeDebugFlags(game?.debug);
       let snapshot = exportCharacterSnapshot(game);
-      if (currentCharacterPayload) {
-        snapshot = {
-          ...currentCharacterPayload,
-          position: snapshot?.position ?? currentCharacterPayload?.position ?? null,
-        };
-      }
       if (!snapshot) {
-        snapshot = await resolveLoadableCharacterSnapshot(currentCharacterId);
+        snapshot = currentCharacterPayload ?? await resolveLoadableCharacterSnapshot(currentCharacterId);
       }
       const sharedStatePreview = importSave(sharedPayload);
       const currentDungeonId = sharedDungeonInstanceIdForState(game);
@@ -11201,25 +11327,15 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
         sharedDungeonRuntime.lastAppliedCharacterId = currentCharacterId;
       }
     }
-    if (
-      currentCharacterPayload
-      && normalizeCharacterProfileId(currentCharacterPayload?.character?.id ?? currentCharacterId) === currentCharacterId
-      && game
-    ) {
-      const prevPos = {
-        x: Math.floor(Number(game?.player?.x ?? 0)),
-        y: Math.floor(Number(game?.player?.y ?? 0)),
-        z: Math.floor(Number(game?.player?.z ?? 0)),
-      };
-      applyCharacterSnapshot(game, currentCharacterPayload);
-      game.player.x = prevPos.x;
-      game.player.y = prevPos.y;
-      game.player.z = prevPos.z;
+    if (currentCharacterPayload && game) {
+      const appliedVitals = applyCharacterVitalsSnapshot(game, currentCharacterPayload);
+      if (appliedVitals) {
       syncEntityVisualTargetsFromState(game);
       hydrateNearby(game);
       computeVisibility(game);
       updateContextActionButton(game);
       updateDeathOverlay(game);
+      }
     }
     syncRemoteCharacterActors(game, sharedData);
     return true;
@@ -11231,7 +11347,7 @@ async function syncSharedDungeonState(reason = "sync", options = null) {
   }
 }
 
-const CHARACTER_SESSION_TOUCH_INTERVAL_MS = 10000;
+const CHARACTER_SESSION_TOUCH_INTERVAL_MS = 3000;
 
 function stopCharacterSessionTouchLoop() {
   if (!characterSessionRuntime.touchTimer) return;
@@ -11269,8 +11385,6 @@ async function touchCharacterSession(reason = "interval") {
       x: Number.isFinite(Number(position?.x)) ? Math.floor(Number(position.x)) : null,
       y: Number.isFinite(Number(position?.y)) ? Math.floor(Number(position.y)) : null,
       z: Number.isFinite(Number(position?.depth ?? position?.z)) ? Math.floor(Number(position?.depth ?? position?.z)) : null,
-      hp: Number.isFinite(Number(snapPlayer?.hp ?? game?.player?.hp)) ? Math.max(0, Math.floor(Number(snapPlayer?.hp ?? game?.player?.hp))) : null,
-      max_hp: Number.isFinite(Number(snapPlayer?.maxHp ?? game?.player?.maxHp)) ? Math.max(1, Math.floor(Number(snapPlayer?.maxHp ?? game?.player?.maxHp))) : null,
     });
     characterSessionRuntime.lastTouchAt = Date.now();
     return true;
@@ -11862,6 +11976,49 @@ async function resolveLatestCharacterSnapshot(characterId = "") {
   return resolveLatestCharacterSnapshotFromLocal(characterId);
 }
 
+function buildCharacterSnapshotFromStateMetaSummary(stateMeta = null) {
+  const summary = (stateMeta && typeof stateMeta.summary === "object") ? stateMeta.summary : null;
+  if (!summary) return null;
+  const rawCharacter = (summary.character && typeof summary.character === "object") ? summary.character : {};
+  const characterId = normalizeCharacterProfileId(rawCharacter.id ?? stateMeta?.id ?? "");
+  if (!characterId) return null;
+  const rawSpeciesId = normalizeCharacterSpeciesId(rawCharacter.speciesId ?? DEFAULT_CHARACTER_SPECIES_ID);
+  const rawClassId = normalizeCharacterClassId(
+    rawCharacter.classId ?? defaultClassIdForSpecies(rawSpeciesId),
+    rawSpeciesId
+  );
+  const profile = normalizeCharacterProfile({
+    id: characterId,
+    name: String(rawCharacter.name ?? stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
+    speciesId: rawSpeciesId,
+    classId: rawClassId,
+    deepestDepth: Math.max(0, Math.floor(Number(rawCharacter.deepestDepth ?? 0) || 0)),
+  });
+  return {
+    character: profile,
+    combat: {
+      lastEventMs: 0,
+      regenAnchorMs: 0,
+    },
+    dungeonInstanceId: String(summary.dungeonInstanceId ?? "").trim(),
+    position: normalizeCharacterSnapshotPosition(summary.position ?? null),
+    player: {
+      level: Math.max(1, Math.floor(Number(summary?.player?.level ?? 1) || 1)),
+      xp: 0,
+      hp: 1,
+      maxHp: 1,
+      dead: false,
+      godmode: false,
+      gold: 0,
+      inv: [],
+      equip: { weapon: null, head: null, chest: null, legs: null },
+      effects: [],
+      classId: profile.classId,
+      speciesId: profile.speciesId,
+    },
+  };
+}
+
 async function fetchCharacterSlotsFromServer() {
   if (!isAuthenticatedUser) return [];
   const browserInstanceId = resolveBrowserInstanceId();
@@ -11890,7 +12047,10 @@ async function fetchCharacterSlotsFromServer() {
       id: characterId,
       name: String(stateMeta?.name ?? DEFAULT_CHARACTER_NAME),
     });
-    const snapshot = await resolveCharacterSnapshotFromServerState(characterId);
+    let snapshot = buildCharacterSnapshotFromStateMetaSummary(stateMeta);
+    if (!snapshot) {
+      snapshot = await resolveCharacterSnapshotFromServerState(characterId);
+    }
     const slot = slotsByCharacterId.get(characterId) ?? {
       id: slotId,
       name: String(stateMeta?.name ?? profileFallback.name ?? DEFAULT_CHARACTER_NAME),
@@ -11917,7 +12077,13 @@ async function fetchCharacterSlotsFromServer() {
     );
     slot.hasDungeonPosition = slot.hasDungeonPosition || characterSnapshotHasDungeonPosition(snapshot);
     const lockInfo = lockByCharacterId.get(characterId) ?? null;
-    slot.lockedElsewhere = !!(lockInfo && (!currentSessionId || lockInfo.sessionId !== currentSessionId));
+    const lockBrowserId = String(lockInfo?.browserInstanceId ?? "").trim().toLowerCase();
+    const sameBrowserLock = !!(lockBrowserId && lockBrowserId === String(browserInstanceId ?? "").trim().toLowerCase());
+    slot.lockedElsewhere = !!(
+      lockInfo
+      && !sameBrowserLock
+      && (!currentSessionId || lockInfo.sessionId !== currentSessionId)
+    );
     slot.lockSessionId = String(lockInfo?.sessionId ?? "").trim();
     slotsByCharacterId.set(characterId, slot);
   }
@@ -12750,7 +12916,7 @@ async function startCharacterFlow() {
       characterUi.selectedSaveId = activeSlotExists ? activeId : (availableSlotId || characterUi.slots[0]?.id || "");
       characterUi.selectionPurpose = "load_run";
       characterUi.mode = hasSlots ? "select" : "create";
-      if (isAuthoritativeModeEnabled() && hasSlots && characterUi.selectedSaveId) {
+      if (!authenticatedFreshLoginBoot && isAuthoritativeModeEnabled() && hasSlots && characterUi.selectedSaveId) {
         const preferredSlotId = characterUi.selectedSaveId;
         const orderedSlots = [
           ...(preferredSlotId ? characterUi.slots.filter((slot) => slot.id === preferredSlotId) : []),
@@ -12759,14 +12925,18 @@ async function startCharacterFlow() {
         for (const resumeSlot of orderedSlots) {
           const resumeSlotId = String(resumeSlot?.id ?? "").trim();
           if (!resumeSlotId) continue;
-          const loaded = await loadRunFromCharacterSlot(resumeSlotId, {
-            forceEntrance: false,
-            characterId: normalizeCharacterProfileId(
-              resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
-            ),
-            silent: true,
-            slotMeta: resumeSlot,
-          });
+          const loaded = await withPromiseTimeout(
+            loadRunFromCharacterSlot(resumeSlotId, {
+              forceEntrance: false,
+              characterId: normalizeCharacterProfileId(
+                resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
+              ),
+              silent: true,
+              slotMeta: resumeSlot,
+            }),
+            STARTUP_CHARACTER_RESUME_TIMEOUT_MS,
+            "Resuming the selected character took too long."
+          ).catch(() => false);
           if (!loaded) continue;
           characterUi.selectedSaveId = resumeSlotId;
           if (!activeSlotExists || preferredSlotId !== resumeSlotId) setActiveCharacterSlotId(resumeSlotId);
@@ -12788,7 +12958,7 @@ async function startCharacterFlow() {
           setCharacterOverlayStatus("No available character slot could be resumed. Choose a different character.", true);
         }
       }
-      if (!isAuthoritativeModeEnabled() && hasSlots && availableSlotId) {
+      if (!authenticatedFreshLoginBoot && !isAuthoritativeModeEnabled() && hasSlots && availableSlotId) {
         const preferredSlotId = characterUi.selectedSaveId || availableSlotId;
         const orderedSlots = [
           ...(preferredSlotId ? characterUi.slots.filter((slot) => slot.id === preferredSlotId) : []),
@@ -12797,14 +12967,18 @@ async function startCharacterFlow() {
         for (const resumeSlot of orderedSlots) {
           const resumeSlotId = String(resumeSlot?.id ?? "").trim();
           if (!resumeSlotId) continue;
-          const loaded = await loadRunFromCharacterSlot(resumeSlotId, {
-            forceEntrance: false,
-            characterId: normalizeCharacterProfileId(
-              resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
-            ),
-            silent: true,
-            slotMeta: resumeSlot,
-          });
+          const loaded = await withPromiseTimeout(
+            loadRunFromCharacterSlot(resumeSlotId, {
+              forceEntrance: false,
+              characterId: normalizeCharacterProfileId(
+                resumeSlot?.profile?.id ?? normalizeCharacterProfileIdFromSlotId(resumeSlotId)
+              ),
+              silent: true,
+              slotMeta: resumeSlot,
+            }),
+            STARTUP_CHARACTER_RESUME_TIMEOUT_MS,
+            "Resuming the selected character took too long."
+          ).catch(() => false);
           if (!loaded) continue;
           characterUi.selectedSaveId = resumeSlotId;
           if (!activeSlotExists || preferredSlotId !== resumeSlotId) setActiveCharacterSlotId(resumeSlotId);
@@ -12850,7 +13024,12 @@ async function startCharacterFlow() {
           true
         );
       } else {
-        setCharacterOverlayStatus("Select or create a character to continue.", true);
+        setCharacterOverlayStatus(
+          authenticatedFreshLoginBoot
+            ? "Choose a character to continue."
+            : "Select or create a character to continue.",
+          true
+        );
       }
     } catch (err) {
       characterUi.mode = "create";
@@ -15731,10 +15910,11 @@ function titleCaseLowerLabel(name) {
 
 function ensureAreaRespawnState(state) {
   if (!state.areaRespawn || typeof state.areaRespawn !== "object") {
-    state.areaRespawn = { currentAreaKey: "", schedules: {} };
+    state.areaRespawn = { currentAreaKey: "", schedules: {}, emptySince: {} };
   }
   if (typeof state.areaRespawn.currentAreaKey !== "string") state.areaRespawn.currentAreaKey = "";
   if (!state.areaRespawn.schedules || typeof state.areaRespawn.schedules !== "object") state.areaRespawn.schedules = {};
+  if (!state.areaRespawn.emptySince || typeof state.areaRespawn.emptySince !== "object") state.areaRespawn.emptySince = {};
   return state.areaRespawn;
 }
 
@@ -16449,39 +16629,85 @@ function areaHasAnyCharacterOccupant(state, areaKey = "") {
   return false;
 }
 
+function collectOccupiedAreaKeys(state) {
+  const keys = new Set();
+  if (!state?.world) return keys;
+  const player = state.player;
+  if (player && Number.isFinite(player.x) && Number.isFinite(player.y) && Number.isFinite(player.z)) {
+    const playerAreaKey = String(state.world.areaKeyAt(player.x, player.y, player.z) ?? "");
+    if (playerAreaKey) keys.add(playerAreaKey);
+  }
+  for (const ent of state.entities?.values?.() ?? []) {
+    if (!ent || ent.kind !== "actor" || !ent.remoteCharacterId) continue;
+    if (!Number.isFinite(ent.x) || !Number.isFinite(ent.y) || !Number.isFinite(ent.z)) continue;
+    const entAreaKey = String(state.world.areaKeyAt(ent.x, ent.y, ent.z) ?? "");
+    if (entAreaKey) keys.add(entAreaKey);
+  }
+  return keys;
+}
+
 function updateAreaRespawnTracking(state, now = Date.now()) {
   const areaState = ensureAreaRespawnState(state);
   const currentKey = state.world.areaKeyAt(state.player.x, state.player.y, state.player.z);
+  const occupiedAreaKeys = collectOccupiedAreaKeys(state);
+  for (const areaKey of occupiedAreaKeys) {
+    if (!areaKey) continue;
+    delete areaState.schedules[areaKey];
+    delete areaState.emptySince[areaKey];
+  }
   const previousKey = areaState.currentAreaKey;
-  if (previousKey && previousKey !== currentKey) {
+  if (previousKey && previousKey !== currentKey && !occupiedAreaKeys.has(previousKey)) {
     const parsedPrev = parseChunkAreaKey(previousKey);
     if (parsedPrev && parsedPrev.z >= 0) {
-      areaState.schedules[previousKey] = now + areaRespawnDelayMsForDepth(parsedPrev.z);
+      const emptySince = Math.max(0, Math.floor(Number(areaState.emptySince[previousKey] ?? 0) || 0)) || now;
+      areaState.emptySince[previousKey] = emptySince;
+      areaState.schedules[previousKey] = emptySince + areaRespawnDelayMsForDepth(parsedPrev.z);
     }
   }
+  for (const areaKey of Object.keys(areaState.schedules)) {
+    if (!areaKey || occupiedAreaKeys.has(areaKey)) continue;
+    const parsedArea = parseChunkAreaKey(areaKey);
+    if (!parsedArea || parsedArea.z < 0) {
+      delete areaState.schedules[areaKey];
+      delete areaState.emptySince[areaKey];
+      continue;
+    }
+    const emptySince = Math.max(0, Math.floor(Number(areaState.emptySince[areaKey] ?? 0) || 0));
+    if (emptySince > 0) continue;
+    areaState.emptySince[areaKey] = now;
+    areaState.schedules[areaKey] = now + areaRespawnDelayMsForDepth(parsedArea.z);
+  }
   areaState.currentAreaKey = currentKey;
-  if (currentKey && areaState.schedules[currentKey]) delete areaState.schedules[currentKey];
+  if (currentKey) {
+    delete areaState.schedules[currentKey];
+    delete areaState.emptySince[currentKey];
+  }
 }
 
 function processAreaRespawns(state, now = Date.now()) {
   const areaState = ensureAreaRespawnState(state);
+  const occupiedAreaKeys = collectOccupiedAreaKeys(state);
   for (const [areaKey, dueMs] of Object.entries(areaState.schedules)) {
     const parsed = parseChunkAreaKey(areaKey);
     if (!parsed || parsed.z < 0) {
       delete areaState.schedules[areaKey];
+      delete areaState.emptySince[areaKey];
       continue;
     }
-    if (areaKey === areaState.currentAreaKey) {
-      areaState.schedules[areaKey] = now + 1000;
+    if (occupiedAreaKeys.has(areaKey) || areaHasAnyCharacterOccupant(state, areaKey)) {
+      delete areaState.schedules[areaKey];
+      delete areaState.emptySince[areaKey];
       continue;
     }
-    if (areaHasAnyCharacterOccupant(state, areaKey)) {
-      areaState.schedules[areaKey] = now + 1000;
-      continue;
-    }
-    if (!Number.isFinite(dueMs) || dueMs > now) continue;
+    const emptySince = Math.max(0, Math.floor(Number(areaState.emptySince[areaKey] ?? 0) || 0));
+    const emptyDelayMs = areaRespawnDelayMsForDepth(parsed.z);
+    const readyAt = emptySince > 0 ? (emptySince + emptyDelayMs) : Math.max(now + emptyDelayMs, Number(dueMs) || 0);
+    areaState.emptySince[areaKey] = emptySince > 0 ? emptySince : now;
+    areaState.schedules[areaKey] = readyAt;
+    if (readyAt > now) continue;
     respawnEntitiesForArea(state, areaKey, now);
     delete areaState.schedules[areaKey];
+    delete areaState.emptySince[areaKey];
   }
 }
 
@@ -17677,6 +17903,16 @@ function playerAttack(state, monster) {
   if (!rollHit(attackAcc, targetEva)) {
     monster.awake = true;
     rememberMonsterPlayerPosition(monster, p, combatClock);
+    const attackerPlayerId = liveCombatPlayerIdFromState(state, p);
+    if (attackerPlayerId) {
+      addLiveMonsterThreatForPlayer(state, monster, attackerPlayerId, 6, { tick: combatClock });
+      noteLiveMonsterSeenPlayer(state, monster, attackerPlayerId, {
+        tick: combatClock,
+        x: Number(p.x ?? 0),
+        y: Number(p.y ?? 0),
+        z: Number(p.z ?? 0),
+      });
+    }
     alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec), combatClock);
     pushLog(state, `You miss the ${monsterDisplayName(monster, p.z)}.`);
     persistMonsterOverride(state, monster);
@@ -17693,6 +17929,16 @@ function playerAttack(state, monster) {
   const dmg = attack.dmg;
   monster.hp -= dmg;
   monster.awake = true;
+  const attackerPlayerId = liveCombatPlayerIdFromState(state, p);
+  if (attackerPlayerId) {
+    addLiveMonsterThreatForPlayer(state, monster, attackerPlayerId, Math.max(8, dmg * 2), { tick: combatClock });
+    noteLiveMonsterSeenPlayer(state, monster, attackerPlayerId, {
+      tick: combatClock,
+      x: Number(p.x ?? 0),
+      y: Number(p.y ?? 0),
+      z: Number(p.z ?? 0),
+    });
+  }
   rememberMonsterPlayerPosition(monster, p, combatClock);
   alertMonsterPack(state, monster, p, monsterAlertRadius(mSpec), combatClock);
   persistMonsterOverride(state, monster);
@@ -18007,6 +18253,7 @@ function useInventoryIndex(state, idx) {
     const heal = Math.max(1, Math.round(potionHealAmount(p.maxHp) * Math.max(0.1, Number(p.healMult ?? 1))));
     const before = p.hp;
     p.hp = clamp(p.hp + heal, 0, p.maxHp);
+    if (p.hp !== before && canUseSharedDungeonSync()) sharedDungeonRuntime.localVitalsDirty = true;
     recordAnalyticsDamage(ensureAnalyticsState(state), p.z, { healing: Math.max(0, p.hp - before) });
     pushLog(state, `You drink a potion. (+${p.hp - before} HP, ${Math.round(POTION_HEAL_PCT * 100)}% max base)`);
 
@@ -18586,6 +18833,7 @@ function chooseMonsterSupportUndeadAction(state, monster = null, spec = null, op
 function spawnSupportSummonedMonster(state, summoner = null, monsterType = "skeleton", options = null) {
   if (!state?.entities || !state?.dynamic) return null;
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
   const targetPos = normalizeLiveTargetPoint(opts.targetPos ?? null);
   if (!targetPos) return null;
   const spec = monsterStatsForDepth(monsterType, targetPos.z);
@@ -18615,18 +18863,18 @@ function spawnSupportSummonedMonster(state, summoner = null, monsterType = "skel
   }
   const summonLive = ensureLiveActorState(ent, "monster");
   summonLive.ai.leashAnchor = { x: targetPos.x, y: targetPos.y, z: targetPos.z };
-  if (opts.trackPlayer === true && state?.player && targetPos.z === Math.floor(Number(state.player.z ?? targetPos.z))) {
+  if (opts.trackPlayer === true && target && targetPos.z === Math.floor(Number(target.z ?? targetPos.z))) {
     rememberMonsterPlayerPosition(
       ent,
-      state.player,
+      target,
       Number.isFinite(Number(opts.currentTick)) ? Math.floor(Number(opts.currentTick)) : Math.floor(Number(opts.currentTurn ?? state.turn ?? 0))
     );
     if (ent.awake) {
-      summonLive.combat.combatTargetId = liveSimulationActorId(state, state.player, "player");
+      summonLive.combat.combatTargetId = liveSimulationActorId(state, target, "player");
       summonLive.combat.lastKnownEnemyPos = {
-        x: Math.floor(Number(state.player.x ?? 0)),
-        y: Math.floor(Number(state.player.y ?? 0)),
-        z: Math.floor(Number(state.player.z ?? 0)),
+        x: Math.floor(Number(target.x ?? 0)),
+        y: Math.floor(Number(target.y ?? 0)),
+        z: Math.floor(Number(target.z ?? 0)),
       };
       summonLive.combat.aggroState = "engaged";
     }
@@ -18637,20 +18885,20 @@ function spawnSupportSummonedMonster(state, summoner = null, monsterType = "skel
 function resolveMonsterSupportUndeadActionEffect(state, monster = null, spec = null, descriptor = null, options = null) {
   if (!state?.entities || !monster || monster.kind !== "monster") return { ok: false, reason: "invalid" };
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
   const abilityId = String(descriptor?.abilityId ?? "").trim().toLowerCase();
-  const z = Math.floor(Number(monster.z ?? state?.player?.z ?? 0));
+  const z = Math.floor(Number(monster.z ?? target?.z ?? state?.player?.z ?? 0));
   if (abilityId === "summon_skeleton") {
     const targetPos = normalizeLiveTargetPoint(descriptor?.targetPos ?? null);
     if (!targetPos) return { ok: false, reason: "no_space" };
     const occupiedMonsters = opts.monsterOccupancy instanceof Map ? opts.monsterOccupancy : buildOccupancy(state).monsters;
-    const player = state?.player ?? null;
     if (!state.world.isPassable(targetPos.x, targetPos.y, targetPos.z)) return { ok: false, reason: "blocked" };
     if (occupiedMonsters.get(keyXYZ(targetPos.x, targetPos.y, targetPos.z))) return { ok: false, reason: "blocked" };
     if (
-      player
-      && targetPos.x === Math.floor(Number(player.x ?? 0))
-      && targetPos.y === Math.floor(Number(player.y ?? 0))
-      && targetPos.z === Math.floor(Number(player.z ?? targetPos.z))
+      target
+      && targetPos.x === Math.floor(Number(target.x ?? 0))
+      && targetPos.y === Math.floor(Number(target.y ?? 0))
+      && targetPos.z === Math.floor(Number(target.z ?? targetPos.z))
     ) {
       return { ok: false, reason: "blocked" };
     }
@@ -18660,6 +18908,7 @@ function resolveMonsterSupportUndeadActionEffect(state, monster = null, spec = n
       currentTick: opts.currentTick,
       currentTurn: opts.currentTurn,
       trackPlayer: opts.trackPlayer === true,
+      target,
       monsterOccupancy: occupiedMonsters,
     });
     if (!summoned) return { ok: false, reason: "spawn_failed" };
@@ -18741,19 +18990,21 @@ function executeMonsterShotIntent(state, monster, spec) {
   return true;
 }
 
-function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
+function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits", explicitTarget = null) {
+  const target = resolveLiveMonsterTargetActor(state, explicitTarget);
+  if (!target) return false;
   markCombatEvent(state, monster);
-  markLiveCombatEngagement(state, monster, "monster", state.player, "player");
-  const nm = monsterDisplayName(monster, state.player.z);
-  const spec = monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
-  const classId = normalizeCharacterClassId(state.player.classId, state.player.speciesId);
-  const dist = Math.abs((monster?.x ?? 0) - state.player.x) + Math.abs((monster?.y ?? 0) - state.player.y);
+  markLiveCombatEngagement(state, monster, "monster", target, "player");
+  const nm = monsterDisplayName(monster, target.z ?? state?.player?.z ?? 0);
+  const spec = monsterStatsForDepth(monster.type, monster.z ?? target.z ?? state?.player?.z ?? 0);
+  const classId = normalizeCharacterClassId(target.classId, target.speciesId);
+  const dist = Math.abs((monster?.x ?? 0) - target.x) + Math.abs((monster?.y ?? 0) - target.y);
   let attackerAcc = spec.acc;
   if (classId === "warden_gap" && dist <= 2) attackerAcc = Math.max(8, attackerAcc - 5);
-  if (!rollHit(attackerAcc, state.player.eva ?? 0)) {
-    if (classId === "slipblade") state.player.slipbladeBonusReady = true;
+  if (!rollHit(attackerAcc, target.eva ?? 0)) {
+    if (classId === "slipblade") target.slipbladeBonusReady = true;
     pushLog(state, `The ${nm} misses you.`);
-    return;
+    return false;
   }
   let raw = baseDmgLo + Math.floor(Math.random() * (baseDmgHi - baseDmgLo + 1));
   if (monster?.type === "rift_hound" && monster?.blinkStrikeBonus) {
@@ -18763,14 +19014,14 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
 
   if (playerHasGodmode(state)) {
     pushLog(state, `The ${nm} ${verb} you, but no damage gets through.`);
-    return;
+    return false;
   }
 
-  const reduced = reduceIncomingDamage(state, raw, monster.z ?? state.player.z);
+  const reduced = reduceIncomingDamage(state, raw, monster.z ?? target.z ?? state?.player?.z ?? 0);
   const dmg = Math.max(1, Math.floor(reduced?.dmg ?? 1));
-  state.player.hp -= dmg;
-  recordAnalyticsDamage(ensureAnalyticsState(state), state.player.z, { taken: dmg });
-  if (classId === "overclock_unit") state.player.overclockUntilMs = Date.now() + 3000;
+  target.hp -= dmg;
+  recordAnalyticsDamage(ensureAnalyticsState(state), target.z ?? state?.player?.z ?? 0, { taken: dmg });
+  if (classId === "overclock_unit") target.overclockUntilMs = Date.now() + 3000;
   pushLog(state, `The ${nm} ${verb} you for ${dmg}.`);
   if (reduced?.shaded) pushLog(state, "Shadeguard ward dampens the blow.");
   if (Math.random() < clamp(Number(spec?.poisonOnHitChance ?? 0), 0, 1)) {
@@ -18788,11 +19039,12 @@ function monsterHitPlayer(state, monster, baseDmgLo, baseDmgHi, verb = "hits") {
     applySlowToPlayer(state, 1, -10, -14, 0.75, `${nm}'s impact`);
   }
   if (Math.random() < clamp(Number(spec?.knockbackOnHitChance ?? 0), 0, 1)) {
-    if (tryKnockbackPlayer(state, monster.x ?? state.player.x, monster.y ?? state.player.y)) {
+    if (tryKnockbackPlayer(state, monster.x ?? target.x, monster.y ?? target.y)) {
       pushLog(state, `${nm} knocks you back.`);
     }
   }
-  if (state.player.hp <= 0) killPlayer(state, { cause: "monster", killerType: monster?.type ?? "" });
+  if (target.hp <= 0) killPlayer(state, { cause: "monster", killerType: monster?.type ?? "" });
+  return true;
 }
 
 function monstersTurn(state) {
@@ -22650,7 +22902,9 @@ function draw(state) {
     }
     touchCharacterProgress(state);
     updateAreaRespawnSystem(state, nowMs);
-    applyOutOfCombatRegen(state, nowMs);
+    if (!canUseSharedDungeonSync()) {
+      applyOutOfCombatRegen(state, nowMs);
+    }
   } else {
     updateViewportMetrics();
   }
@@ -23345,6 +23599,12 @@ function runLocalLiveTickCommand(state, command = null, options = null) {
   if (!state || typeof state !== "object") return false;
   if (isAuthoritativeSessionActive()) return false;
   if (!liveTickCombatEnabled(state)) return false;
+  const beforeVitalsSignature = JSON.stringify({
+    hp: Math.max(0, Math.floor(Number(state?.player?.hp ?? 0) || 0)),
+    maxHp: Math.max(1, Math.floor(Number(state?.player?.maxHp ?? 1) || 1)),
+    dead: !!state?.player?.dead,
+    effects: ensureArray(state?.player?.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean),
+  });
   const result = executeLiveTickCommandOnState(state, command, {
     nowMs: Date.now(),
     maxCatchupTicks: LIVE_SIM_COMMAND_CATCHUP_MAX_TICKS,
@@ -23352,6 +23612,15 @@ function runLocalLiveTickCommand(state, command = null, options = null) {
   });
   if (!result || typeof result !== "object") return false;
   if (result.ok === true) lastLocalLiveCommandAt = Date.now();
+  const afterVitalsSignature = JSON.stringify({
+    hp: Math.max(0, Math.floor(Number(state?.player?.hp ?? 0) || 0)),
+    maxHp: Math.max(1, Math.floor(Number(state?.player?.maxHp ?? 1) || 1)),
+    dead: !!state?.player?.dead,
+    effects: ensureArray(state?.player?.effects).map((entry) => (entry && typeof entry === "object" ? { ...entry } : null)).filter(Boolean),
+  });
+  if (beforeVitalsSignature !== afterVitalsSignature && canUseSharedDungeonSync()) {
+    sharedDungeonRuntime.localVitalsDirty = true;
+  }
   renderInventory(state);
   renderEquipment(state);
   renderEffects(state);
@@ -24142,6 +24411,35 @@ function normalizeLiveTargetPoint(raw = null) {
   return { x, y, z };
 }
 
+function normalizeLiveThreatByPlayerMap(raw = null) {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  const out = {};
+  for (const [idRaw, threatRaw] of Object.entries(src)) {
+    const playerId = normalizeCharacterProfileId(idRaw);
+    if (!playerId) continue;
+    const threat = Number(threatRaw);
+    if (!Number.isFinite(threat) || threat <= 0) continue;
+    out[playerId] = Math.min(1000000, Math.max(0, threat));
+  }
+  return out;
+}
+
+function normalizeLiveLastSeenPlayerById(raw = null) {
+  const src = (raw && typeof raw === "object") ? raw : {};
+  const out = {};
+  for (const [idRaw, posRaw] of Object.entries(src)) {
+    const playerId = normalizeCharacterProfileId(idRaw);
+    if (!playerId) continue;
+    const pos = normalizeLiveTargetPoint(posRaw ?? null);
+    if (!pos) continue;
+    out[playerId] = {
+      ...pos,
+      tick: Math.max(0, Math.floor(Number(posRaw?.tick ?? 0) || 0)),
+    };
+  }
+  return out;
+}
+
 function normalizeLiveIntentState(raw = null, actorKind = "actor") {
   const src = (raw && typeof raw === "object") ? raw : {};
   const moveDir = String(src.moveDir ?? "").trim().toUpperCase();
@@ -24194,6 +24492,11 @@ function normalizeLiveCombatActorState(raw = null, actorKind = "actor") {
     cooldowns: normalizeLiveCooldownState(src.cooldowns ?? null),
     combat: {
       combatTargetId: String(src?.combat?.combatTargetId ?? "").trim(),
+      currentTargetPlayerId: normalizeCharacterProfileId(src?.combat?.currentTargetPlayerId ?? ""),
+      targetLockedUntilTick: Math.max(0, Math.floor(Number(src?.combat?.targetLockedUntilTick ?? 0) || 0)),
+      threatByPlayerId: normalizeLiveThreatByPlayerMap(src?.combat?.threatByPlayerId ?? null),
+      lastSeenPlayerById: normalizeLiveLastSeenPlayerById(src?.combat?.lastSeenPlayerById ?? null),
+      lastThreatDecayTick: Math.max(0, Math.floor(Number(src?.combat?.lastThreatDecayTick ?? 0) || 0)),
       inCombatUntilTick: Math.max(0, Math.floor(Number(src?.combat?.inCombatUntilTick ?? 0) || 0)),
       lastDamagedById: String(src?.combat?.lastDamagedById ?? "").trim(),
       lastKnownEnemyPos: normalizeLiveTargetPoint(src?.combat?.lastKnownEnemyPos ?? null),
@@ -24992,6 +25295,65 @@ function clearLivePlayerCombatTarget(state, targetId = "") {
   }
 }
 
+function liveCombatPlayerIdFromState(state, player = null) {
+  const resolvedPlayer = (player && typeof player === "object") ? player : state?.player;
+  const fromCharacter = normalizeCharacterProfileId(state?.character?.id ?? "");
+  const fromPlayer = normalizeCharacterProfileId(resolvedPlayer?.id ?? "");
+  return fromCharacter || fromPlayer || "";
+}
+
+function noteLiveMonsterSeenPlayer(state, monster = null, playerId = "", options = null) {
+  if (!monster || monster.kind !== "monster") return;
+  const id = normalizeCharacterProfileId(playerId);
+  if (!id) return;
+  const opts = (options && typeof options === "object") ? options : {};
+  const tick = Math.max(0, Math.floor(Number(opts.tick ?? currentLiveSimulationTick(state)) || 0));
+  const x = Math.floor(Number(opts.x ?? state?.player?.x ?? monster.x ?? 0));
+  const y = Math.floor(Number(opts.y ?? state?.player?.y ?? monster.y ?? 0));
+  const z = Math.floor(Number(opts.z ?? state?.player?.z ?? monster.z ?? 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  monsterLive.combat.lastSeenPlayerById[id] = { x, y, z, tick };
+  if (monsterLive.combat.lastKnownEnemyPos?.z === z || !monsterLive.combat.lastKnownEnemyPos) {
+    monsterLive.combat.lastKnownEnemyPos = { x, y, z };
+  }
+}
+
+function addLiveMonsterThreatForPlayer(state, monster = null, playerId = "", amount = 0, options = null) {
+  if (!monster || monster.kind !== "monster") return;
+  const id = normalizeCharacterProfileId(playerId);
+  const threatAmount = Number(amount);
+  if (!id || !Number.isFinite(threatAmount) || threatAmount <= 0) return;
+  const opts = (options && typeof options === "object") ? options : {};
+  const tick = Math.max(0, Math.floor(Number(opts.tick ?? currentLiveSimulationTick(state)) || 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  const currentThreat = Math.max(0, Number(monsterLive.combat.threatByPlayerId[id] ?? 0) || 0);
+  monsterLive.combat.threatByPlayerId[id] = Math.min(1000000, currentThreat + threatAmount);
+  if (!monsterLive.combat.currentTargetPlayerId || monsterLive.combat.currentTargetPlayerId === id) {
+    monsterLive.combat.currentTargetPlayerId = id;
+    monsterLive.combat.combatTargetId = id;
+    monsterLive.combat.targetLockedUntilTick = Math.max(monsterLive.combat.targetLockedUntilTick, tick + Math.max(4, liveTicksFromLegacyTurns(1)));
+  }
+}
+
+function decayLiveMonsterThreat(monster = null, currentTick = 0) {
+  if (!monster || monster.kind !== "monster") return;
+  const tick = Math.max(0, Math.floor(Number(currentTick) || 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  const lastDecayTick = Math.max(0, Math.floor(Number(monsterLive.combat.lastThreatDecayTick ?? tick) || tick));
+  const decaySteps = Math.max(0, Math.min(24, tick - lastDecayTick));
+  if (decaySteps <= 0) return;
+  const decayFactor = Math.pow(0.92, decaySteps);
+  for (const [id, rawThreat] of Object.entries(monsterLive.combat.threatByPlayerId ?? {})) {
+    const nextThreat = Math.max(0, Number(rawThreat ?? 0) * decayFactor);
+    if (nextThreat < 0.5) {
+      delete monsterLive.combat.threatByPlayerId[id];
+    } else {
+      monsterLive.combat.threatByPlayerId[id] = nextThreat;
+    }
+  }
+  monsterLive.combat.lastThreatDecayTick = tick;
+}
+
 function markLiveCombatEngagement(state, source = null, sourceKind = "actor", target = null, targetKind = "actor", tick = null) {
   if (!state || typeof state !== "object") return;
   const currentTick = Math.max(0, Math.floor(Number(tick ?? currentLiveSimulationTick(state)) || 0));
@@ -25004,6 +25366,31 @@ function markLiveCombatEngagement(state, source = null, sourceKind = "actor", ta
     : ensureLiveActorState(target, targetKind);
   const sourceId = liveSimulationActorId(state, source, sourceKind);
   const targetId = liveSimulationActorId(state, target, targetKind);
+  const activePlayerId = liveCombatPlayerIdFromState(state, state?.player);
+  if (sourceKind === "monster" && source && typeof source === "object") {
+    source.awake = true;
+    if (targetKind === "player" && activePlayerId) {
+      addLiveMonsterThreatForPlayer(state, source, activePlayerId, 3, { tick: currentTick });
+      noteLiveMonsterSeenPlayer(state, source, activePlayerId, {
+        tick: currentTick,
+        x: Number(target?.x ?? state?.player?.x ?? 0),
+        y: Number(target?.y ?? state?.player?.y ?? 0),
+        z: Number(target?.z ?? state?.player?.z ?? 0),
+      });
+    }
+  }
+  if (targetKind === "monster" && target && typeof target === "object") {
+    target.awake = true;
+    if (sourceKind === "player" && activePlayerId) {
+      addLiveMonsterThreatForPlayer(state, target, activePlayerId, 3, { tick: currentTick });
+      noteLiveMonsterSeenPlayer(state, target, activePlayerId, {
+        tick: currentTick,
+        x: Number(source?.x ?? state?.player?.x ?? 0),
+        y: Number(source?.y ?? state?.player?.y ?? 0),
+        z: Number(source?.z ?? state?.player?.z ?? 0),
+      });
+    }
+  }
   if (sourceLive) {
     sourceLive.combat.inCombatUntilTick = Math.max(sourceLive.combat.inCombatUntilTick, untilTick);
     sourceLive.combat.combatTargetId = targetId;
@@ -25074,9 +25461,16 @@ function resolveLivePlayerAttackTarget(state) {
   return primary;
 }
 
-function liveMonsterCanConsiderSupportAction(state, monster = null, currentTick = 0) {
-  if (!state?.player || !monster || monster.kind !== "monster") return false;
-  const p = state.player;
+function resolveLiveMonsterTargetActor(state, explicitTarget = null) {
+  const target = (explicitTarget && typeof explicitTarget === "object") ? explicitTarget : state?.player;
+  if (!target || target.dead) return null;
+  if (!Number.isFinite(Number(target.x)) || !Number.isFinite(Number(target.y)) || !Number.isFinite(Number(target.z))) return null;
+  return target;
+}
+
+function liveMonsterCanConsiderSupportAction(state, monster = null, currentTick = 0, explicitTarget = null) {
+  const p = resolveLiveMonsterTargetActor(state, explicitTarget);
+  if (!p || !monster || monster.kind !== "monster") return false;
   const monsterLive = ensureLiveActorState(monster, "monster");
   const actRadius = Math.max(viewRadiusX, viewRadiusY) + 5;
   const dx = Math.floor(Number(monster.x ?? 0)) - Math.floor(Number(p.x ?? 0));
@@ -25106,41 +25500,46 @@ function liveMonsterSupportTiming(monster = null, spec = null, abilityId = "") {
   };
 }
 
-function liveTelegraphPointsForMonsterAbility(state, monster = null, abilityId = "", targetPos = null) {
-  if (!state?.player || !monster) return [];
+function liveTelegraphPointsForMonsterAbility(state, monster = null, abilityId = "", targetPos = null, explicitTarget = null) {
+  const target = resolveLiveMonsterTargetActor(state, explicitTarget);
+  if (!monster) return [];
   const origin = {
     x: Math.floor(Number(monster.x ?? 0)),
     y: Math.floor(Number(monster.y ?? 0)),
-    z: Math.floor(Number(monster.z ?? state.player.z ?? 0)),
+    z: Math.floor(Number(monster.z ?? target?.z ?? state?.player?.z ?? 0)),
   };
   const normalizedId = String(abilityId ?? "").trim().toLowerCase();
   const resolvedTarget = normalizeLiveTargetPoint(targetPos ?? null)
     ?? (normalizedId === "summon_skeleton"
       ? origin
-      : {
-          x: Math.floor(Number(state.player.x ?? 0)),
-          y: Math.floor(Number(state.player.y ?? 0)),
-          z: Math.floor(Number(state.player.z ?? 0)),
-        });
+      : (target
+        ? {
+            x: Math.floor(Number(target.x ?? 0)),
+            y: Math.floor(Number(target.y ?? 0)),
+            z: Math.floor(Number(target.z ?? 0)),
+          }
+        : origin));
   if (normalizedId === "bolster_undead") return [origin];
   return [origin, resolvedTarget];
 }
 
 function chooseLiveMonsterAbilityAction(state, monster = null, spec = null, options = null) {
-  if (!state?.player || !monster || monster.kind !== "monster") return null;
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
+  if (!target || !monster || monster.kind !== "monster") return null;
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
   const ai = String(spec?.ai ?? (spec?.range ? "ranged_hold" : "melee_chase")).trim().toLowerCase();
   if (ai !== "support_undead") return null;
   const monsterLive = ensureLiveActorState(monster, "monster");
   if (monsterLive.cooldowns.abilityTicks > 0) return null;
-  if (!liveMonsterCanConsiderSupportAction(state, monster, currentTick)) return null;
+  if (!liveMonsterCanConsiderSupportAction(state, monster, currentTick, target)) return null;
   return chooseMonsterSupportUndeadAction(state, monster, spec, opts);
 }
 
 function startLiveMonsterAbilityAction(state, monster = null, spec = null, descriptor = null, options = null) {
-  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0 || !descriptor) return false;
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
+  if (!target || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0 || !descriptor) return false;
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
   const live = ensureLiveSimulationState(state);
   const monsterLive = ensureLiveActorState(monster, "monster");
@@ -25170,20 +25569,19 @@ function startLiveMonsterAbilityAction(state, monster = null, spec = null, descr
   noteLiveMonsterAiDecision(monster, currentTick, "casting", abilityId, {
     behaviorId: String(spec?.ai ?? "").trim().toLowerCase() || "support_undead",
   });
-  const seesPlayer = state.player && hasLineOfSight(
+  const seesPlayer = hasLineOfSight(
     state.world,
-    Math.floor(Number(monster.z ?? state.player.z ?? 0)),
+    Math.floor(Number(monster.z ?? target.z ?? 0)),
     monster.x,
     monster.y,
-    state.player.x,
-    state.player.y
+    target.x,
+    target.y
   );
   if (
-    state.player
-    && Math.floor(Number(monster.z ?? state.player.z ?? 0)) === Math.floor(Number(state.player.z ?? 0))
+    Math.floor(Number(monster.z ?? target.z ?? 0)) === Math.floor(Number(target.z ?? 0))
     && (seesPlayer || currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0)))
   ) {
-    liveRememberMonsterPlayer(state, monster, currentTick);
+    liveRememberMonsterPlayer(state, monster, currentTick, target);
   }
   if (timing.telegraphed) {
     state.live.telegraphs = state.live.telegraphs
@@ -25195,7 +25593,7 @@ function startLiveMonsterAbilityAction(state, monster = null, spec = null, descr
         startTick: currentTick,
         resolveTick: monsterLive.action.actionResolveTick,
         shape: abilityId === "bolster_undead" ? "cell" : "line",
-        points: liveTelegraphPointsForMonsterAbility(state, monster, abilityId, descriptor.targetPos),
+        points: liveTelegraphPointsForMonsterAbility(state, monster, abilityId, descriptor.targetPos, target),
       })
       .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
   }
@@ -25215,8 +25613,9 @@ function startLiveMonsterAbilityAction(state, monster = null, spec = null, descr
 }
 
 function resolveLiveMonsterAbilityAction(state, monster = null, spec = null, options = null) {
-  if (!state?.player || !monster || monster.kind !== "monster") return false;
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
+  if (!target || !monster || monster.kind !== "monster") return false;
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
   const monsterLive = ensureLiveActorState(monster, "monster");
   if (monsterLive.action.currentActionType !== "ABILITY" || monsterLive.action.actionState !== "windup") return false;
@@ -25229,7 +25628,8 @@ function resolveLiveMonsterAbilityAction(state, monster = null, spec = null, opt
     targetPos: monsterLive.action.targetPos,
   }, {
     currentTick,
-    trackPlayer: hasLineOfSight(state.world, Math.floor(Number(monster.z ?? state.player.z ?? 0)), monster.x, monster.y, state.player.x, state.player.y)
+    target,
+    trackPlayer: hasLineOfSight(state.world, Math.floor(Number(monster.z ?? target.z ?? 0)), monster.x, monster.y, target.x, target.y)
       || currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0)),
   });
   if (result.ok) {
@@ -25364,9 +25764,9 @@ function resolveLivePlayerBasicAttack(state, options = null) {
   return resolved;
 }
 
-function monsterCanHitPlayerNow(state, monster = null, spec = null) {
-  if (!state?.player || !monster || monster.kind !== "monster") return { canHit: false, ranged: false, telegraphed: false };
-  const p = state.player;
+function monsterCanHitTargetNow(state, monster = null, target = null, spec = null) {
+  if (!state?.world || !monster || monster.kind !== "monster" || !target) return { canHit: false, ranged: false, telegraphed: false };
+  const p = target;
   const z = Math.floor(Number(monster.z ?? p.z ?? 0));
   if (p.dead || z !== Math.floor(Number(p.z ?? 0))) return { canHit: false, ranged: false, telegraphed: false };
   const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, z);
@@ -25383,12 +25783,17 @@ function monsterCanHitPlayerNow(state, monster = null, spec = null) {
   return { canHit: canShoot, ranged: true, telegraphed };
 }
 
+function monsterCanHitPlayerNow(state, monster = null, spec = null) {
+  return monsterCanHitTargetNow(state, monster, state?.player ?? null, spec);
+}
+
 function startLiveMonsterBasicAttack(state, monster = null, spec = null, options = null) {
-  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return false;
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
+  if (!target || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return false;
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
-  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
-  const canAttack = monsterCanHitPlayerNow(state, monster, monsterSpec);
+  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, monster.z ?? target.z ?? state?.player?.z ?? 0);
+  const canAttack = monsterCanHitTargetNow(state, monster, target, monsterSpec);
   if (!canAttack.canHit) return false;
   const monsterLive = ensureLiveActorState(monster, "monster");
   if (monsterLive.cooldowns.attackTicks > 0) return false;
@@ -25407,25 +25812,25 @@ function startLiveMonsterBasicAttack(state, monster = null, spec = null, options
   monsterLive.action.gcdEndTick = monsterLive.action.actionRecoveryEndTick;
   monsterLive.action.moveLockUntilTick = currentTick + timing.moveLockTicks;
   monsterLive.action.sequence = actionSeq;
-  monsterLive.action.targetId = liveSimulationActorId(state, state.player, "player");
+  monsterLive.action.targetId = liveSimulationActorId(state, target, "player");
   monsterLive.action.targetPos = {
-    x: Math.floor(Number(state.player.x ?? 0)),
-    y: Math.floor(Number(state.player.y ?? 0)),
-    z: Math.floor(Number(state.player.z ?? 0)),
+    x: Math.floor(Number(target.x ?? 0)),
+    y: Math.floor(Number(target.y ?? 0)),
+    z: Math.floor(Number(target.z ?? 0)),
   };
   monsterLive.cooldowns.attackTicks = Math.max(monsterLive.cooldowns.attackTicks, timing.cooldownTicks);
-  monsterLive.combat.combatTargetId = liveSimulationActorId(state, state.player, "player");
+  monsterLive.combat.combatTargetId = liveSimulationActorId(state, target, "player");
   monsterLive.combat.lastKnownEnemyPos = {
-    x: Math.floor(Number(state.player.x ?? 0)),
-    y: Math.floor(Number(state.player.y ?? 0)),
-    z: Math.floor(Number(state.player.z ?? 0)),
+    x: Math.floor(Number(target.x ?? 0)),
+    y: Math.floor(Number(target.y ?? 0)),
+    z: Math.floor(Number(target.z ?? 0)),
   };
   monsterLive.combat.aggroState = "engaged";
   noteLiveMonsterAiDecision(monster, currentTick, "attacking", canAttack.ranged ? "ranged_attack" : "melee_attack", {
     behaviorId: String(monsterSpec.ai ?? "").trim().toLowerCase() || (monsterSpec.range ? "ranged_hold" : "melee_chase"),
   });
   monster.awake = true;
-  liveRememberMonsterPlayer(state, monster, currentTick);
+  liveRememberMonsterPlayer(state, monster, currentTick, target);
   if (timing.telegraphed) {
     state.live.telegraphs = state.live.telegraphs
       .filter((entry) => String(entry?.id ?? "").trim() !== monsterLive.action.currentActionId)
@@ -25437,17 +25842,17 @@ function startLiveMonsterBasicAttack(state, monster = null, spec = null, options
         resolveTick: monsterLive.action.actionResolveTick,
         shape: canAttack.ranged ? "line" : "cell",
         points: [
-          { x: Math.floor(Number(monster.x ?? 0)), y: Math.floor(Number(monster.y ?? 0)), z: Math.floor(Number(monster.z ?? state.player.z ?? 0)) },
-          { x: Math.floor(Number(state.player.x ?? 0)), y: Math.floor(Number(state.player.y ?? 0)), z: Math.floor(Number(state.player.z ?? 0)) },
+          { x: Math.floor(Number(monster.x ?? 0)), y: Math.floor(Number(monster.y ?? 0)), z: Math.floor(Number(monster.z ?? target.z ?? 0)) },
+          { x: Math.floor(Number(target.x ?? 0)), y: Math.floor(Number(target.y ?? 0)), z: Math.floor(Number(target.z ?? 0)) },
         ],
       })
       .slice(-LIVE_SIM_MAX_EVENT_HISTORY);
   }
-  markLiveCombatEngagement(state, monster, "monster", state.player, "player", currentTick);
+  markLiveCombatEngagement(state, monster, "monster", target, "player", currentTick);
   pushLiveSimulationEvent(state, "monster_attack_windup", {
     tick: currentTick,
     actorId: monster.id,
-    targetId: liveSimulationActorId(state, state.player, "player"),
+    targetId: liveSimulationActorId(state, target, "player"),
     actionId: monsterLive.action.currentActionId,
     payload: {
       windupTicks: timing.windupTicks,
@@ -25460,31 +25865,32 @@ function startLiveMonsterBasicAttack(state, monster = null, spec = null, options
 }
 
 function resolveLiveMonsterBasicAttack(state, monster = null, spec = null, options = null) {
-  if (!state?.player || !monster || monster.kind !== "monster") return false;
   const opts = (options && typeof options === "object") ? options : {};
+  const target = resolveLiveMonsterTargetActor(state, opts.target ?? null);
+  if (!target || !monster || monster.kind !== "monster") return false;
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
   const monsterLive = ensureLiveActorState(monster, "monster");
   const actionId = String(monsterLive.action.currentActionId ?? "").trim();
   if (monsterLive.action.currentActionType !== "ATTACK" || monsterLive.action.actionState !== "windup") return false;
-  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
-  const attackCheck = monsterCanHitPlayerNow(state, monster, monsterSpec);
+  const monsterSpec = (spec && typeof spec === "object") ? spec : monsterStatsForDepth(monster.type, monster.z ?? target.z ?? state?.player?.z ?? 0);
+  const attackCheck = monsterCanHitTargetNow(state, monster, target, monsterSpec);
   const targetPos = normalizeLiveTargetPoint(monsterLive.action.targetPos ?? null);
   const aimedAtPlayer = !attackCheck.ranged
     || !targetPos
     || (
-      Math.floor(Number(state.player.x ?? 0)) === targetPos.x
-      && Math.floor(Number(state.player.y ?? 0)) === targetPos.y
-      && Math.floor(Number(state.player.z ?? 0)) === targetPos.z
+      Math.floor(Number(target.x ?? 0)) === targetPos.x
+      && Math.floor(Number(target.y ?? 0)) === targetPos.y
+      && Math.floor(Number(target.z ?? 0)) === targetPos.z
     );
   const resolved = attackCheck.canHit && aimedAtPlayer;
   clearLiveTelegraphForAction(state, actionId);
   if (resolved) {
-    monsterHitPlayer(state, monster, monsterSpec.atkLo, monsterSpec.atkHi, attackCheck.ranged ? "shoots" : "hits");
-    markLiveCombatEngagement(state, monster, "monster", state.player, "player", currentTick);
+    monsterHitPlayer(state, monster, monsterSpec.atkLo, monsterSpec.atkHi, attackCheck.ranged ? "shoots" : "hits", target);
+    markLiveCombatEngagement(state, monster, "monster", target, "player", currentTick);
     pushLiveSimulationEvent(state, "monster_attack_resolve", {
       tick: currentTick,
       actorId: monster.id,
-      targetId: liveSimulationActorId(state, state.player, "player"),
+      targetId: liveSimulationActorId(state, target, "player"),
       actionId,
       payload: {
         ranged: attackCheck.ranged === true,
@@ -25492,12 +25898,12 @@ function resolveLiveMonsterBasicAttack(state, monster = null, spec = null, optio
     });
   } else {
     if (state.visible?.has?.(keyXY(monster.x, monster.y))) {
-      pushLog(state, `The ${monsterDisplayName(monster, state.player.z)} lashes out but misses its window.`);
+      pushLog(state, `The ${monsterDisplayName(monster, target.z ?? state?.player?.z ?? 0)} lashes out but misses its window.`);
     }
     pushLiveSimulationEvent(state, "monster_attack_cancel", {
       tick: currentTick,
       actorId: monster.id,
-      targetId: liveSimulationActorId(state, state.player, "player"),
+      targetId: liveSimulationActorId(state, target, "player"),
       actionId,
       payload: {
         reason: aimedAtPlayer ? "out_of_range" : "target_moved",
@@ -25514,6 +25920,39 @@ function resolveLiveMonsterBasicAttack(state, monster = null, spec = null, optio
   }
   persistMonsterOverride(state, monster);
   return resolved;
+}
+
+function cancelLiveMonsterBasicAttack(state, monster = null, options = null) {
+  if (!monster || monster.kind !== "monster") return false;
+  const opts = (options && typeof options === "object") ? options : {};
+  const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  if (monsterLive.action.currentActionType !== "ATTACK") return false;
+  const actionId = String(monsterLive.action.currentActionId ?? "").trim();
+  const reason = String(opts.reason ?? "target_missing").trim().toLowerCase() || "target_missing";
+  const monsterSpec = (opts.spec && typeof opts.spec === "object")
+    ? opts.spec
+    : monsterStatsForDepth(monster.type, monster.z ?? state?.player?.z ?? 0);
+  clearLiveTelegraphForAction(state, actionId);
+  pushLiveSimulationEvent(state, "monster_attack_cancel", {
+    tick: currentTick,
+    actorId: monster.id,
+    targetId: String(monsterLive.action.targetId ?? ""),
+    actionId,
+    payload: { reason },
+  });
+  monsterLive.action.actionState = "recovery";
+  monsterLive.action.actionResolveTick = currentTick;
+  monsterLive.action.targetId = "";
+  monsterLive.action.targetPos = null;
+  noteLiveMonsterAiDecision(monster, currentTick, "recovering", reason, {
+    behaviorId: String(monsterSpec.ai ?? "").trim().toLowerCase() || (monsterSpec.range ? "ranged_hold" : "melee_chase"),
+  });
+  if (currentTick > monsterLive.action.actionRecoveryEndTick) {
+    monsterLive.action.actionRecoveryEndTick = currentTick;
+  }
+  persistMonsterOverride(state, monster);
+  return true;
 }
 
 function advanceLivePlayerCombatOnTick(state, options = null) {
@@ -25578,16 +26017,30 @@ function noteLiveMonsterAiDecision(monster = null, currentTick = 0, stateId = ""
   return monsterLive.ai;
 }
 
-function liveRememberMonsterPlayer(state, monster = null, currentTick = 0) {
-  if (!state?.player || !monster) return;
-  rememberMonsterPlayerPosition(monster, state.player, currentTick);
-  alertMonsterPack(state, monster, state.player, monsterAlertRadius(monsterStatsForDepth(monster.type, monster.z ?? state.player.z)), currentTick);
+function liveRememberMonsterPlayer(state, monster = null, currentTick = 0, explicitTarget = null) {
+  const target = resolveLiveMonsterTargetActor(state, explicitTarget);
+  if (!target || !monster) return;
+  rememberMonsterPlayerPosition(monster, target, currentTick);
+  alertMonsterPack(state, monster, target, monsterAlertRadius(monsterStatsForDepth(monster.type, monster.z ?? target.z ?? state?.player?.z ?? 0)), currentTick);
   const monsterLive = initializeLiveMonsterAiState(monster, currentTick);
-  monsterLive.combat.combatTargetId = liveSimulationActorId(state, state.player, "player");
+  const playerId = liveCombatPlayerIdFromState(state, target);
+  if (playerId) {
+    noteLiveMonsterSeenPlayer(state, monster, playerId, {
+      tick: currentTick,
+      x: Number(target.x ?? 0),
+      y: Number(target.y ?? 0),
+      z: Number(target.z ?? 0),
+    });
+    addLiveMonsterThreatForPlayer(state, monster, playerId, 1, { tick: currentTick });
+  }
+  monsterLive.combat.combatTargetId = liveSimulationActorId(state, target, "player");
+  if (playerId) {
+    monsterLive.combat.currentTargetPlayerId = playerId;
+  }
   monsterLive.combat.lastKnownEnemyPos = {
-    x: Math.floor(Number(state.player.x ?? 0)),
-    y: Math.floor(Number(state.player.y ?? 0)),
-    z: Math.floor(Number(state.player.z ?? 0)),
+    x: Math.floor(Number(target.x ?? 0)),
+    y: Math.floor(Number(target.y ?? 0)),
+    z: Math.floor(Number(target.z ?? 0)),
   };
   monsterLive.combat.aggroState = "engaged";
   noteLiveMonsterAiDecision(monster, currentTick, "tracking", "saw_player", {
@@ -25698,10 +26151,10 @@ function tryCommitLiveMonsterMove(state, monster = null, nextPos = null, options
 }
 
 function advanceSingleLiveMonsterMovement(state, monster = null, options = null) {
-  if (!state?.player || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return { moved: false, reason: "invalid" };
   const opts = (options && typeof options === "object") ? options : {};
+  const p = resolveLiveMonsterTargetActor(state, opts.target ?? null);
+  if (!p || !monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) return { moved: false, reason: "invalid" };
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
-  const p = state.player;
   if (p.dead || monster.z !== p.z) return { moved: false, reason: "depth" };
   const monsterLive = initializeLiveMonsterAiState(monster, currentTick);
   if (monsterLive.action.actionState !== "idle") return { moved: false, reason: "busy" };
@@ -25725,7 +26178,7 @@ function advanceSingleLiveMonsterMovement(state, monster = null, options = null)
 
   if (seesPlayer) {
     monster.awake = true;
-    liveRememberMonsterPlayer(state, monster, currentTick);
+    liveRememberMonsterPlayer(state, monster, currentTick, p);
   }
 
   const markNoMove = (reason = "hold") => {
@@ -26065,6 +26518,7 @@ function advanceLiveSimulationOnState(state, options = null) {
   const stepCount = Math.max(1, Math.floor(Number(opts.ticks ?? 1) || 1));
   const oneShotMoveDir = normalizeCardinalDirection(opts.playerMoveDir ?? "");
   const clearMoveIntent = opts.clearMoveIntent !== false;
+  // In shared multiplayer mode, monster simulation is server-authoritative.
   const useServerSharedMonsterSync = !HEADLESS_RUNTIME && canUseSharedDungeonSync();
   let advancedTicks = 0;
   let movedCount = 0;
@@ -26327,6 +26781,13 @@ function buildSharedServerCharacterProxy(state, target = null) {
   const proxyPlayer = {
     ...((state.player && typeof state.player === "object") ? state.player : {}),
   };
+  const proxyCombat = {
+    lastEventMs: Number.isFinite(Number(snapshot?.combat?.lastEventMs)) ? Math.max(0, Math.floor(Number(snapshot.combat.lastEventMs))) : 0,
+    regenAnchorMs: Number.isFinite(Number(snapshot?.combat?.regenAnchorMs))
+      ? Math.max(0, Math.floor(Number(snapshot.combat.regenAnchorMs)))
+      : Date.now(),
+    hudTargets: {},
+  };
   const proxyInv = normalizeInventoryEntries(snapPlayer.inv ?? [], {
     speciesId,
     classId,
@@ -26361,12 +26822,12 @@ function buildSharedServerCharacterProxy(state, target = null) {
   proxyPlayer.live = normalizeLiveCombatActorState(snapPlayer.live ?? proxyPlayer.live ?? null, "player");
   const snapMaxHp = Math.max(1, Math.floor(Number(snapPlayer.maxHp ?? proxyPlayer.maxHp ?? 1) || 1));
   const snapHp = Math.max(0, Math.floor(Number(snapPlayer.hp ?? proxyPlayer.hp ?? snapMaxHp) || 0));
-  const hpRatio = clamp(snapHp / snapMaxHp, 0, 1);
   recalcDerivedStats(proxyState);
-  proxyPlayer.hp = clamp(Math.round((proxyPlayer.maxHp ?? 1) * hpRatio), 0, proxyPlayer.maxHp ?? 1);
+  proxyPlayer.hp = clamp(snapHp, 0, proxyPlayer.maxHp ?? 1);
   proxyPlayer.energy = proxyPlayer.energyMax;
   return {
     player: proxyPlayer,
+    combat: proxyCombat,
     inv: proxyInv,
     character: profile,
   };
@@ -26407,39 +26868,144 @@ function syncSharedServerCharacterActors(state, characterRecords = []) {
   }
 }
 
+function resolveSharedServerCharacterRecordById(characterRecords = [], characterId = "") {
+  const targetId = normalizeCharacterProfileId(characterId);
+  if (!targetId) return null;
+  for (const target of Array.isArray(characterRecords) ? characterRecords : []) {
+    if (!target) continue;
+    if (normalizeCharacterProfileId(target.characterId ?? "") !== targetId) continue;
+    if (target.dead) return null;
+    return target;
+  }
+  return null;
+}
+
 function chooseSharedServerMonsterTarget(state, monster = null, characterRecords = [], options = null) {
   if (!state?.world || !monster || monster.kind !== "monster") return null;
   const opts = (options && typeof options === "object") ? options : {};
   const currentTick = Math.max(0, Math.floor(Number(opts.currentTick ?? currentLiveSimulationTick(state)) || 0));
   const monsterLive = ensureLiveActorState(monster, "monster");
+  const spec = monsterStatsForDepth(monster.type, monster.z ?? 0);
+  decayLiveMonsterThreat(monster, currentTick);
   const candidates = [];
+  const activePlayerIds = new Set();
   for (const target of Array.isArray(characterRecords) ? characterRecords : []) {
+    const playerId = normalizeCharacterProfileId(target?.characterId ?? "");
+    if (!playerId) continue;
+    activePlayerIds.add(playerId);
     if (!target || target.dead) continue;
     if (!Number.isFinite(Number(target.x)) || !Number.isFinite(Number(target.y)) || !Number.isFinite(Number(target.z))) continue;
     if (Math.floor(Number(target.z)) !== Math.floor(Number(monster.z ?? target.z))) continue;
     const dist = Math.abs(Math.floor(Number(monster.x ?? 0)) - Math.floor(Number(target.x))) + Math.abs(Math.floor(Number(monster.y ?? 0)) - Math.floor(Number(target.y)));
     const hasLos = hasLineOfSight(state.world, Math.floor(Number(target.z)), monster.x, monster.y, Math.floor(Number(target.x)), Math.floor(Number(target.y)));
-    const currentTarget = String(monsterLive.combat.combatTargetId ?? "").trim() === String(target.characterId ?? "").trim();
+    const attackCheck = monsterCanHitTargetNow(state, monster, {
+      x: Math.floor(Number(target.x)),
+      y: Math.floor(Number(target.y)),
+      z: Math.floor(Number(target.z)),
+      dead: false,
+    }, spec);
+    const currentTarget = String(monsterLive.combat.currentTargetPlayerId ?? "").trim() === playerId;
     const engaged = currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.inCombatUntilTick ?? 0) || 0));
+    const threat = Math.max(0, Number(monsterLive.combat.threatByPlayerId?.[playerId] ?? 0) || 0);
+    const memory = monsterLive.combat.lastSeenPlayerById?.[playerId] ?? null;
+    const memoryAge = memory ? Math.max(0, currentTick - Math.max(0, Math.floor(Number(memory.tick ?? 0) || 0))) : 9999;
     const hpPct = Math.max(0, Math.min(1, Number(target.hp ?? 0) / Math.max(1, Number(target.maxHp ?? 1))));
+    if (hasLos) {
+      noteLiveMonsterSeenPlayer(state, monster, playerId, {
+        tick: currentTick,
+        x: Number(target.x ?? 0),
+        y: Number(target.y ?? 0),
+        z: Number(target.z ?? 0),
+      });
+    }
+    let score = 0;
+    if (attackCheck.canHit) score += 120;
+    if (hasLos) score += 55;
+    else if (memory && memoryAge <= Math.max(6, liveTicksFromLegacyTurns(3))) score += 12;
+    score += Math.max(0, 35 - dist);
+    score += Math.min(220, threat * 4.5);
+    if (engaged) score += 16;
+    if (currentTarget) score += 34;
+    if (currentTarget && currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.targetLockedUntilTick ?? 0) || 0))) {
+      score += 32;
+    }
+    score += Math.max(0, (1 - hpPct) * 8);
     candidates.push({
       target,
+      playerId,
+      attackCheck,
       currentTarget,
       engaged,
       hasLos,
       dist,
       hpPct,
+      threat,
+      memoryAge,
+      score,
     });
   }
+  for (const id of Object.keys(monsterLive.combat.threatByPlayerId ?? {})) {
+    if (activePlayerIds.has(id)) continue;
+    delete monsterLive.combat.threatByPlayerId[id];
+  }
+  for (const id of Object.keys(monsterLive.combat.lastSeenPlayerById ?? {})) {
+    if (activePlayerIds.has(id)) continue;
+    delete monsterLive.combat.lastSeenPlayerById[id];
+  }
+  if (!candidates.length) {
+    monsterLive.combat.currentTargetPlayerId = "";
+    monsterLive.combat.combatTargetId = "";
+    return null;
+  }
   candidates.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
     if (a.currentTarget !== b.currentTarget) return a.currentTarget ? -1 : 1;
+    if (a.attackCheck.canHit !== b.attackCheck.canHit) return a.attackCheck.canHit ? -1 : 1;
     if (a.hasLos !== b.hasLos) return a.hasLos ? -1 : 1;
-    if (a.engaged !== b.engaged) return a.engaged ? -1 : 1;
     if (a.dist !== b.dist) return a.dist - b.dist;
-    if (a.hpPct !== b.hpPct) return a.hpPct - b.hpPct;
-    return String(a.target?.characterId ?? "").localeCompare(String(b.target?.characterId ?? ""));
+    if (a.memoryAge !== b.memoryAge) return a.memoryAge - b.memoryAge;
+    return String(a.playerId ?? "").localeCompare(String(b.playerId ?? ""));
   });
-  return candidates[0]?.target ?? null;
+  const best = candidates[0];
+  const currentTargetId = normalizeCharacterProfileId(monsterLive.combat.currentTargetPlayerId ?? "");
+  const current = currentTargetId ? (candidates.find((entry) => entry.playerId === currentTargetId) ?? null) : null;
+  let selected = best;
+  if (current) {
+    const currentLocked = currentTick < Math.max(0, Math.floor(Number(monsterLive.combat.targetLockedUntilTick ?? 0) || 0));
+    const currentBeatsSwitchThreshold = current.score > 0 && best.score < (current.score * 1.25);
+    if (currentLocked || currentBeatsSwitchThreshold) {
+      selected = current;
+    }
+  }
+  const switched = normalizeCharacterProfileId(monsterLive.combat.currentTargetPlayerId ?? "") !== selected.playerId;
+  monsterLive.combat.currentTargetPlayerId = selected.playerId;
+  monsterLive.combat.combatTargetId = selected.playerId;
+  monsterLive.combat.targetLockedUntilTick = switched
+    ? currentTick + Math.max(6, liveTicksFromLegacyTurns(2))
+    : Math.max(monsterLive.combat.targetLockedUntilTick, currentTick + Math.max(4, liveTicksFromLegacyTurns(1)));
+  monsterLive.combat.lastKnownEnemyPos = {
+    x: Math.floor(Number(selected.target?.x ?? 0)),
+    y: Math.floor(Number(selected.target?.y ?? 0)),
+    z: Math.floor(Number(selected.target?.z ?? monster.z ?? 0)),
+  };
+  return selected.target ?? null;
+}
+
+function resolveSharedServerMonsterContextTarget(state, monster = null, characterRecords = [], options = null) {
+  if (!state?.world || !monster || monster.kind !== "monster") return null;
+  const monsterLive = ensureLiveActorState(monster, "monster");
+  const actionState = String(monsterLive.action.actionState ?? "").trim().toLowerCase();
+  const actionType = String(monsterLive.action.currentActionType ?? "").trim().toUpperCase();
+  const preserveActionTarget = actionState === "windup" || actionState === "executing";
+  if (preserveActionTarget && actionType === "ATTACK") {
+    const attackTarget = resolveSharedServerCharacterRecordById(characterRecords, monsterLive.action.targetId);
+    if (attackTarget) return attackTarget;
+  }
+  if (preserveActionTarget) {
+    const combatTarget = resolveSharedServerCharacterRecordById(characterRecords, monsterLive.combat.currentTargetPlayerId);
+    if (combatTarget) return combatTarget;
+  }
+  return chooseSharedServerMonsterTarget(state, monster, characterRecords, options);
 }
 
 function withSharedServerCharacterContext(state, target = null, fn = null) {
@@ -26447,9 +27013,15 @@ function withSharedServerCharacterContext(state, target = null, fn = null) {
   if (!target.proxy) target.proxy = buildSharedServerCharacterProxy(state, target);
   if (!target.proxy?.player) return null;
   const prevPlayer = state.player;
+  const prevCombat = state.combat;
   const prevInv = state.inv;
   const prevCharacter = state.character;
   state.player = target.proxy.player;
+  state.combat = target.proxy.combat ?? {
+    lastEventMs: 0,
+    regenAnchorMs: Date.now(),
+    hudTargets: {},
+  };
   state.inv = target.proxy.inv;
   state.character = target.proxy.character;
   try {
@@ -26462,6 +27034,7 @@ function withSharedServerCharacterContext(state, target = null, fn = null) {
     target.maxHp = Math.max(1, Math.floor(Number(state.player?.maxHp ?? target.maxHp ?? 1) || 1));
     target.dead = !!state.player?.dead || target.hp <= 0;
     state.player = prevPlayer;
+    state.combat = prevCombat;
     state.inv = prevInv;
     state.character = prevCharacter;
   }
@@ -26471,6 +27044,7 @@ function exportSharedServerCharacterSnapshot(target = null) {
   if (!target?.proxy?.player || !target?.proxy?.character) return null;
   const snapshot = exportCharacterSnapshot({
     player: target.proxy.player,
+    combat: target.proxy.combat ?? null,
     inv: target.proxy.inv ?? [],
     character: target.proxy.character,
     sharedDungeonId: target.dungeonInstanceId,
@@ -26499,6 +27073,10 @@ function advanceSharedServerDungeonOnState(state, characterEntries = [], options
   const nowMs = Math.max(0, Math.floor(Number(opts.nowMs ?? Date.now()) || Date.now()));
   const tickMs = Math.max(10, Math.floor(Number(live.tickMs ?? LIVE_SIM_DEFAULT_TICK_MS) || LIVE_SIM_DEFAULT_TICK_MS));
   const lastStepAtMs = Math.max(0, Math.min(nowMs, Math.floor(Number(live.lastStepAtMs ?? 0) || 0)));
+  if (lastStepAtMs <= 0) {
+    live.lastStepAtMs = nowMs;
+    return { ok: true, advancedTicks: 0, characters: targets };
+  }
   const elapsedMs = Math.max(0, nowMs - lastStepAtMs);
   const dueTicksRaw = Math.max(0, Math.floor(elapsedMs / tickMs));
   const maxTicks = Math.max(1, Math.min(24, Math.floor(Number(opts.maxTicks ?? 12) || 12)));
@@ -26514,11 +27092,11 @@ function advanceSharedServerDungeonOnState(state, characterEntries = [], options
   }
   syncSharedServerCharacterActors(state, targets);
   if (dueTicks <= 0) {
-    live.lastStepAtMs = nowMs;
     return { ok: true, advancedTicks: 0, characters: targets };
   }
   for (let i = 0; i < dueTicks; i += 1) {
     live.tick = Math.max(0, Math.floor(Number(live.tick ?? 0) || 0)) + 1;
+    const stepNowMs = Math.max(0, Math.min(nowMs, lastStepAtMs + ((i + 1) * tickMs)));
     for (const entity of state.entities?.values?.() ?? []) {
       if (!entity || typeof entity !== "object") continue;
       if (entity.kind === "actor" && entity.remoteCharacterId) continue;
@@ -26555,43 +27133,62 @@ function advanceSharedServerDungeonOnState(state, characterEntries = [], options
     syncSharedServerCharacterActors(state, targets);
     for (const monster of Array.from(state.entities?.values?.() ?? [])) {
       if (!monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) continue;
-      const target = chooseSharedServerMonsterTarget(state, monster, targets, { currentTick: live.tick });
+      const monsterLive = ensureLiveActorState(monster, "monster");
+      const attackTargetMissing = (
+        (monsterLive.action.actionState === "windup" || monsterLive.action.actionState === "executing")
+        && monsterLive.action.currentActionType === "ATTACK"
+        && !resolveSharedServerCharacterRecordById(targets, monsterLive.action.targetId)
+      );
+      if (attackTargetMissing) {
+        cancelLiveMonsterBasicAttack(state, monster, { currentTick: live.tick, reason: "target_missing" });
+        continue;
+      }
+      const target = resolveSharedServerMonsterContextTarget(state, monster, targets, { currentTick: live.tick });
       if (!target) continue;
       withSharedServerCharacterContext(state, target, () => {
         const spec = monsterStatsForDepth(monster.type, monster.z ?? state.player.z);
-        const monsterLive = ensureLiveActorState(monster, "monster");
         if (monsterLive.action.currentActionType === "ABILITY" && monsterLive.action.actionState === "windup" && live.tick >= monsterLive.action.actionResolveTick) {
-          resolveLiveMonsterAbilityAction(state, monster, spec, { currentTick: live.tick });
+          resolveLiveMonsterAbilityAction(state, monster, spec, { currentTick: live.tick, target: target.proxy?.player ?? state.player });
           return;
         }
         if (monsterLive.action.currentActionType === "ATTACK" && monsterLive.action.actionState === "windup" && live.tick >= monsterLive.action.actionResolveTick) {
-          resolveLiveMonsterBasicAttack(state, monster, spec, { currentTick: live.tick });
+          resolveLiveMonsterBasicAttack(state, monster, spec, { currentTick: live.tick, target: target.proxy?.player ?? state.player });
           return;
         }
         if (monsterLive.action.actionState !== "idle") return;
-        const abilityDescriptor = chooseLiveMonsterAbilityAction(state, monster, spec, { currentTick: live.tick });
-        if (abilityDescriptor && startLiveMonsterAbilityAction(state, monster, spec, abilityDescriptor, { currentTick: live.tick })) {
+        const explicitTarget = target.proxy?.player ?? state.player;
+        const abilityDescriptor = chooseLiveMonsterAbilityAction(state, monster, spec, { currentTick: live.tick, target: explicitTarget });
+        if (abilityDescriptor && startLiveMonsterAbilityAction(state, monster, spec, abilityDescriptor, { currentTick: live.tick, target: explicitTarget })) {
           return;
         }
-        if (monsterCanHitPlayerNow(state, monster, spec).canHit) {
-          startLiveMonsterBasicAttack(state, monster, spec, { currentTick: live.tick });
+        if (monsterCanHitTargetNow(state, monster, explicitTarget, spec).canHit) {
+          startLiveMonsterBasicAttack(state, monster, spec, { currentTick: live.tick, target: explicitTarget });
         }
       });
     }
     syncSharedServerCharacterActors(state, targets);
     for (const monster of Array.from(state.entities?.values?.() ?? [])) {
       if (!monster || monster.kind !== "monster" || (monster.hp ?? 0) <= 0) continue;
-      const target = chooseSharedServerMonsterTarget(state, monster, targets, { currentTick: live.tick });
+      const target = resolveSharedServerMonsterContextTarget(state, monster, targets, { currentTick: live.tick });
       if (!target) continue;
       withSharedServerCharacterContext(state, target, () => {
-        advanceSingleLiveMonsterMovement(state, monster, { currentTick: live.tick });
+        advanceSingleLiveMonsterMovement(state, monster, { currentTick: live.tick, target: target.proxy?.player ?? state.player });
+      });
+    }
+    for (const target of targets) {
+      if (!target.proxy?.player || target.dead) continue;
+      withSharedServerCharacterContext(state, target, () => {
+        applyOutOfCombatRegen(state, stepNowMs);
       });
     }
     if ((live.tick % LIVE_SIM_TICKS_PER_LEGACY_TURN) === 0) {
       state.turn = Math.max(0, Math.floor(Number(state.turn ?? 0) || 0)) + 1;
     }
   }
-  live.lastStepAtMs = nowMs;
+  live.lastStepAtMs = Math.max(
+    0,
+    Math.min(nowMs, lastStepAtMs + (dueTicks * tickMs))
+  );
   syncSharedServerCharacterActors(state, targets);
   return {
     ok: true,
@@ -27663,7 +28260,13 @@ function saveResumeSnapshot(state) {
 
 function loadSaveOrNew() {
   bootLoadedFromLocalSave = false;
+  authenticatedFreshLoginBoot = false;
   const authState = isAuthenticatedUser ? "auth" : "guest";
+  let prevAuthState = "";
+  try {
+    prevAuthState = String(localStorage.getItem(SAVE_AUTH_STATE_KEY) ?? "");
+  } catch {}
+  authenticatedFreshLoginBoot = !!(isAuthenticatedUser && prevAuthState !== "auth");
   if (isAuthoritativeModeEnabled()) {
     try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -27671,7 +28274,7 @@ function loadSaveOrNew() {
     enforceAdminControlPolicy(g);
     return g;
   }
-  if (isAuthenticatedUser && !hasPendingSaveAfterLoginHandoff()) {
+  if (isAuthenticatedUser && !hasPendingSaveAfterLoginHandoff() && !authenticatedFreshLoginBoot) {
     try { localStorage.setItem(SAVE_AUTH_STATE_KEY, authState); } catch {}
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     try {
@@ -27692,7 +28295,6 @@ function loadSaveOrNew() {
     return g;
   }
   try {
-    const prevAuthState = String(localStorage.getItem(SAVE_AUTH_STATE_KEY) ?? "");
     if (authState === "guest" && prevAuthState !== "guest") {
       clearCurrentRunResumeSnapshot();
       clearLegacyLocalSlotMigrationSlots();

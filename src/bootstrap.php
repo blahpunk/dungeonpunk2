@@ -14,7 +14,7 @@ function app_apply_baseline_security_headers(): void
 function app_apply_html_security_headers(): void
 {
   app_apply_baseline_security_headers();
-  header("Content-Security-Policy: default-src 'self'; base-uri 'self'; frame-ancestors 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self' https://secure.blahpunk.com");
+  header("Content-Security-Policy: default-src 'self'; base-uri 'self'; frame-ancestors 'self'; img-src 'self' data: blob: https://anal.blahpunk.com; script-src 'self' 'unsafe-inline' https://anal.blahpunk.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://anal.blahpunk.com; form-action 'self' https://secure.blahpunk.com");
   header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
   header('CDN-Cache-Control: no-store');
   header('Surrogate-Control: no-store');

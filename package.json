@@ -1,3 +1,7 @@
 {
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "realtime:start": "node server/runtime/realtime_server.mjs",
+    "realtime:check": "node --check server/runtime/realtime_server.mjs && node --check client/net/realtimeSocketTransport.js && node --check client/net/authoritativeApi.js"
+  }
 }

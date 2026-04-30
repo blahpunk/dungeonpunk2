@@ -1,4 +1,20 @@
-export function createAuthoritativeApi(options = {}) {
+import {
+  createRealtimeSocketTransport,
+  resolveAuthoritativeTransportMode,
+} from "./realtimeSocketTransport.js?v=20260325a";
+
+function createNoopUnsubscribe() {
+  return () => {};
+}
+
+function isAbortLikeError(error = null) {
+  if (!error) return false;
+  const name = String(error?.name ?? "").trim();
+  const code = String(error?.code ?? "").trim();
+  return name === "AbortError" || code === "ERR_ABORTED" || code === "ABORT_ERR";
+}
+
+export function createPhpAuthoritativeTransport(options = {}) {
   const baseUrl = String(options.baseUrl ?? "./index.php").trim() || "./index.php";
   const csrfToken = String(options.csrfToken ?? "").trim();
   const browserInstanceId = String(options.browserInstanceId ?? "").trim();
@@ -87,6 +103,7 @@ export function createAuthoritativeApi(options = {}) {
       responseBytes,
       status: resp.status,
       contentLength: Math.max(0, Math.floor(Number(resp.headers.get("content-length") ?? 0) || 0)),
+      mode: "php",
     };
     if (data && typeof data === "object") {
       data._transport = transport;
@@ -105,6 +122,18 @@ export function createAuthoritativeApi(options = {}) {
   }
 
   return {
+    transportMode: "php",
+    requestedTransportMode: "php",
+    connect() {
+      return Promise.resolve(true);
+    },
+    disconnect() {},
+    onMessage() {
+      return createNoopUnsubscribe();
+    },
+    onDisconnect() {
+      return createNoopUnsubscribe();
+    },
     openSession({ characterId = "", saveId = "", forceEntrance = false, freshWorld = false } = {}) {
       return request({
         action: "open_session",
@@ -234,3 +263,152 @@ export function createAuthoritativeApi(options = {}) {
     },
   };
 }
+
+export function createAuthoritativeApi(options = {}) {
+  const requestedMode = resolveAuthoritativeTransportMode(options);
+  const fallbackTransport = createPhpAuthoritativeTransport(options);
+  if (requestedMode !== "realtime") return fallbackTransport;
+
+  const realtimeTransport = createRealtimeSocketTransport({
+    ...options,
+    fallbackTransport,
+  });
+  const allowTransportFallback = options.allowTransportFallback !== false;
+  let activeTransport = realtimeTransport;
+  let fallbackActive = false;
+
+  function activateFallback(reason = "", error = null) {
+    if (fallbackActive || !allowTransportFallback) return false;
+    fallbackActive = true;
+    activeTransport = fallbackTransport;
+    try {
+      realtimeTransport.disconnect?.();
+    } catch {}
+    const detail = String(reason ?? "").trim() || "Realtime transport became unavailable.";
+    if (detail !== "Realtime transport disconnected (client-disconnect).") {
+      try {
+        console.warn(`[authoritative] ${detail} Falling back to PHP authoritative transport.`, error ?? "");
+      } catch {}
+    }
+    return true;
+  }
+
+  if (typeof realtimeTransport.onDisconnect === "function") {
+    realtimeTransport.onDisconnect((reason) => {
+      if (!allowTransportFallback) return;
+      activateFallback(`Realtime transport disconnected (${String(reason ?? "socket-closed").trim() || "socket-closed"}).`);
+    });
+  }
+
+  async function invoke(method = "", args = undefined) {
+    const name = String(method ?? "").trim();
+    const transport = activeTransport;
+    const fn = transport?.[name];
+    if (typeof fn !== "function") {
+      throw new Error(`Authoritative transport method is unavailable: ${name}`);
+    }
+    try {
+      return await fn.call(transport, args);
+    } catch (error) {
+      if (transport !== realtimeTransport || !allowTransportFallback || isAbortLikeError(error)) {
+        throw error;
+      }
+      activateFallback(String(error?.message ?? `Realtime ${name} failed.`).trim(), error);
+      const fallbackFn = fallbackTransport?.[name];
+      if (typeof fallbackFn !== "function") throw error;
+      return fallbackFn.call(fallbackTransport, args);
+    }
+  }
+
+  return {
+    get transportMode() {
+      return String(activeTransport?.transportMode ?? (fallbackActive ? "php" : "realtime")).trim() || "php";
+    },
+    get requestedTransportMode() {
+      return requestedMode;
+    },
+    get usingFallbackTransport() {
+      return fallbackActive;
+    },
+    connect() {
+      return invoke("connect");
+    },
+    disconnect() {
+      try {
+        realtimeTransport.disconnect?.();
+      } catch {}
+      try {
+        fallbackTransport.disconnect?.();
+      } catch {}
+    },
+    onMessage(handler) {
+      const unsubscribers = [];
+      if (typeof realtimeTransport.onMessage === "function") {
+        unsubscribers.push(realtimeTransport.onMessage(handler));
+      }
+      if (typeof fallbackTransport.onMessage === "function") {
+        unsubscribers.push(fallbackTransport.onMessage(handler));
+      }
+      return () => {
+        for (const unsubscribe of unsubscribers) {
+          try { unsubscribe?.(); } catch {}
+        }
+      };
+    },
+    onDisconnect(handler) {
+      const unsubscribers = [];
+      if (typeof realtimeTransport.onDisconnect === "function") {
+        unsubscribers.push(realtimeTransport.onDisconnect(handler));
+      }
+      if (typeof fallbackTransport.onDisconnect === "function") {
+        unsubscribers.push(fallbackTransport.onDisconnect(handler));
+      }
+      return () => {
+        for (const unsubscribe of unsubscribers) {
+          try { unsubscribe?.(); } catch {}
+        }
+      };
+    },
+    openSession(args = {}) {
+      return invoke("openSession", args);
+    },
+    sendCommand(args = {}) {
+      return invoke("sendCommand", args);
+    },
+    setMovementIntent(args = {}) {
+      return invoke("setMovementIntent", args);
+    },
+    pollMovement(args = {}) {
+      return invoke("pollMovement", args);
+    },
+    touchSession(args = {}) {
+      return invoke("touchSession", args);
+    },
+    sessionLockAudit(args = {}) {
+      return invoke("sessionLockAudit", args);
+    },
+    requestResync(args = {}) {
+      return invoke("requestResync", args);
+    },
+    switchCharacter(args = {}) {
+      return invoke("switchCharacter", args);
+    },
+    newDungeon(args = {}) {
+      return invoke("newDungeon", args);
+    },
+    createCharacterAndEnter(args = {}) {
+      return invoke("createCharacterAndEnter", args);
+    },
+    manualSave(args = {}) {
+      return invoke("manualSave", args);
+    },
+    saveAndExit(args = {}) {
+      return invoke("saveAndExit", args);
+    },
+    closeSession(args = {}) {
+      return invoke("closeSession", args);
+    },
+  };
+}
+
+export { resolveAuthoritativeTransportMode };

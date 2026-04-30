@@ -1,13 +1,23 @@
 # DungeonPunk (`dungeon25`)
 
-Browser-based roguelike dungeon crawler with server-backed save slots, procedural chunk generation, depth-scaling loot/enemies, and admin sprite tooling.
+Browser-based roguelike dungeon crawler with a shared dungeon, server-backed saves/characters, procedural generation, depth-scaling loot/enemies, and admin sprite tooling.
 
 ## Tech Stack
-- Frontend gameplay/runtime: vanilla JavaScript ([game.js](/var/www/blahpunk.com/dungeon25/game.js))
-- Server/API + page shell: PHP ([index.php](/var/www/blahpunk.com/dungeon25/index.php))
+- Frontend gameplay/runtime: vanilla JavaScript
+- Page shell, auth, persistence, admin APIs: PHP
+- Authoritative worker/runtime: Node.js
+- Staged realtime transport server: Node.js WebSocket compatibility layer
 - Assets: `client/assets/...`
 
-No build step is required for core gameplay. Serve `index.php` with PHP.
+No build step is required for core gameplay. The current migration keeps PHP in place for auth/persistence/admin flows while introducing a dedicated realtime transport server for live gameplay delivery.
+
+## Realtime Migration Status
+- `server/runtime/realtime_server.mjs` adds a persistent WebSocket transport that proxies the existing authoritative PHP API during the compatibility phase.
+- `client/net/authoritativeApi.js` now selects between:
+  - legacy PHP authoritative transport
+  - realtime socket transport with PHP fallback
+- Transport selection is flag-driven from `index.php` body data attributes or local storage overrides.
+- This is the staged Phase 1/2 migration slice. PHP is still in the hot path for simulation ownership until the later runtime migration lands.
 
 ## Core Gameplay Features
 - Infinite procedural dungeon in chunked world coordinates.
@@ -87,17 +97,40 @@ No build step is required for core gameplay. Serve `index.php` with PHP.
   - list/load/save/delete server save slots.
 - `GET/POST ?api=sprites`
   - list/upload/delete/scale custom sprite overrides.
+- `POST ?api=authoritative`
+  - compatibility authoritative API used by the legacy transport and by the staged realtime proxy.
 
 ## Project Layout
-- [index.php](/var/www/blahpunk.com/dungeon25/index.php): page shell, CSS, auth/session config, save/sprite APIs.
-- [game.js](/var/www/blahpunk.com/dungeon25/game.js): full game runtime.
+- `index.php`: page shell, CSS, auth/session config, save/sprite APIs, rollout flags.
+- `game.js`: full game runtime.
+- `client/net/authoritativeApi.js`: transport selector with legacy PHP compatibility.
+- `client/net/realtimeSocketTransport.js`: persistent realtime client transport.
+- `server/runtime/realtime_server.mjs`: staged WebSocket realtime transport server.
+- `server/runtime/authoritative_worker.mjs`: existing authoritative worker/runtime.
 - `client/assets/`: sprites, portraits, and visual assets.
 - `all_objects_sprites.csv`: object/sprite coverage export.
 
 ## Running Locally
 1. Use a PHP-capable web server and point document root to this directory.
-2. Open `index.php` in browser.
-3. Optional: configure auth/save secrets in environment for secure signed server saves.
+2. Optional but recommended for the migration path: start the staged realtime transport server with `npm run realtime:start`.
+3. Set rollout env vars if you want the browser to use the new transport:
+   - `DUNGEON25_AUTHORITATIVE_ENABLED=1`
+   - `DUNGEON25_REALTIME_TRANSPORT_ENABLED=1`
+   - `DUNGEON25_REALTIME_TRANSPORT_MODE=realtime`
+   - `DUNGEON25_REALTIME_URL=ws://127.0.0.1:8787/realtime` (or `wss://...` behind TLS)
+4. Open `index.php` in the browser.
+5. Optional: configure auth/save secrets and storage env vars for secure signed saves and shared-run persistence.
+
+## Transport Overrides
+- Client local storage override: `dungeonpunk.authoritativeTransportMode`
+  - `php`
+  - `realtime`
+- Client local storage override: `dungeonpunk.realtimeTransportUrl`
+  - explicit websocket URL for dev/testing
+
+## Migration Notes
+- Detailed staged notes live in `docs/migration/realtime-architecture-shift.md`.
+- The compatibility layer keeps `?api=authoritative` available while realtime parity is proven.
 
 ## Operational Notes
 - Sprite uploads can still be blocked upstream by reverse proxy/web server body limits even if app limits are higher.

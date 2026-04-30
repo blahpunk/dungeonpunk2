@@ -2121,10 +2121,39 @@ function character_states_public_meta(array $entriesById): array
 {
   $out = [];
   foreach ($entriesById as $entry) {
+    $snapshot = decode_character_snapshot_payload_array((string) ($entry['payload'] ?? ''));
+    $character = is_array($snapshot['character'] ?? null) ? $snapshot['character'] : [];
+    $player = is_array($snapshot['player'] ?? null) ? $snapshot['player'] : [];
+    $position = is_array($snapshot['position'] ?? null) ? $snapshot['position'] : [];
+    $depth = array_key_exists('depth', $position)
+      ? (is_numeric($position['depth']) ? (int) $position['depth'] : null)
+      : (array_key_exists('z', $position) && is_numeric($position['z']) ? (int) $position['z'] : null);
+    $summary = [
+      'character' => [
+        'id' => (string) ($character['id'] ?? ($entry['id'] ?? '')),
+        'name' => (string) ($character['name'] ?? ($entry['name'] ?? 'Adventurer')),
+        'speciesId' => (string) ($character['speciesId'] ?? ($player['speciesId'] ?? '')),
+        'classId' => (string) ($character['classId'] ?? ($player['classId'] ?? '')),
+        'deepestDepth' => max(
+          0,
+          (int) floor((float) ($character['deepestDepth'] ?? 0))
+        ),
+      ],
+      'player' => [
+        'level' => max(1, (int) floor((float) ($player['level'] ?? 1))),
+      ],
+      'dungeonInstanceId' => (string) ($snapshot['dungeonInstanceId'] ?? ''),
+      'position' => [
+        'x' => array_key_exists('x', $position) && is_numeric($position['x']) ? (int) $position['x'] : null,
+        'y' => array_key_exists('y', $position) && is_numeric($position['y']) ? (int) $position['y'] : null,
+        'depth' => $depth,
+      ],
+    ];
     $out[] = [
       'id' => (string) ($entry['id'] ?? ''),
       'name' => (string) ($entry['name'] ?? 'Adventurer'),
       'updated_at' => (string) ($entry['updated_at'] ?? ''),
+      'summary' => $summary,
     ];
   }
   usort(
@@ -2360,12 +2389,8 @@ function active_character_states_public_payload(array $entriesById, array $activ
       'x' => $x,
       'y' => $y,
       'z' => $z,
-      'hp' => $preferSnapshot
-        ? max(0, (int) ($player['hp'] ?? 0))
-        : max(0, (int) ($presence['hp'] ?? $player['hp'] ?? 0)),
-      'max_hp' => $preferSnapshot
-        ? max(1, (int) ($player['maxHp'] ?? 1))
-        : max(1, (int) ($presence['max_hp'] ?? $player['maxHp'] ?? 1)),
+      'hp' => max(0, (int) ($player['hp'] ?? ($presence['hp'] ?? 0))),
+      'max_hp' => max(1, (int) ($player['maxHp'] ?? ($presence['max_hp'] ?? 1))),
       'session_id' => (string) ($lockMeta['session_id'] ?? ''),
       'browser_instance_id' => (string) ($lockMeta['browser_instance_id'] ?? ''),
       'updated_at' => $preferSnapshot
@@ -2566,6 +2591,87 @@ function active_shared_dungeon_character_entries(string $secret, string $dungeon
 }
 
 /**
+ * @return array<string, mixed>|null
+ */
+function build_shared_dungeon_character_entry_from_payload(
+  string $characterId,
+  string $payload,
+  string $userKey = '',
+  string $fallbackName = 'Adventurer'
+): ?array {
+  $normalizedCharacterId = normalize_character_profile_id($characterId);
+  $normalizedPayload = trim($payload);
+  if ($normalizedCharacterId === '' || $normalizedPayload === '') {
+    return null;
+  }
+  $snapshot = decode_character_snapshot_payload_array($normalizedPayload);
+  if (!is_array($snapshot)) {
+    return null;
+  }
+  $position = is_array($snapshot['position'] ?? null) ? $snapshot['position'] : [];
+  $player = is_array($snapshot['player'] ?? null) ? $snapshot['player'] : [];
+  $character = is_array($snapshot['character'] ?? null) ? $snapshot['character'] : [];
+  $x = array_key_exists('x', $position) && is_numeric($position['x']) ? (int) $position['x'] : null;
+  $y = array_key_exists('y', $position) && is_numeric($position['y']) ? (int) $position['y'] : null;
+  $z = array_key_exists('depth', $position)
+    ? (is_numeric($position['depth']) ? (int) $position['depth'] : null)
+    : (array_key_exists('z', $position) && is_numeric($position['z']) ? (int) $position['z'] : null);
+  if (!is_int($x) || !is_int($y) || !is_int($z)) {
+    return null;
+  }
+  $name = trim((string) ($character['name'] ?? $fallbackName));
+  if ($name === '') {
+    $name = 'Adventurer';
+  }
+  return [
+    'character_id' => $normalizedCharacterId,
+    'characterId' => $normalizedCharacterId,
+    'user_key' => strtolower(trim($userKey)),
+    'name' => $name,
+    'payload' => $normalizedPayload,
+    'updated_at' => date('c'),
+    'dungeon_instance_id' => trim((string) ($snapshot['dungeonInstanceId'] ?? '')),
+    'x' => $x,
+    'y' => $y,
+    'z' => $z,
+    'hp' => max(0, (int) ($player['hp'] ?? 0)),
+    'max_hp' => max(1, (int) ($player['maxHp'] ?? 1)),
+    'class_id' => (string) ($character['classId'] ?? $player['classId'] ?? ''),
+    'species_id' => (string) ($character['speciesId'] ?? $player['speciesId'] ?? ''),
+  ];
+}
+
+/**
+ * @param array<int, array<string, mixed>> $entries
+ * @param array<int, array<string, mixed>> $fallbackEntries
+ * @return array<int, array<string, mixed>>
+ */
+function merge_shared_dungeon_character_entries(array $entries, array $fallbackEntries, string $dungeonInstanceId = ''): array
+{
+  $merged = [];
+  foreach ([$entries, $fallbackEntries] as $list) {
+    foreach ($list as $entry) {
+      if (!is_array($entry)) {
+        continue;
+      }
+      $characterId = normalize_character_profile_id((string) ($entry['characterId'] ?? $entry['character_id'] ?? ''));
+      if ($characterId === '') {
+        continue;
+      }
+      $entryDungeonId = trim((string) ($entry['dungeon_instance_id'] ?? $entry['dungeonInstanceId'] ?? ''));
+      if ($dungeonInstanceId !== '' && $entryDungeonId !== '' && !hash_equals($dungeonInstanceId, $entryDungeonId)) {
+        continue;
+      }
+      $merged[$characterId] = $entry + [
+        'character_id' => $characterId,
+        'characterId' => $characterId,
+      ];
+    }
+  }
+  return array_values($merged);
+}
+
+/**
  * @param array<int, array<string, mixed>> $rows
  * @param array{
  *   by_id: array<string, array<string, mixed>>,
@@ -2626,7 +2732,7 @@ function persist_shared_dungeon_character_snapshots(array $rows, array &$grouped
  *   character_persist_ok: bool
  * }
  */
-function advance_and_persist_shared_run(?array $sharedRun, string $secret, array $runtimeSettings): array
+function advance_and_persist_shared_run(?array $sharedRun, string $secret, array $runtimeSettings, array $fallbackCharacterEntries = []): array
 {
   $grouped = load_all_character_states_grouped($secret);
   if (!is_array($sharedRun)) {
@@ -2651,11 +2757,15 @@ function advance_and_persist_shared_run(?array $sharedRun, string $secret, array
   $dungeonInstanceId = shared_run_payload_dungeon_instance_id($payload);
   $active = active_shared_dungeon_character_entries($secret, $dungeonInstanceId);
   $grouped = $active['grouped'];
-  $characterEntries = array_values($active['entries']);
+  $characterEntries = merge_shared_dungeon_character_entries(
+    array_values($active['entries']),
+    $fallbackCharacterEntries,
+    $dungeonInstanceId
+  );
   $worker = authoritative_worker_shared_dungeon_step($payload, $characterEntries, [
     'nowMs' => (int) floor(microtime(true) * 1000),
     'tickMs' => (int) floor((float) ($runtimeSettings['dungeon_speed_ms'] ?? 0)),
-    'maxTicks' => 12,
+    'maxTicks' => 3,
   ]);
   $result = is_array($worker['result'] ?? null) ? $worker['result'] : null;
   if (!is_array($result)) {
@@ -3637,6 +3747,20 @@ if (empty($_SESSION['savegames_csrf'])) {
 }
 $saveGamesCsrf = (string) $_SESSION['savegames_csrf'];
 $sharedRuntimeSettings = shared_runtime_settings_load();
+$realtimeTransportEnabled = filter_var((string) (getenv('DUNGEON25_REALTIME_TRANSPORT_ENABLED') ?: ''), FILTER_VALIDATE_BOOLEAN);
+$realtimeTransportModeEnv = strtolower(trim((string) (getenv('DUNGEON25_REALTIME_TRANSPORT_MODE') ?: '')));
+$realtimeTransportMode = in_array($realtimeTransportModeEnv, ['realtime', 'socket', 'ws', 'websocket', 'realtime_socket'], true)
+  ? 'realtime'
+  : 'php';
+if ($realtimeTransportModeEnv === '') {
+  $realtimeTransportMode = $realtimeTransportEnabled ? 'realtime' : 'php';
+}
+if ($realtimeTransportMode === 'realtime') {
+  $realtimeTransportEnabled = true;
+}
+$realtimeTransportUrl = trim((string) (getenv('DUNGEON25_REALTIME_URL') ?: ''));
+$authoritativeFrontendEnabled = filter_var((string) (getenv('DUNGEON25_AUTHORITATIVE_ENABLED') ?: ''), FILTER_VALIDATE_BOOLEAN)
+  || $realtimeTransportEnabled;
 
 // All later request paths only need session-derived values read above.
 // Release the PHP session lock now so long-poll and intent requests can run concurrently.
@@ -4314,7 +4438,23 @@ if ($apiMode === 'savegames') {
     if ($sharedRunRequested) {
       $sharedLocked = with_global_shared_run_lock(function () use ($savegamesActorEmail, $saveSecret, $runtimeSettings, $currentCharacterIdQuery, $characterLockAudit) {
         $lockedSharedRun = load_user_shared_run($savegamesActorEmail, $saveSecret);
-        $sharedAdvanced = advance_and_persist_shared_run($lockedSharedRun, $saveSecret, $runtimeSettings);
+        $fallbackCharacterEntries = [];
+        if ($currentCharacterIdQuery !== '') {
+          $currentCharacterStates = load_user_character_states($savegamesActorEmail, $saveSecret);
+          $currentCharacterEntry = $currentCharacterStates[$currentCharacterIdQuery] ?? null;
+          if (is_array($currentCharacterEntry)) {
+            $fallback = build_shared_dungeon_character_entry_from_payload(
+              $currentCharacterIdQuery,
+              (string) ($currentCharacterEntry['payload'] ?? ''),
+              (string) ($currentCharacterEntry['user_key'] ?? authoritative_user_storage_key($savegamesActorEmail)),
+              (string) ($currentCharacterEntry['name'] ?? 'Adventurer')
+            );
+            if (is_array($fallback)) {
+              $fallbackCharacterEntries[] = $fallback;
+            }
+          }
+        }
+        $sharedAdvanced = advance_and_persist_shared_run($lockedSharedRun, $saveSecret, $runtimeSettings, $fallbackCharacterEntries);
         $nextSharedRun = $sharedAdvanced['shared_run'];
         if (empty($sharedAdvanced['character_persist_ok'])) {
           json_response(['ok' => false, 'error' => 'Could not persist shared character state.'], 500);
@@ -4408,11 +4548,16 @@ if ($apiMode === 'savegames') {
   }
   if ($action === 'shared_run_sync') {
     $payload = trim((string) ($body['payload'] ?? ''));
+    $currentCharacterPayload = trim((string) ($body['current_character_payload'] ?? ''));
+    $currentCharacterId = normalize_character_profile_id((string) ($body['current_character_id'] ?? ''));
     if ($payload === '') {
       json_response(['ok' => false, 'error' => 'Missing shared run payload.'], 400);
     }
     if (strlen($payload) > SAVE_PAYLOAD_MAX_LEN) {
       json_response(['ok' => false, 'error' => 'Shared run payload is too large.'], 413);
+    }
+    if ($currentCharacterPayload !== '' && strlen($currentCharacterPayload) > CHARACTER_STATE_PAYLOAD_MAX_LEN) {
+      json_response(['ok' => false, 'error' => 'Current character payload is too large.'], 413);
     }
     $characterId = normalize_character_profile_id((string) ($body['character_id'] ?? ''));
     $characterName = trim_save_name((string) ($body['character_name'] ?? ''));
@@ -4420,7 +4565,29 @@ if ($apiMode === 'savegames') {
     if ($characterName === '') {
       $characterName = 'Adventurer';
     }
-    $locked = with_global_shared_run_lock(function () use ($payload, $savegamesActorEmail, $saveSecret, $characterId, $characterName, $runtimeSettings, $currentCharacterId) {
+    $locked = with_global_shared_run_lock(function () use ($payload, $currentCharacterPayload, $savegamesActorEmail, $saveSecret, $characterId, $characterName, $runtimeSettings, $currentCharacterId) {
+      if ($currentCharacterId !== '' && $currentCharacterPayload !== '') {
+        $characterStatesInner = load_user_character_states($savegamesActorEmail, $saveSecret);
+        $currentCharacterName = $characterName;
+        $decodedCurrentCharacter = decode_character_snapshot_payload_array($currentCharacterPayload);
+        if (is_array($decodedCurrentCharacter)) {
+          $decodedCharacterMeta = is_array($decodedCurrentCharacter['character'] ?? null) ? $decodedCurrentCharacter['character'] : [];
+          $decodedCharacterName = trim_save_name((string) ($decodedCharacterMeta['name'] ?? ''));
+          if ($decodedCharacterName !== '') {
+            $currentCharacterName = $decodedCharacterName;
+          }
+        }
+        $characterStatesInner[$currentCharacterId] = [
+          'id' => $currentCharacterId,
+          'name' => $currentCharacterName !== '' ? $currentCharacterName : 'Adventurer',
+          'payload' => $currentCharacterPayload,
+          'updated_at' => date('c'),
+          'sig' => '',
+        ];
+        if (!persist_user_character_states($savegamesActorEmail, $characterStatesInner, $saveSecret)) {
+          json_response(['ok' => false, 'error' => 'Could not persist current character state.'], 500);
+        }
+      }
       $lockedSharedRun = load_user_shared_run($savegamesActorEmail, $saveSecret);
       $nextPayload = merge_shared_run_world_state($payload, $lockedSharedRun);
       $nextPayload = merge_shared_run_remote_actors($nextPayload, $lockedSharedRun, $characterId);
@@ -4431,7 +4598,19 @@ if ($apiMode === 'savegames') {
         'character_name' => $characterName,
         'sig' => '',
       ];
-      $sharedAdvanced = advance_and_persist_shared_run($lockedSharedRun, $saveSecret, $runtimeSettings);
+      $fallbackCharacterEntries = [];
+      if ($currentCharacterId !== '' && $currentCharacterPayload !== '') {
+        $fallback = build_shared_dungeon_character_entry_from_payload(
+          $currentCharacterId,
+          $currentCharacterPayload,
+          authoritative_user_storage_key($savegamesActorEmail),
+          $characterName
+        );
+        if (is_array($fallback)) {
+          $fallbackCharacterEntries[] = $fallback;
+        }
+      }
+      $sharedAdvanced = advance_and_persist_shared_run($lockedSharedRun, $saveSecret, $runtimeSettings, $fallbackCharacterEntries);
       if (empty($sharedAdvanced['character_persist_ok'])) {
         json_response(['ok' => false, 'error' => 'Could not persist shared character state.'], 500);
       }
@@ -8259,7 +8438,10 @@ header('X-Robots-Tag: index, follow, max-image-preview:large', true);
   <body
     data-can-admin-controls="<?php echo $isAdminUser ? '1' : '0'; ?>"
     data-is-authenticated="<?php echo $user !== null ? '1' : '0'; ?>"
-    data-authoritative-enabled="0"
+    data-authoritative-enabled="<?php echo $authoritativeFrontendEnabled ? '1' : '0'; ?>"
+    data-authoritative-transport-mode="<?php echo h($realtimeTransportMode); ?>"
+    data-realtime-transport-enabled="<?php echo $realtimeTransportEnabled ? '1' : '0'; ?>"
+    data-realtime-transport-url="<?php echo h($realtimeTransportUrl); ?>"
     data-save-csrf="<?php echo h($saveGamesCsrf); ?>"
     data-save-max-slots="<?php echo MAX_SERVER_SAVES; ?>"
     data-character-max-slots="<?php echo MAX_SERVER_CHARACTERS; ?>"
